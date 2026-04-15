@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { SchemaInfo, ClassInfo } from '../types';
+import { classToGraphql } from '../preview/schemaPreview';
 
 interface TreeNode {
   label: string;
@@ -7,6 +8,7 @@ interface TreeNode {
   icon: string;
   file?: string;
   line?: number;
+  className?: string;
   children?: TreeNode[];
 }
 
@@ -17,6 +19,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   private schemas: SchemaInfo[] = [];
   private classMap = new Map<string, ClassInfo>();
   private filterPattern: RegExp | null = null;
+  private sortMode: 'none' | 'asc' | 'desc' = 'none';
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
@@ -38,6 +41,11 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
         vscode.window.showTextDocument(uri, {
           selection: new vscode.Range(line, 0, line, 0),
         });
+      } else if (msg.type === 'preview' && msg.className) {
+        this.showPreview(msg.className);
+      } else if (msg.type === 'sort') {
+        this.sortMode = msg.mode;
+        this.sendTree();
       }
     });
   }
@@ -69,24 +77,29 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     this.sendTree();
   }
 
-  private filterClasses(classes: ClassInfo[]): ClassInfo[] {
-    if (!this.filterPattern) return classes;
-    return classes.filter(
-      (cls) => this.filterPattern!.test(cls.name) || cls.fields.some((f) => this.filterPattern!.test(f.name)),
-    );
+  private filterAndSortClasses(classes: ClassInfo[]): ClassInfo[] {
+    let result = this.filterPattern
+      ? classes.filter((cls) => this.filterPattern!.test(cls.name) || cls.fields.some((f) => this.filterPattern!.test(f.name)))
+      : [...classes];
+    if (this.sortMode === 'asc') {
+      result.sort((a, b) => a.name.localeCompare(b.name));
+    } else if (this.sortMode === 'desc') {
+      result.sort((a, b) => b.name.localeCompare(a.name));
+    }
+    return result;
   }
 
   private buildTree(): TreeNode[] {
     const roots: TreeNode[] = [];
     for (const schema of this.schemas) {
       const categories: TreeNode[] = [];
-      const fq = this.filterClasses(schema.queries);
+      const fq = this.filterAndSortClasses(schema.queries);
       if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, icon: 'symbol-namespace', children: fq.map((c) => this.buildClassNode(c)) });
-      const fm = this.filterClasses(schema.mutations);
+      const fm = this.filterAndSortClasses(schema.mutations);
       if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, icon: 'symbol-namespace', children: fm.map((c) => this.buildClassNode(c)) });
-      const fs = this.filterClasses(schema.subscriptions);
+      const fs = this.filterAndSortClasses(schema.subscriptions);
       if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, icon: 'symbol-namespace', children: fs.map((c) => this.buildClassNode(c)) });
-      const ft = this.filterClasses(schema.types);
+      const ft = this.filterAndSortClasses(schema.types);
       if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, icon: 'symbol-namespace', children: ft.map((c) => this.buildClassNode(c)) });
 
       if (this.filterPattern && categories.length === 0) continue;
@@ -114,6 +127,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       icon: 'symbol-class',
       file: cls.filePath,
       line: cls.lineNumber,
+      className: cls.name,
       children: children.length > 0 ? children : undefined,
     };
   }
@@ -130,10 +144,55 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     }));
   }
 
+  private previewPanel?: vscode.WebviewPanel;
+
+  private showPreview(className: string): void {
+    const cls = this.classMap.get(className);
+    if (!cls) return;
+    const sdl = classToGraphql(cls, this.classMap);
+
+    if (this.previewPanel) {
+      this.previewPanel.title = cls.name;
+      this.previewPanel.webview.html = this.getPreviewHtml(cls.name, sdl);
+      this.previewPanel.reveal(vscode.ViewColumn.One, true);
+      return;
+    }
+
+    this.previewPanel = vscode.window.createWebviewPanel(
+      'graphqlPreview',
+      cls.name,
+      { viewColumn: vscode.ViewColumn.One, preserveFocus: true },
+    );
+    this.previewPanel.webview.html = this.getPreviewHtml(cls.name, sdl);
+    this.previewPanel.onDidDispose(() => { this.previewPanel = undefined; });
+  }
+
+  private getPreviewHtml(_title: string, sdl: string): string {
+    const escaped = sdl
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/^(type|input|enum|interface|union|scalar|query|mutation|subscription)\b/gm, '<span class="kw">$1</span>')
+      .replace(/^(\s*#.*)/gm, '<span class="comment">$1</span>')
+      .replace(/:\s*(\[?)(\w+)(]?[!]?)/g, ': $1<span class="type">$2</span>$3');
+
+    return [
+      '<!DOCTYPE html><html><head><style>',
+      'body { font-family: var(--vscode-editor-font-family, Menlo, Monaco, monospace);',
+      '  font-size: var(--vscode-editor-font-size, 13px); line-height: 1.5;',
+      '  color: var(--vscode-editor-foreground); background: var(--vscode-editor-background);',
+      '  padding: 16px 24px; white-space: pre; }',
+      '.kw { color: #c586c0; } .type { color: #4ec9b0; } .comment { color: #6a9955; }',
+      '</style></head><body>',
+      escaped,
+      '</body></html>',
+    ].join('\n');
+  }
+
   private sendTree(): void {
     if (!this.view) return;
     const tree = this.buildTree();
-    this.view.webview.postMessage({ type: 'tree', data: tree, hasFilter: !!this.filterPattern });
+    this.view.webview.postMessage({ type: 'tree', data: tree, hasFilter: !!this.filterPattern, sortMode: this.sortMode });
   }
 
   private getHtml(): string {
@@ -201,6 +260,7 @@ body {
   flex-shrink: 0;
 }
 .toggle:hover { opacity: 0.85; background: var(--vscode-toolbar-hoverBackground); }
+.sep { width: 1px; height: 14px; background: var(--vscode-widget-border, rgba(128,128,128,0.3)); margin: 0 2px; flex-shrink: 0; }
 .toggle.active {
   opacity: 1;
   background: var(--vscode-inputOption-activeBackground, rgba(0,90,180,0.3));
@@ -271,6 +331,8 @@ body {
     <button class="toggle" id="case" title="Match Case (Alt+C)">Aa</button>
     <button class="toggle" id="word" title="Match Whole Word (Alt+W)"><b>ab</b>|</button>
     <button class="toggle" id="regex" title="Use Regular Expression (Alt+R)">.*</button>
+    <span class="sep"></span>
+    <button class="toggle" id="sort" title="Sort: click to cycle (none → A-Z → Z-A)">↕</button>
   </div>
 </div>
 <div id="tree" class="tree"></div>
@@ -281,9 +343,13 @@ const input = document.getElementById('q');
 const caseBtn = document.getElementById('case');
 const wordBtn = document.getElementById('word');
 const regexBtn = document.getElementById('regex');
+const sortBtn = document.getElementById('sort');
 const treeEl = document.getElementById('tree');
 
 let searchState = { caseSensitive: false, wholeWord: false, useRegex: false };
+const sortCycle = ['none', 'asc', 'desc'];
+const sortLabels = { none: '↕', asc: 'A↓', desc: 'Z↓' };
+let sortIdx = 0;
 
 function emitSearch() {
   vscode.postMessage({ type: 'search', query: input.value, ...searchState });
@@ -299,10 +365,20 @@ caseBtn.addEventListener('click', () => toggleBtn(caseBtn, 'caseSensitive'));
 wordBtn.addEventListener('click', () => toggleBtn(wordBtn, 'wholeWord'));
 regexBtn.addEventListener('click', () => toggleBtn(regexBtn, 'useRegex'));
 
+sortBtn.addEventListener('click', () => {
+  sortIdx = (sortIdx + 1) % sortCycle.length;
+  const mode = sortCycle[sortIdx];
+  sortBtn.textContent = sortLabels[mode];
+  sortBtn.classList.toggle('active', mode !== 'none');
+  sortBtn.title = 'Sort: ' + (mode === 'none' ? 'none' : mode === 'asc' ? 'A → Z' : 'Z → A');
+  vscode.postMessage({ type: 'sort', mode: mode });
+});
+
 document.addEventListener('keydown', (e) => {
   if (e.altKey && e.key === 'c') { toggleBtn(caseBtn, 'caseSensitive'); e.preventDefault(); }
   if (e.altKey && e.key === 'w') { toggleBtn(wordBtn, 'wholeWord'); e.preventDefault(); }
   if (e.altKey && e.key === 'r') { toggleBtn(regexBtn, 'useRegex'); e.preventDefault(); }
+  if (e.altKey && e.key === 's') { sortBtn.click(); e.preventDefault(); }
 });
 
 // ── Tree rendering ──
@@ -373,18 +449,24 @@ function buildNode(node, depth, autoExpand) {
     wrapper.appendChild(childrenEl);
   }
 
-  // Click handlers
+  // Click: toggle expand. Double-click: open source + preview schema.
   row.addEventListener('click', (e) => {
     if (hasChildren) {
       const isOpen = childrenEl.classList.toggle('open');
       twistie.textContent = isOpen ? '▾' : '▸';
-      // Lazy render children
       if (isOpen && childrenEl.children.length === 0) {
         for (const child of node.children) {
           childrenEl.appendChild(buildNode(child, depth + 1, false));
         }
       }
     }
+    // Show GraphQL preview for class nodes on single click
+    if (node.className) {
+      vscode.postMessage({ type: 'preview', className: node.className });
+    }
+  });
+  row.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
     if (node.file) {
       vscode.postMessage({ type: 'open', file: node.file, line: node.line });
     }

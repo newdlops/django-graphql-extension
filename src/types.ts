@@ -1,9 +1,16 @@
 export type Framework = 'graphene' | 'strawberry' | 'ariadne' | 'graphql-schema';
 
+export interface FieldArgInfo {
+  name: string;
+  type: string;
+  required: boolean;
+}
+
 export interface FieldInfo {
   name: string;
   fieldType: string;
   resolvedType?: string;
+  args?: FieldArgInfo[];
   filePath: string;
   lineNumber: number;
 }

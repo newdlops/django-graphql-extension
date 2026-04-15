@@ -1,12 +1,13 @@
 import * as vscode from 'vscode';
 import { GraphqlViewProvider } from './webview/graphqlViewProvider';
+import { GqlCodeLensProvider } from './codelens/gqlCodeLensProvider';
 import { ParseCache } from './scanner/parseCache';
 import { detectProjects } from './scanner/djangoDetector';
 import { parseGrapheneSchemas } from './scanner/grapheneParser';
 import { parseStrawberrySchemas } from './scanner/strawberryParser';
 import { parseAriadneSchemas } from './scanner/ariadneParser';
 import { parseGraphQLFiles } from './scanner/graphqlFileParser';
-import { SchemaInfo } from './types';
+import { SchemaInfo, ClassInfo } from './types';
 import { log } from './logger';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -14,11 +15,41 @@ export function activate(context: vscode.ExtensionContext) {
   parseCache.load();
 
   const viewProvider = new GraphqlViewProvider();
+  const codeLensProvider = new GqlCodeLensProvider();
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(GraphqlViewProvider.viewType, viewProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    vscode.languages.registerCodeLensProvider(
+      [
+        { language: 'typescript', scheme: 'file' },
+        { language: 'typescriptreact', scheme: 'file' },
+        { language: 'javascript', scheme: 'file' },
+        { language: 'javascriptreact', scheme: 'file' },
+      ],
+      codeLensProvider,
+    ),
+    vscode.languages.registerHoverProvider(
+      [
+        { language: 'typescript', scheme: 'file' },
+        { language: 'typescriptreact', scheme: 'file' },
+        { language: 'javascript', scheme: 'file' },
+        { language: 'javascriptreact', scheme: 'file' },
+      ],
+      codeLensProvider,
+    ),
+  );
+
+  // Command to jump to a backend class definition
+  const openClassCommand = vscode.commands.registerCommand(
+    'djangoGraphqlExplorer.openClass',
+    (filePath: string, lineNumber: number) => {
+      const uri = vscode.Uri.file(filePath);
+      vscode.window.showTextDocument(uri, {
+        selection: new vscode.Range(lineNumber, 0, lineNumber, 0),
+      });
+    },
   );
 
   let refreshing = false;
@@ -75,6 +106,15 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     viewProvider.updateSchemas(allSchemas);
+
+    // Build classMap for CodeLens
+    const classMap = new Map<string, ClassInfo>();
+    for (const schema of allSchemas) {
+      for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
+        classMap.set(cls.name, cls);
+      }
+    }
+    codeLensProvider.updateIndex(classMap);
   }
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -101,7 +141,7 @@ export function activate(context: vscode.ExtensionContext) {
   gqlWatcher.onDidCreate(debouncedRefresh);
   gqlWatcher.onDidDelete(debouncedRefresh);
 
-  context.subscriptions.push(refreshCommand, pyWatcher, gqlWatcher);
+  context.subscriptions.push(refreshCommand, openClassCommand, pyWatcher, gqlWatcher);
 
   // Initial scan
   refresh();

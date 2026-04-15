@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { ClassInfo, FieldInfo, SchemaInfo } from '../types';
+import { ClassInfo, FieldInfo, FieldArgInfo, SchemaInfo } from '../types';
 import { ParseCache, CachedFileData } from './parseCache';
 
 const GRAPHENE_BASE_CLASSES = new Set([
@@ -723,6 +723,9 @@ function parseClassFields(
           }
         }
 
+        // Extract keyword arguments as field args
+        const args = parseFieldArgs(lines, i);
+
         fields.push({
           name: fieldName,
           fieldType,
@@ -730,6 +733,7 @@ function parseClassFields(
             resolvedType && !['True', 'False', 'None', 'lambda'].includes(resolvedType)
               ? resolvedType
               : undefined,
+          args: args.length > 0 ? args : undefined,
           filePath,
           lineNumber: i,
         });
@@ -738,6 +742,52 @@ function parseClassFields(
   }
 
   return fields;
+}
+
+const GRAPHENE_ARG_TYPES: Record<string, string> = {
+  String: 'String', Int: 'Int', Float: 'Float', Boolean: 'Boolean', ID: 'ID',
+  DateTime: 'DateTime', Date: 'Date', Time: 'Time', Decimal: 'Decimal',
+  JSONString: 'JSONString', UUID: 'UUID', List: 'List', NonNull: 'NonNull',
+  Argument: 'Argument', InputField: 'InputField',
+};
+
+function parseFieldArgs(lines: string[], fieldLineNumber: number): FieldArgInfo[] {
+  const args: FieldArgInfo[] = [];
+  // Collect the full field definition (may span multiple lines until closing ')')
+  let fullDef = '';
+  let depth = 0;
+  for (let j = fieldLineNumber; j < lines.length && j < fieldLineNumber + 20; j++) {
+    const line = lines[j];
+    for (const ch of line) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+    }
+    fullDef += line + '\n';
+    if (depth <= 0 && j > fieldLineNumber) break;
+  }
+
+  // Match keyword args: arg_name=graphene.Type(...) or arg_name=Type(...)
+  const kwargRegex = /(\w+)\s*=\s*(?:graphene\.)?(\w+)\s*\(/g;
+  let m;
+  let first = true;
+  while ((m = kwargRegex.exec(fullDef)) !== null) {
+    if (first) { first = false; continue; } // skip the field assignment itself (field_name = Type(...))
+    const argName = m[1];
+    const argType = m[2];
+    // Skip non-type kwargs like description, default_value, deprecation_reason
+    if (['description', 'default_value', 'deprecation_reason', 'name', 'source', 'resolver'].includes(argName)) continue;
+    if (!GRAPHENE_ARG_TYPES[argType] && !/^[A-Z]/.test(argType)) continue;
+
+    const afterMatch = fullDef.substring(m.index + m[0].length);
+    const required = /required\s*=\s*True/.test(afterMatch.split(')')[0] ?? '');
+    args.push({
+      name: argName,
+      type: GRAPHENE_ARG_TYPES[argType] ?? argType,
+      required,
+    });
+  }
+
+  return args;
 }
 
 function resolveInheritedFields(
