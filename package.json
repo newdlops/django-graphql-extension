@@ -1,0 +1,65 @@
+{
+  "name": "django-graphql-explorer",
+  "displayName": "Django GraphQL Explorer",
+  "description": "Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace",
+  "version": "0.0.1",
+  "publisher": "lky",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/settings.py",
+    "workspaceContains:**/*.graphql",
+    "workspaceContains:**/*.gql"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "djangoGraphql",
+          "title": "Django GraphQL",
+          "icon": "$(symbol-misc)"
+        }
+      ]
+    },
+    "views": {
+      "djangoGraphql": [
+        {
+          "id": "djangoGraphqlExplorer.view",
+          "name": "Schema Explorer",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "djangoGraphqlExplorer.refresh",
+        "title": "Refresh Django GraphQL Schema",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "djangoGraphqlExplorer.refresh",
+          "when": "view == djangoGraphqlExplorer.view",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^18.0.0",
+    "typescript": "^5.3.0"
+  }
+}
