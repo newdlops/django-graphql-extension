@@ -3,12 +3,29 @@
   "displayName": "Django GraphQL Explorer",
   "description": "Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace",
   "version": "0.0.1",
-  "publisher": "lky",
+  "publisher": "newdlops",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/django-graphql-extension"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
+    "Programming Languages",
+    "Linters",
     "Other"
+  ],
+  "keywords": [
+    "django",
+    "graphql",
+    "graphene",
+    "strawberry",
+    "ariadne",
+    "schema",
+    "explorer",
+    "codelens"
   ],
   "activationEvents": [
     "workspaceContains:**/settings.py",
@@ -55,7 +72,9 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "package": "npm run compile && vsce package",
+    "publish": "npm run compile && vsce publish"
   },
   "devDependencies": {
     "@types/vscode": "^1.75.0",
