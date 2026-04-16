@@ -89,6 +89,17 @@ function formatArgValues(field: FieldInfo): string {
   return `(${parts.join(', ')})`;
 }
 
+function getTypeFields(typeName: string, classMap: Map<string, ClassInfo>): FieldInfo[] {
+  const cls = classMap.get(typeName);
+  if (!cls) return [];
+  if (cls.fields.length > 0) return cls.fields;
+  // Try flattening base classes (mixin/inheritance pattern)
+  const fields: FieldInfo[] = [];
+  const seen = new Set<string>();
+  flattenMixins(cls, classMap, fields, seen, 0);
+  return fields;
+}
+
 function renderField(
   field: FieldInfo,
   classMap: Map<string, ClassInfo>,
@@ -99,16 +110,20 @@ function renderField(
   const indent = '  '.repeat(depth);
   const camelName = snakeToCamel(field.name);
   const argValues = formatArgValues(field);
-  const resolvedCls = field.resolvedType ? classMap.get(field.resolvedType) : undefined;
 
-  if (resolvedCls && resolvedCls.fields.length > 0 && !visited.has(resolvedCls.name)) {
-    visited.add(resolvedCls.name);
+  // Resolve the type: try resolvedType first, then fieldType itself
+  const typeName = field.resolvedType ?? field.fieldType;
+  const isScalar = SCALAR_TYPES.has(typeName);
+  const typeFields = !isScalar && !visited.has(typeName) ? getTypeFields(typeName, classMap) : [];
+
+  if (typeFields.length > 0) {
+    visited.add(typeName);
     lines.push(`${indent}${camelName}${argValues} {`);
-    for (const subField of resolvedCls.fields) {
+    for (const subField of typeFields) {
       renderField(subField, classMap, depth + 1, visited, lines);
     }
     lines.push(`${indent}}`);
-    visited.delete(resolvedCls.name);
+    visited.delete(typeName);
   } else {
     lines.push(`${indent}${camelName}${argValues}`);
   }

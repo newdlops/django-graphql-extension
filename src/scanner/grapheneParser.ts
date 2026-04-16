@@ -131,7 +131,28 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   function parseFileData(text: string, filePath: string): CachedFileData {
     const containsGraphene = /graphene/i.test(text);
     const imports = containsGraphene ? parseImports(text) : undefined;
-    const classes = extractClassesFromText(text);
+
+    // Build import alias map: alias → original name
+    // e.g., "from foo import Bar as Baz" → aliasMap["Baz"] = "Bar"
+    const aliasMap = new Map<string, string>();
+    const aliasRegex = /from\s+\S+\s+import\s+([^)]+(?:\([^)]*\))?)/gs;
+    let aliasMatch;
+    while ((aliasMatch = aliasRegex.exec(text)) !== null) {
+      const importBlock = aliasMatch[1].replace(/[()]/g, '');
+      for (const part of importBlock.split(',')) {
+        const asMatch = part.trim().match(/^(\w+)\s+as\s+(\w+)$/);
+        if (asMatch) {
+          aliasMap.set(asMatch[2], asMatch[1]); // alias → original
+        }
+      }
+    }
+
+    const rawClasses = extractClassesFromText(text);
+    // Resolve aliased base class names to original names
+    const classes = rawClasses.map((c) => ({
+      ...c,
+      baseClasses: c.baseClasses.map((bc) => aliasMap.get(bc) ?? bc),
+    }));
     const schemaEntries: { queryRootName?: string; mutationRootName?: string }[] = [];
     if (containsGraphene && imports) {
       detectSchemaCall(text, imports, (q, m) => {
@@ -349,6 +370,22 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   for (const raw of allRawClasses) {
     if (isDirectGrapheneClass(raw)) {
       grapheneClassNames.add(raw.name);
+    }
+  }
+
+  // Seed: classes that have .Field() registration pattern
+  // These are mutation wrapper classes that may not extend graphene bases
+  const dotFieldRegex = /^\s+\w+\s*=\s*\w+\.Field\s*\(/;
+  for (const raw of allRawClasses) {
+    if (grapheneClassNames.has(raw.name)) continue;
+    const classEnd = Math.min(raw.lineNumber + 20, raw.lines.length);
+    for (let li = raw.lineNumber + 1; li < classEnd; li++) {
+      const line = raw.lines[li];
+      if (/^\S/.test(line) && line.trim().length > 0) break; // end of class body
+      if (dotFieldRegex.test(line)) {
+        grapheneClassNames.add(raw.name);
+        break;
+      }
     }
   }
 
@@ -693,6 +730,7 @@ function parseClassFields(
       break;
     }
 
+    // Pattern 1: field = graphene.Type(...) or field = Type(...)
     const fieldMatch = line.match(/^\s+(\w+)\s*=\s*(?:graphene\.)?(\w+)\s*\(/);
     if (fieldMatch) {
       const fieldName = fieldMatch[1];
@@ -704,24 +742,7 @@ function parseClassFields(
         imports.fromGrapheneDjango.has(fieldType) ||
         /Field$/.test(fieldType)
       ) {
-        const afterEquals = line.substring(line.indexOf(fieldType));
-        const typeArgMatch = afterEquals.match(/\w+\s*\(\s*(\w+)/);
-        let resolvedType: string | undefined;
-        if (typeArgMatch) {
-          resolvedType = typeArgMatch[1];
-        } else {
-          // Multi-line field: look at subsequent lines for the first positional argument
-          for (let j = i + 1; j < lines.length && j <= i + 3; j++) {
-            const trimmed = lines[j].trim();
-            if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
-            if (trimmed.startsWith(')')) break;
-            const nextArgMatch = trimmed.match(/^(\w+)/);
-            if (nextArgMatch && !/^\w+\s*=/.test(trimmed)) {
-              resolvedType = nextArgMatch[1];
-            }
-            break;
-          }
-        }
+        const resolvedType = extractResolvedType(lines, i, fieldType);
 
         // Extract keyword arguments as field args
         const args = parseFieldArgs(lines, i);
@@ -729,19 +750,117 @@ function parseClassFields(
         fields.push({
           name: fieldName,
           fieldType,
-          resolvedType:
-            resolvedType && !['True', 'False', 'None', 'lambda'].includes(resolvedType)
-              ? resolvedType
-              : undefined,
+          resolvedType,
           args: args.length > 0 ? args : undefined,
           filePath,
           lineNumber: i,
         });
+        continue;
       }
+    }
+
+    // Pattern 2: field = ClassName.Field() — mutation/relay registration pattern
+    const dotFieldMatch = line.match(/^\s+(\w+)\s*=\s*(\w+)\.Field\s*\(/);
+    if (dotFieldMatch) {
+      const fieldName = dotFieldMatch[1];
+      const className = dotFieldMatch[2];
+
+      fields.push({
+        name: fieldName,
+        fieldType: 'Field',
+        resolvedType: className,
+        filePath,
+        lineNumber: i,
+      });
     }
   }
 
   return fields;
+}
+
+const NON_TYPE_WORDS = new Set([
+  'True', 'False', 'None', 'lambda', 'self', 'info', 'root',
+  'required', 'description', 'default_value', 'deprecation_reason',
+  'source', 'resolver', 'name',
+]);
+
+function extractResolvedType(lines: string[], fieldLineNumber: number, fieldType: string): string | undefined {
+  // Collect the full field definition text (up to 15 lines or closing paren)
+  let fullText = '';
+  let depth = 0;
+  for (let j = fieldLineNumber; j < lines.length && j < fieldLineNumber + 15; j++) {
+    const line = lines[j];
+    for (const ch of line) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+    }
+    fullText += line + '\n';
+    if (depth <= 0 && j > fieldLineNumber) break;
+  }
+
+  // Find the opening paren of the field type call
+  const typeCallIdx = fullText.indexOf(fieldType);
+  if (typeCallIdx === -1) return undefined;
+  const afterType = fullText.substring(typeCallIdx + fieldType.length).trimStart();
+  if (!afterType.startsWith('(')) return undefined;
+  const argsContent = afterType.substring(1); // after '('
+
+  // Extract the first positional argument (before any keyword arg)
+  // Skip whitespace and newlines
+  const trimmed = argsContent.trimStart();
+
+  // Pattern 1: lambda: Type
+  const lambdaMatch = trimmed.match(/^lambda\s*:\s*(\w+)/);
+  if (lambdaMatch) {
+    const t = lambdaMatch[1];
+    return NON_TYPE_WORDS.has(t) ? undefined : t;
+  }
+
+  // Pattern 2: 'StringType' or "StringType" (string reference)
+  const strMatch = trimmed.match(/^['"](\w+)['"]/);
+  if (strMatch) {
+    const t = strMatch[1];
+    return NON_TYPE_WORDS.has(t) ? undefined : t;
+  }
+
+  // Pattern 3: Regular positional argument — first word that's not a keyword arg
+  const firstArgMatch = trimmed.match(/^(\w+)/);
+  if (firstArgMatch) {
+    const word = firstArgMatch[1];
+    // Check it's not a keyword argument (word followed by =)
+    const afterWord = trimmed.substring(firstArgMatch[0].length).trimStart();
+    if (afterWord.startsWith('=')) return undefined; // keyword arg, not type
+    if (NON_TYPE_WORDS.has(word)) return undefined;
+    // Must start with uppercase to be a type
+    if (/^[A-Z]/.test(word)) return word;
+  }
+
+  // Pattern 4: Multi-line — first line is empty or comment, look at next lines
+  const linesList = argsContent.split('\n');
+  for (const argLine of linesList) {
+    const t = argLine.trim();
+    if (t.length === 0 || t.startsWith('#') || t.startsWith(')')) continue;
+
+    // lambda: Type
+    const lm = t.match(/^lambda\s*:\s*(\w+)/);
+    if (lm) return NON_TYPE_WORDS.has(lm[1]) ? undefined : lm[1];
+
+    // 'StringType'
+    const sm = t.match(/^['"](\w+)['"]/);
+    if (sm) return NON_TYPE_WORDS.has(sm[1]) ? undefined : sm[1];
+
+    // Regular word
+    const wm = t.match(/^(\w+)/);
+    if (wm) {
+      const after = t.substring(wm[0].length).trimStart();
+      if (after.startsWith('=')) continue; // keyword arg — skip to next line
+      if (NON_TYPE_WORDS.has(wm[1])) return undefined;
+      if (/^[A-Z]/.test(wm[1])) return wm[1];
+    }
+    break;
+  }
+
+  return undefined;
 }
 
 const GRAPHENE_ARG_TYPES: Record<string, string> = {

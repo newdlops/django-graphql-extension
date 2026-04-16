@@ -52,6 +52,41 @@ export function activate(context: vscode.ExtensionContext) {
     },
   );
 
+  const showMissingFieldsCommand = vscode.commands.registerCommand(
+    'djangoGraphqlExplorer.showMissingFields',
+    (typeName: string, used: string[], missing: { name: string; type: string }[]) => {
+      const panel = vscode.window.createWebviewPanel(
+        'missingFields', `Missing fields — ${typeName}`,
+        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+      );
+      const usedHtml = used.map((n) => `<div class="field used">${n}</div>`).join('');
+      const missingHtml = missing.map((f) =>
+        `<div class="field missing">${f.name}<span class="type">${f.type}</span></div>`
+      ).join('');
+      panel.webview.html = [
+        '<!DOCTYPE html><html><head><style>',
+        'body { font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 16px; }',
+        'h2 { font-size: 14px; margin: 0 0 8px; color: var(--vscode-foreground); }',
+        '.summary { margin-bottom: 16px; color: var(--vscode-descriptionForeground); }',
+        '.section { margin-bottom: 16px; }',
+        '.section-title { font-weight: bold; margin-bottom: 4px; }',
+        '.field { padding: 2px 8px; font-family: inherit; }',
+        '.used { opacity: 0.5; }',
+        '.used::before { content: "✓ "; color: #4ec9b0; }',
+        '.missing { }',
+        '.missing::before { content: "✗ "; color: #f44747; }',
+        '.type { margin-left: 8px; color: var(--vscode-descriptionForeground); }',
+        '.type::before { content: ": "; }',
+        '</style></head><body>',
+        `<h2>${typeName}</h2>`,
+        `<div class="summary">${used.length} queried, ${missing.length} available but not queried</div>`,
+        `<div class="section"><div class="section-title">Queried (${used.length})</div>${usedHtml}</div>`,
+        `<div class="section"><div class="section-title">Not queried (${missing.length})</div>${missingHtml}</div>`,
+        '</body></html>',
+      ].join('\n');
+    },
+  );
+
   let refreshing = false;
   let pendingRefresh = false;
 
@@ -141,7 +176,7 @@ export function activate(context: vscode.ExtensionContext) {
   gqlWatcher.onDidCreate(debouncedRefresh);
   gqlWatcher.onDidDelete(debouncedRefresh);
 
-  context.subscriptions.push(refreshCommand, openClassCommand, pyWatcher, gqlWatcher);
+  context.subscriptions.push(refreshCommand, openClassCommand, showMissingFieldsCommand, pyWatcher, gqlWatcher);
 
   // Initial scan
   refresh();

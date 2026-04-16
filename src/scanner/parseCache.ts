@@ -26,7 +26,7 @@ export interface CachedFileData {
   imports: CachedImportInfo;
 }
 
-const CACHE_KEY = 'grapheneParseCache.v1';
+const CACHE_KEY = 'grapheneParseCache.v5';
 
 export class ParseCache {
   private cache = new Map<string, CachedFileData>();
