@@ -1,10 +1,23 @@
 import { QueryStructure, QueryStructureNode, QueryStructureArg } from '../analysis/queryStructure';
 
 /**
+ * Per-render state threaded through `renderRoot` / `renderField` — produces
+ * unique DOM ids for lazy-expand placeholders and tracks the ancestry chain
+ * of resolved types so deeper lazy requests can reapply the cycle guard.
+ */
+interface RenderState {
+  nextId: number;
+  ancestry: string[];
+}
+
+/**
  * Render a QueryStructure as beautified JSON-ish HTML: collapsible `{ … }`
  * blocks, per-field ✓/✗ markers, argument lists inline. Intended as the body
  * content pushed into the Live Query Inspector webview on each cursor move —
  * lightweight, no external libraries, uses native <details> for expand/collapse.
+ * Fields that hit the depth cap (`hasMoreChildren=true`) render a lazy
+ * ▸ expand marker; the shell's JS intercepts the click and posts a message
+ * back to the extension to fetch the deeper subtree.
  */
 export function renderQueryStructureJsonHtml(structure: QueryStructure): string {
   const summary = `
@@ -14,8 +27,19 @@ export function renderQueryStructureJsonHtml(structure: QueryStructure): string 
       <span class="muted">of ${structure.totalCount} total fields</span>
     </div>`;
 
-  const body = renderRoot(structure.rootField);
+  const state: RenderState = { nextId: 0, ancestry: [structure.rootTypeName] };
+  const body = renderRoot(structure.rootField, state);
   return summary + `<pre class="json-tree">${body}</pre>`;
+}
+
+/** Same shape as `OperationVariable` in gqlCursorResolver, re-declared here
+ *  so queryStructureJson doesn't take a hard dependency on cursor-resolver. */
+export interface TemplateOperationVariable {
+  name: string;
+  type: string;
+  required: boolean;
+  list: boolean;
+  defaultValue?: string;
 }
 
 /**
@@ -26,6 +50,7 @@ export function renderQueryStructureJsonHtml(structure: QueryStructure): string 
 export function renderTemplateStructuresHtml(params: {
   operationKind: string;
   operationName?: string;
+  operationVariables?: TemplateOperationVariable[];
   structures: Array<{ structure: QueryStructure; note?: string }>;
   unresolved: Array<{ name: string; reason: string }>;
 }): string {
@@ -40,12 +65,19 @@ export function renderTemplateStructuresHtml(params: {
       <span class="pill pill-q">✓ ${aggQueried} queried</span>
       <span class="pill pill-m">✗ ${aggTotal - aggQueried} missing</span>
       <span class="muted">across ${params.structures.length} root field${params.structures.length === 1 ? '' : 's'}</span>
-    </div>`;
+    </div>${renderOperationVariables(params.operationVariables ?? [])}`;
 
   const blocks: string[] = [];
+  // Per-literal nextId sequence, so each <pre class="json-tree"> block owns
+  // its own DOM id space. The upper 16 bits disambiguate blocks from each
+  // other in case a lazy response referencing one block lands in the DOM
+  // before another block finishes rendering.
+  let blockIndex = 0;
   for (const { structure, note } of params.structures) {
     const noteHtml = note ? `<div class="root-note">${escape(note)}</div>` : '';
-    blocks.push(`${noteHtml}<pre class="json-tree">${renderRoot(structure.rootField)}</pre>`);
+    const state: RenderState = { nextId: blockIndex << 16, ancestry: [structure.rootTypeName] };
+    blocks.push(`${noteHtml}<pre class="json-tree">${renderRoot(structure.rootField, state)}</pre>`);
+    blockIndex++;
   }
   if (params.unresolved.length > 0) {
     blocks.push(`<div class="unresolved-section">`);
@@ -59,7 +91,7 @@ export function renderTemplateStructuresHtml(params: {
   return summary + blocks.join('\n');
 }
 
-function renderRoot(node: QueryStructureNode): string {
+function renderRoot(node: QueryStructureNode, state: RenderState): string {
   // Root: `displayName: TypeLabel { ... }`
   const hasChildren = node.children.length > 0;
   const argBlock = renderArgs(node.args);
@@ -67,7 +99,7 @@ function renderRoot(node: QueryStructureNode): string {
 
   if (!hasChildren) return `<span class="line">${header}</span>`;
 
-  const inner = node.children.map((c) => renderField(c, 1)).join(',\n');
+  const inner = node.children.map((c) => renderField(c, 1, state)).join(',\n');
   return [
     `<details open class="block block-root">`,
     `<summary><span class="line">${header} <span class="brace">{</span></span></summary>`,
@@ -77,7 +109,7 @@ function renderRoot(node: QueryStructureNode): string {
   ].join('\n');
 }
 
-function renderField(node: QueryStructureNode, depth: number): string {
+function renderField(node: QueryStructureNode, depth: number, state: RenderState): string {
   const marker = node.queried
     ? '<span class="mark mark-q">✓</span>'
     : '<span class="mark mark-m">✗</span>';
@@ -91,14 +123,16 @@ function renderField(node: QueryStructureNode, depth: number): string {
   const argBlock = renderArgs(node.args);
 
   const keyLine = `${indent}${marker}<span class="${keyClass}">${escape(node.displayName)}</span>${argBlock}: `;
+  const isList = /^\[/.test(node.typeLabel);
+  const hasChildren = node.children.length > 0;
+  const isLazy = !hasChildren && node.hasMoreChildren && !!node.resolvedType;
 
-  // Leaf field: no children to expand.
-  if (node.children.length === 0) {
+  // Leaf field: no children to expand AND no lazy handle.
+  if (!hasChildren && !isLazy) {
     return `<span class="line ${node.queried ? 'line-q' : 'line-m'}">${keyLine}<span class="${typeClass}">${escape(node.typeLabel)}</span></span>`;
   }
 
   // Object/list field — collapsible. List types are surfaced with [] brackets.
-  const isList = /^\[/.test(node.typeLabel);
   const open = isList ? '<span class="brace">[{</span>' : '<span class="brace">{</span>';
   const close = isList ? '<span class="brace">}]</span>' : '<span class="brace">}</span>';
 
@@ -106,7 +140,28 @@ function renderField(node: QueryStructureNode, depth: number): string {
     ? `<span class="${typeClass}">${escape(stripBrackets(node.typeLabel))}</span>`
     : `<span class="${typeClass}">${escape(node.typeLabel)}</span>`;
 
-  const inner = node.children.map((c) => renderField(c, depth + 1)).join(',\n');
+  // Lazy block: same `<details>` shape as a fully-expanded block, but starts
+  // closed and carries `data-lazy-*` attributes that the shell's toggle
+  // listener uses to fetch the inner subtree on first open. Keeping the
+  // structure identical to the expanded case is what makes the lazy-loaded
+  // content align (indent + line spacing) with the surrounding tree.
+  if (isLazy) {
+    const nodeId = state.nextId++;
+    const ancestryAttr = escape(state.ancestry.join(','));
+    return [
+      `<details class="block block-lazy ${node.queried ? 'block-q' : 'block-m'}" data-node-id="${nodeId}" data-lazy-type="${escape(node.resolvedType!)}" data-ancestry="${ancestryAttr}" data-depth="${depth}">`,
+      `<summary><span class="line">${keyLine}${typeTag} ${open}</span></summary>`,
+      `<div class="lazy-content"></div>`,
+      `<span class="line">${indentSpan(depth)}${close}</span>`,
+      `</details>`,
+    ].join('\n');
+  }
+
+  // Push the resolved class onto the ancestry chain so any deeper lazy
+  // markers emitted inside the children carry the full cycle-guard context.
+  if (node.resolvedType) state.ancestry.push(node.resolvedType);
+  const inner = node.children.map((c) => renderField(c, depth + 1, state)).join(',\n');
+  if (node.resolvedType) state.ancestry.pop();
 
   return [
     `<details open class="block ${node.queried ? 'block-q' : 'block-m'}">`,
@@ -115,6 +170,54 @@ function renderField(node: QueryStructureNode, depth: number): string {
     `<span class="line">${indentSpan(depth)}${close}</span>`,
     `</details>`,
   ].join('\n');
+}
+
+/**
+ * Render the response to a lazy-expand request as an HTML fragment that the
+ * shell JS drops into a `.lazy-content` slot inside the already-rendered
+ * `<details class="block-lazy">` wrapper. `startDepth` is the *child* indent
+ * level — i.e., one deeper than the clicked field's own depth — so the new
+ * lines align with siblings they'd have had if they were rendered eagerly.
+ */
+export function renderJsonSubtreeHtml(
+  nodes: QueryStructureNode[],
+  ancestry: string[],
+  startDepth: number,
+): string {
+  // Use a unique-ish starting id so these nodes don't collide with the
+  // initial render's ids in the same document. Collision would make
+  // `document.querySelector` pick the wrong row on further expansion.
+  const state: RenderState = { nextId: Date.now() & 0xffffff, ancestry: [...ancestry] };
+  return nodes.map((n) => renderField(n, startDepth, state)).join(',\n');
+}
+
+/**
+ * Render the operation-level variables block that appears at the top of the
+ * Live Inspector. Surfaces the exact same signature the user wrote, so they
+ * can verify at a glance what the gql operation accepts — e.g.
+ *     query RtccEmailList(
+ *       $companyId: ID!
+ *       $rightToConsentOrConsultId: ID!
+ *       $page: Int
+ *       $perPage: Int
+ *     )
+ * This complements the per-field arg list rendered next to each root field.
+ */
+function renderOperationVariables(vars: TemplateOperationVariable[]): string {
+  if (vars.length === 0) return '';
+  const rows = vars
+    .map((v) => {
+      const reqMark = v.required ? '!' : '';
+      const typeText = v.list ? `[${escape(v.type)}]${reqMark}` : `${escape(v.type)}${reqMark}`;
+      const def = v.defaultValue ? ` <span class="opvar-default">= ${escape(v.defaultValue)}</span>` : '';
+      return `    <span class="opvar"><span class="opvar-name">$${escape(v.name)}</span>: <span class="opvar-type">${typeText}</span>${def}</span>`;
+    })
+    .join(',\n');
+  return `
+    <div class="op-variables">
+      <div class="op-variables-title">Variables (${vars.length})</div>
+      <pre class="op-variables-body">(\n${rows}\n)</pre>
+    </div>`;
 }
 
 function renderArgs(args: QueryStructureArg[]): string {
@@ -183,6 +286,14 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 
 .brace { color: var(--vscode-descriptionForeground); font-weight: 600; }
 
+/* Lazy <details> wrapper — starts collapsed; the summary's ▸ chevron doubles
+   as the affordance. Tint the chevron so users notice it triggers a load on
+   the first open. */
+details.block-lazy > summary:before { color: var(--vscode-textLink-foreground, #3794ff); }
+details.block-lazy > summary:hover:before { color: var(--vscode-editor-foreground); }
+.lazy-content { display: block; }
+.lazy-error { color: #f44747; font-size: 0.82em; margin-left: 6px; }
+
 details.block { padding: 0; margin: 0; }
 details.block > summary { cursor: pointer; list-style: none; display: block; }
 details.block > summary::-webkit-details-marker { display: none; }
@@ -202,6 +313,13 @@ details.block-q > summary .key-queried { /* keep existing colors */ }
 .legend { padding: 8px 14px; border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); color: var(--vscode-descriptionForeground); font-size: 0.78em; }
 
 .op-label { display: inline-block; padding: 1px 8px; margin-right: 8px; border-radius: 3px; font-size: 0.85em; font-weight: 600; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+.op-variables { margin: 8px 14px 0; padding: 6px 10px; border: 1px dashed rgba(128,128,128,0.3); border-radius: 4px; background: var(--vscode-editorWidget-background, rgba(128,128,128,0.05)); }
+.op-variables-title { font-size: 0.78em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); margin-bottom: 2px; }
+.op-variables-body { margin: 0; font-family: var(--vscode-editor-font-family, Menlo, monospace); font-size: 0.9em; white-space: pre; color: var(--vscode-editor-foreground); }
+.opvar { display: inline; }
+.opvar-name { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
+.opvar-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
+.opvar-default { color: var(--vscode-descriptionForeground); font-style: italic; }
 .root-note { padding: 4px 14px 0; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
 .unresolved-section { margin: 14px 14px 0; padding: 8px 12px; border: 1px dashed rgba(128,128,128,0.35); border-radius: 4px; }
 .unresolved-title { font-size: 0.8em; font-weight: 600; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }

@@ -113,6 +113,86 @@ describe('parseGqlFields fragment inlining', () => {
   });
 });
 
+describe('parseGqlFields — argName extraction', () => {
+  it('records the names of args the user wrote on a field', () => {
+    const gql = `
+      query Q($cid: ID!, $page: Int) {
+        rtccEmailList(companyId: $cid, page: $page) {
+          id
+        }
+      }
+    `;
+    const parsed = parseGqlFields(gql);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].name).toBe('rtccEmailList');
+    expect(parsed[0].argNames).toEqual(['companyId', 'page']);
+  });
+
+  it('skips nested values (objects, arrays, strings) when collecting arg names', () => {
+    const gql = `
+      mutation M {
+        createThing(input: { name: "Hello, world", tags: [1, 2, 3] }, meta: { a: 1 })
+      }
+    `;
+    const parsed = parseGqlFields(gql);
+    // Only the TOP-level arg names, not nested keys inside values.
+    expect(parsed[0].argNames).toEqual(['input', 'meta']);
+  });
+
+  it('sets argNames to undefined when the field has no `(...)`', () => {
+    const gql = `query Q { me { id } }`;
+    const parsed = parseGqlFields(gql);
+    expect(parsed[0].argNames).toBeUndefined();
+    expect(parsed[0].children[0].argNames).toBeUndefined();
+  });
+
+  it('records an empty array when the user wrote `()` with nothing inside', () => {
+    const gql = `query Q { foo() { bar } }`;
+    const parsed = parseGqlFields(gql);
+    expect(parsed[0].argNames).toEqual([]);
+  });
+
+  it('collects every arg when the gql uses comma-less list formatting', () => {
+    // GraphQL allows whitespace-only separators between args. Captain's real
+    // queries are written this way — all-on-new-lines without commas.
+    const gql = `
+      query RtccEmailList(
+        $companyId: ID!
+        $rightToConsentOrConsultId: ID!
+        $page: Int
+        $perPage: Int
+      ) {
+        rtccEmailList(
+          companyId: $companyId
+          rightToConsentOrConsultId: $rightToConsentOrConsultId
+          page: $page
+          perPage: $perPage
+        ) {
+          id
+        }
+      }
+    `;
+    const parsed = parseGqlFields(gql);
+    expect(parsed[0].argNames).toEqual([
+      'companyId', 'rightToConsentOrConsultId', 'page', 'perPage',
+    ]);
+  });
+
+  it('does not confuse enum / boolean values with the next arg name', () => {
+    // `status: ACTIVE` — ACTIVE is an enum literal, not an arg. Without the
+    // `Name:` lookahead guard the scanner would stop at `published:` here.
+    const gql = `
+      query Q {
+        posts(status: ACTIVE published: true flag: false) {
+          id
+        }
+      }
+    `;
+    const parsed = parseGqlFields(gql);
+    expect(parsed[0].argNames).toEqual(['status', 'published', 'flag']);
+  });
+});
+
 describe('collectDocumentFragments — cross-literal fragment inlining', () => {
   it('resolves `...F` in one gql literal when F is defined in another', () => {
     const docText = `

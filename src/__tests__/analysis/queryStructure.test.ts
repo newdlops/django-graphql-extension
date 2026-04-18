@@ -149,6 +149,54 @@ describe('buildLazySubtree — on-demand deeper expansion', () => {
     expect(companyNode.children).toEqual([]); // nothing to expand
   });
 
+  it('shows only the args the user wrote in gql, not every backend arg', () => {
+    // Backend declares 4 args; user's gql only passed 2. The Query Structure
+    // header must list those 2 (marked provided), not all 4 — otherwise the
+    // UI is noisy and pretends the user supplied args they didn't.
+    const retType = cls('Ret', [f('id', 'Int')]);
+    const rootField: FieldInfo = {
+      name: 'rtcc_email_list',
+      fieldType: 'Field',
+      resolvedType: 'Ret',
+      filePath: '/q.py',
+      lineNumber: 0,
+      args: [
+        { name: 'company_id', type: 'ID', required: true },
+        { name: 'right_to_consent_or_consult_id', type: 'ID', required: true },
+        { name: 'page', type: 'Int', required: false },
+        { name: 'per_page', type: 'Int', required: false },
+      ],
+    };
+    const gf = firstRoot('query Q($cid: ID!, $page: Int) { rtccEmailList(companyId: $cid, page: $page) { id } }')!;
+    const s = buildQueryStructure(gf, retType, new Map([[retType.name, retType]]), undefined, rootField);
+
+    const names = s.rootField.args.map((a) => a.name);
+    expect(names).toEqual(['company_id', 'page']);
+    expect(s.rootField.args.every((a) => a.provided)).toBe(true);
+  });
+
+  it('falls back to the full backend arg list when the gql has no arg list', () => {
+    const retType = cls('Ret', [f('id', 'Int')]);
+    const rootField: FieldInfo = {
+      name: 'foo',
+      fieldType: 'Field',
+      resolvedType: 'Ret',
+      filePath: '/q.py',
+      lineNumber: 0,
+      args: [
+        { name: 'a', type: 'Int', required: false },
+        { name: 'b', type: 'Int', required: false },
+      ],
+    };
+    // No `(...)` on `foo` — we don't know what the user provided, so show
+    // the full backend surface area.
+    const gf = firstRoot('query { foo { id } }')!;
+    const s = buildQueryStructure(gf, retType, new Map([[retType.name, retType]]), undefined, rootField);
+    const names = s.rootField.args.map((a) => a.name);
+    expect(names).toEqual(['a', 'b']);
+    expect(s.rootField.args.every((a) => a.provided === false)).toBe(true);
+  });
+
   it('surfaces rootFieldInfo.args on the root node when supplied', () => {
     const retType = cls('RtccEmailEmailList', [f('id', 'Int')]);
     const rootField: FieldInfo = {

@@ -20,9 +20,25 @@ export interface TemplateRoot {
   targetClass?: ClassInfo;
 }
 
+/**
+ * One operation-level variable declared after the operation name, e.g.
+ * `$companyId: ID!` → `{ name: 'companyId', type: 'ID', required: true }`.
+ * These appear only on named operations — inline queries without a name and
+ * without parens carry no variables.
+ */
+export interface OperationVariable {
+  name: string;
+  type: string;
+  required: boolean;
+  list: boolean;
+  defaultValue?: string;
+}
+
 export interface TemplateContext {
   operationKind: 'query' | 'mutation' | 'subscription' | 'unknown';
   operationName?: string;
+  /** Variables declared in the operation's `(...)` header. Empty when absent. */
+  operationVariables: OperationVariable[];
   /** Every top-level field inside the operation body. */
   roots: TemplateRoot[];
   bodyStart: number;
@@ -65,6 +81,7 @@ export function resolveTemplateAtCursor(
     const opMatch = gqlBody.match(/^\s*(query|mutation|subscription)\b\s*(\w+)?/);
     const operationKind = (opMatch?.[1] as TemplateContext['operationKind']) ?? 'unknown';
     const operationName = opMatch?.[2];
+    const operationVariables = parseOperationVariables(gqlBody);
 
     const roots: TemplateRoot[] = parsed.map((gf) => {
       const snake = camelToSnake(gf.name);
@@ -75,9 +92,103 @@ export function resolveTemplateAtCursor(
       return { gqlField: gf, match, targetClass: target };
     });
 
-    return { operationKind, operationName, roots, bodyStart, bodyEnd };
+    return { operationKind, operationName, operationVariables, roots, bodyStart, bodyEnd };
   }
   return null;
+}
+
+/**
+ * Parse the variable declarations from a named operation header, e.g.
+ *     query RtccEmailList($companyId: ID!, $page: Int) { … }
+ * Returns each `$name: Type` pair (commas optional), with `list` and
+ * `required` extracted from the GraphQL type syntax. Default values (`= …`)
+ * are kept verbatim as a display hint. Designed to run on the stripped gql
+ * body so `${…}` interpolations don't confuse it.
+ */
+export function parseOperationVariables(gql: string): OperationVariable[] {
+  const out: OperationVariable[] = [];
+  const opRe = /^\s*(?:query|mutation|subscription)\b\s*(?:\w+\s*)?\(/;
+  const headerMatch = gql.match(opRe);
+  if (!headerMatch) return out;
+  const openIdx = headerMatch[0].length - 1;
+  // Find the matching close paren.
+  let depth = 1;
+  let i = openIdx + 1;
+  while (i < gql.length && depth > 0) {
+    if (gql[i] === '(') depth++;
+    else if (gql[i] === ')') { depth--; if (depth === 0) break; }
+    i++;
+  }
+  const end = i;
+
+  i = openIdx + 1;
+  while (i < end) {
+    while (i < end && /[\s,]/.test(gql[i])) i++;
+    if (gql[i] === '#') { while (i < end && gql[i] !== '\n') i++; continue; }
+    if (i >= end) break;
+    if (gql[i] !== '$') { i++; continue; }
+    i++; // past `$`
+    const nameMatch = gql.substring(i, end).match(/^([A-Za-z_]\w*)/);
+    if (!nameMatch) continue;
+    const name = nameMatch[1];
+    i += nameMatch[0].length;
+    while (i < end && /\s/.test(gql[i])) i++;
+    if (gql[i] !== ':') continue;
+    i++; // past `:`
+    while (i < end && /\s/.test(gql[i])) i++;
+    // Type ::= NamedType '!'? | '[' Type ']' '!'?
+    let typeText = '';
+    // Balance `[ ]` inside the type.
+    let bracketDepth = 0;
+    while (i < end) {
+      const ch = gql[i];
+      if (ch === '[') { bracketDepth++; typeText += ch; i++; continue; }
+      if (ch === ']') { if (bracketDepth === 0) break; bracketDepth--; typeText += ch; i++; continue; }
+      if (/[A-Za-z0-9_!]/.test(ch)) { typeText += ch; i++; continue; }
+      if (bracketDepth === 0) break;
+      // whitespace inside brackets — ignore.
+      i++;
+    }
+    const trimmedType = typeText.trim();
+    const list = /^\[/.test(trimmedType);
+    const required = /!$/.test(trimmedType);
+    // Strip outer brackets and trailing `!`s to get the inner type name.
+    let inner = trimmedType.replace(/^!+$/, '');
+    if (list) inner = inner.replace(/^\[+/, '').replace(/\]+!?$/, '');
+    inner = inner.replace(/!+$/, '');
+    // Default value: `= …`. Capture up to the next top-level `,` / `)` /
+    // `$`, or the bracket end.
+    let defaultValue: string | undefined;
+    while (i < end && /\s/.test(gql[i])) i++;
+    if (gql[i] === '=') {
+      i++;
+      while (i < end && /\s/.test(gql[i])) i++;
+      const vStart = i;
+      let vDepth = 0;
+      let inString: string | null = null;
+      while (i < end) {
+        const ch = gql[i];
+        if (inString) {
+          if (ch === '\\') { i += 2; continue; }
+          if (ch === inString) inString = null;
+          i++;
+          continue;
+        }
+        if (ch === '"' || ch === "'") { inString = ch; i++; continue; }
+        if (ch === '(' || ch === '[' || ch === '{') { vDepth++; i++; continue; }
+        if (ch === ')' || ch === ']' || ch === '}') {
+          if (vDepth === 0) break;
+          vDepth--; i++; continue;
+        }
+        if (ch === ',' && vDepth === 0) break;
+        if (ch === '$' && vDepth === 0) break;
+        i++;
+      }
+      defaultValue = gql.substring(vStart, i).trim() || undefined;
+    }
+    out.push({ name, type: inner, required, list, defaultValue });
+  }
+  return out;
 }
 
 /**

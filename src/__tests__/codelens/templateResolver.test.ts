@@ -86,4 +86,47 @@ describe('resolveTemplateAtCursor (phase δ)', () => {
     expect(tpl.operationName).toBe('CreateUser');
     expect(tpl.roots[0].targetClass?.name).toBe('UserType');
   });
+
+  it('parses operation-level variables (captain pattern with comma-less list)', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [
+      f('rtcc_email_list', 'Field', { resolvedType: 'UserType' }),
+    ], 'query');
+    const ctx = ctxFor([userType, query]);
+
+    const src = [
+      'const q = gql`',
+      '  query RtccEmailList(',
+      '    $companyId: ID!',
+      '    $rightToConsentOrConsultId: ID!',
+      '    $page: Int',
+      '    $perPage: Int = 20',
+      '    $tags: [String!]',
+      '  ) {',
+      '    rtccEmailList(companyId: $companyId) { id }',
+      '  }',
+      '`;',
+    ].join('\n');
+
+    const tpl = resolveTemplateAtCursor(src, src.indexOf('rtccEmailList'), ctx)!;
+    expect(tpl.operationName).toBe('RtccEmailList');
+    expect(tpl.operationVariables).toHaveLength(5);
+
+    const byName = new Map(tpl.operationVariables.map((v) => [v.name, v]));
+    expect(byName.get('companyId')).toMatchObject({ type: 'ID', required: true, list: false });
+    expect(byName.get('rightToConsentOrConsultId')).toMatchObject({ type: 'ID', required: true, list: false });
+    expect(byName.get('page')).toMatchObject({ type: 'Int', required: false, list: false });
+    expect(byName.get('perPage')).toMatchObject({ type: 'Int', required: false, list: false, defaultValue: '20' });
+    expect(byName.get('tags')).toMatchObject({ type: 'String', required: false, list: true });
+  });
+
+  it('returns an empty operationVariables list when the operation has no (…) header', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFor([userType, query]);
+
+    const src = 'gql`query { user { id } }`;';
+    const tpl = resolveTemplateAtCursor(src, src.indexOf('user'), ctx)!;
+    expect(tpl.operationVariables).toEqual([]);
+  });
 });

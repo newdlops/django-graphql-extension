@@ -211,6 +211,174 @@ describe('parseClassFields — @dataclass annotation fields', () => {
   });
 });
 
+describe('mutation args — nested Arguments / TypedArguments / Input class', () => {
+  it('extracts graphene-style `class Arguments:` fields on `ClassName.Field()` mutation', async () => {
+    __setMockFiles({
+      '/root/schema.py': [
+        'import graphene',
+        'from .mutation import Mutation',
+        'schema = graphene.Schema(mutation=Mutation)',
+      ].join('\n'),
+      '/root/mutation.py': [
+        'import graphene',
+        '',
+        'class CreateFoo(graphene.Mutation):',
+        '    class Arguments:',
+        '        name = graphene.String(required=True)',
+        '        count = graphene.Int()',
+        '',
+        '    ok = graphene.Boolean()',
+        '',
+        'class Mutation(graphene.ObjectType):',
+        '    create_foo = CreateFoo.Field()',
+      ].join('\n'),
+    });
+
+    const schemas = await parseGrapheneSchemas('/root');
+    const all = [
+      ...schemas.flatMap((s) => s.queries),
+      ...schemas.flatMap((s) => s.mutations),
+      ...schemas.flatMap((s) => s.types),
+    ];
+    const mutationRoot = all.find((c) => c.name === 'Mutation')!;
+    const field = mutationRoot.fields.find((f) => f.name === 'create_foo')!;
+    const args = field.args ?? [];
+    const byName = new Map(args.map((a) => [a.name, a]));
+    expect(byName.get('name')!.required).toBe(true);
+    expect(byName.get('name')!.type).toBe('String');
+    expect(byName.get('count')!.required).toBe(false);
+    expect(byName.get('count')!.type).toBe('Int');
+  });
+
+  it('does NOT leak class-level type hints (validate/execute) as mutation args', async () => {
+    // Captain's TypedBaseMutation has `validate: Callable[...]`,
+    // `execute: Callable[...]` type hints at the class body level (not
+    // inside `TypedArguments`). Those are attribute/method type hints, not
+    // args — the resolver must skip them. Regression for a pipeline where
+    // the Query Structure header was showing `validate`, `execute`,
+    // `post_execute`, `__build_context__` as mutation arguments.
+    __setMockFiles({
+      '/root/schema.py': [
+        'import graphene',
+        'from .mutation import Mutation',
+        'schema = graphene.Schema(mutation=Mutation)',
+      ].join('\n'),
+      '/root/base.py': [
+        'import graphene',
+        'from typing import Callable, TypedDict, Self',
+        '',
+        'class TypedBaseMutation(graphene.Mutation):',
+        '    class TypedArguments(TypedDict):',
+        '        pass',
+        '',
+        '    ok = graphene.Boolean()',
+        '    errors = graphene.Field(object)',
+        '',
+        '    validate: Callable[..., object]',
+        '    execute: Callable[..., Self]',
+        '    post_execute: Callable[..., None]',
+        '    __build_context__: Callable[..., None]',
+      ].join('\n'),
+      '/root/mutation.py': [
+        'import graphene',
+        'from .base import TypedBaseMutation',
+        '',
+        'class CreateFoo(TypedBaseMutation):',
+        '    class TypedArguments(TypedBaseMutation.TypedArguments):',
+        '        name: str',
+        '        count: int',
+        '',
+        'class CreateFooMutation:',
+        '    create_foo = CreateFoo.Field(required=True)',
+        '',
+        'class Mutation(CreateFooMutation, graphene.ObjectType):',
+        '    pass',
+      ].join('\n'),
+    });
+
+    const schemas = await parseGrapheneSchemas('/root');
+    const all = [
+      ...schemas.flatMap((s) => s.queries),
+      ...schemas.flatMap((s) => s.mutations),
+      ...schemas.flatMap((s) => s.types),
+    ];
+    const outer = all.find((c) => c.name === 'CreateFooMutation')!;
+    const field = outer.fields.find((f) => f.name === 'create_foo')!;
+    const args = field.args ?? [];
+    const names = args.map((a) => a.name);
+
+    // Actual args from TypedArguments must be present.
+    expect(names).toContain('name');
+    expect(names).toContain('count');
+    // Class-level type hints on TypedBaseMutation must NOT be args.
+    expect(names).not.toContain('validate');
+    expect(names).not.toContain('execute');
+    expect(names).not.toContain('post_execute');
+    expect(names).not.toContain('__build_context__');
+    // Assignment fields on TypedBaseMutation (ok, errors) must not be args either.
+    expect(names).not.toContain('ok');
+    expect(names).not.toContain('errors');
+  });
+
+  it('extracts captain-style `class TypedArguments:` annotation fields (with dotted inheritance)', async () => {
+    __setMockFiles({
+      '/root/schema.py': [
+        'import graphene',
+        'from .mutation import Mutation',
+        'schema = graphene.Schema(mutation=Mutation)',
+      ].join('\n'),
+      '/root/base.py': [
+        'import graphene',
+        'from typing import TypedDict',
+        '',
+        'class TypedBaseMutation(graphene.Mutation):',
+        '    class TypedArguments(TypedDict):',
+        '        client_mutation_id: str',
+        '',
+        '    ok = graphene.Boolean()',
+      ].join('\n'),
+      '/root/mutation.py': [
+        'import graphene',
+        'from typing import TypedDict',
+        'from .base import TypedBaseMutation',
+        '',
+        'class CreateRightToConsentOrConsult(TypedBaseMutation):',
+        '    class TypedArguments(TypedBaseMutation.TypedArguments):',
+        '        company_id: IDStr',
+        '        title: str',
+        '        selected_stakeholder_ids: list[IDStr]',
+        '',
+        '    ok = graphene.Boolean()',
+        '',
+        'class CreateRightToConsentOrConsultMutation:',
+        '    create_right_to_consent_or_consult = CreateRightToConsentOrConsult.Field(required=True)',
+        '',
+        'class Mutation(CreateRightToConsentOrConsultMutation, graphene.ObjectType):',
+        '    pass',
+      ].join('\n'),
+    });
+
+    const schemas = await parseGrapheneSchemas('/root');
+    const all = [
+      ...schemas.flatMap((s) => s.queries),
+      ...schemas.flatMap((s) => s.mutations),
+      ...schemas.flatMap((s) => s.types),
+    ];
+    const outer = all.find((c) => c.name === 'CreateRightToConsentOrConsultMutation')!;
+    const field = outer.fields.find((f) => f.name === 'create_right_to_consent_or_consult')!;
+    const args = field.args ?? [];
+    const names = args.map((a) => a.name);
+    // Inherited client_mutation_id + captain-specific args all present.
+    expect(names).toContain('client_mutation_id');
+    expect(names).toContain('company_id');
+    expect(names).toContain('title');
+    expect(names).toContain('selected_stakeholder_ids');
+    const byName = new Map(args.map((a) => [a.name, a]));
+    expect(byName.get('company_id')!.required).toBe(true);
+    expect(byName.get('title')!.type).toBe('String');
+  });
+});
+
 describe('parseFieldArgs — **ArgsClass.__annotations__ unpacking', () => {
   it('resolves args from a TypedDict referenced via .__annotations__', async () => {
     __setMockFiles({

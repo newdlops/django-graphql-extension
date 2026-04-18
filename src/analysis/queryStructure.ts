@@ -105,12 +105,28 @@ export function buildQueryStructure(
 ): QueryStructure {
   const ctx: BuildCtx = { classMap, maxDepth, expanding: new Set() };
 
-  const rootArgs: QueryStructureArg[] = (rootFieldInfo?.args ?? []).map((a) => ({
+  // If the gql field carries an explicit arg list (e.g. `foo(x: $x, y: $y)`),
+  // surface ONLY those args and mark them provided. This is what the user
+  // expects: the Query Structure panel should show the gql's arguments, not
+  // every arg the backend might accept. When the gql has no `(…)` at all
+  // (e.g. argument-less mutation or `__typename`-only selection), fall back
+  // to the full backend arg list so the user can still discover available
+  // args.
+  const providedArgNames = userField.argNames;
+  const providedSet = providedArgNames ? new Set(providedArgNames.map(camelToSnake)) : undefined;
+  const backendArgs = rootFieldInfo?.args ?? [];
+  const relevantArgs = providedSet
+    ? backendArgs.filter((a) => providedSet.has(a.name))
+    : backendArgs;
+  const rootArgs: QueryStructureArg[] = relevantArgs.map((a) => ({
     name: a.name,
     displayName: snakeToCamel(a.name),
     type: a.type,
     required: a.required,
-    provided: false,
+    // Explicit list ⇒ everything listed here was provided. Without the list
+    // we can't tell, so default to false — consumers that care still get the
+    // backend shape.
+    provided: !!providedSet,
   }));
 
   // The root node represents the field itself (e.g., `stocks`) whose type is rootCls.

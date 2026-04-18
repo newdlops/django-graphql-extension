@@ -610,11 +610,112 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     const classMap = new Map<string, ClassInfo>();
 
     // Resolver for `**ArgsClass.__annotations__` / `**Unpack[ArgsClass]` in
-    // field arg lists. Looks up the annotation-bearing class by name and pulls
-    // its direct + inherited annotations as FieldArgInfo, with a cycle guard
-    // so mutually-referencing TypedDicts don't spin.
+    // field arg lists, AND for the graphene mutation pattern where
+    // `field = SomeMutation.Field()` derives its args from
+    // `SomeMutation.Arguments` (or `.TypedArguments` / `.Input`). Looks up
+    // the named class, pulls its own annotations (TypedDict case) plus any
+    // nested *Arguments class body's annotations + assignment-style fields,
+    // recursing through base classes and dotted inheritance
+    // (`TypedBaseMutation.TypedArguments`). A cycle guard keeps mutually
+    // referencing args classes from spinning.
     const unpackCache = new Map<string, FieldArgInfo[]>();
     const unpackResolving = new Set<string>();
+    const NESTED_ARG_CLASS_NAMES = ['TypedArguments', 'Arguments', 'Input'];
+
+    function classEndLine(raw: RawClassInfo): number {
+      const classLine = raw.lines[raw.lineNumber] ?? '';
+      const classIndent = classLine.match(/^(\s*)/)?.[1].length ?? 0;
+      for (let i = raw.lineNumber + 1; i < raw.lines.length; i++) {
+        const line = raw.lines[i];
+        if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+        const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+        if (indent <= classIndent && line.trim().length > 0) return i;
+      }
+      return raw.lines.length;
+    }
+
+    function findNestedArgsClass(raw: RawClassInfo): RawClassInfo | undefined {
+      const endLine = classEndLine(raw);
+      for (const name of NESTED_ARG_CLASS_NAMES) {
+        const candidates = rawMultiMap.get(name);
+        if (!candidates) continue;
+        for (const c of candidates) {
+          if (
+            c.filePath === raw.filePath &&
+            c.lineNumber > raw.lineNumber &&
+            c.lineNumber < endLine &&
+            c.isNested
+          ) {
+            return c;
+          }
+        }
+      }
+      return undefined;
+    }
+
+    // Resolve a base-class reference that may be dotted (`Outer.Inner`).
+    // For a plain name, delegate to proximity resolution. For a dotted path,
+    // locate the outer class by its last-segment name and find an inner
+    // class by the trailing segment within its line range.
+    function resolveBaseClass(base: string): RawClassInfo | undefined {
+      if (!base.includes('.')) {
+        return rawMultiMap.has(base) ? resolveClassByProximity(base, rawMultiMap, contextPath) : undefined;
+      }
+      const parts = base.split('.');
+      const outerName = parts[0];
+      const innerName = parts[parts.length - 1];
+      const outer = rawMultiMap.has(outerName)
+        ? resolveClassByProximity(outerName, rawMultiMap, contextPath)
+        : undefined;
+      if (!outer) return undefined;
+      const endLine = classEndLine(outer);
+      const candidates = rawMultiMap.get(innerName);
+      if (!candidates) return undefined;
+      return candidates.find(
+        (c) =>
+          c.filePath === outer.filePath &&
+          c.lineNumber > outer.lineNumber &&
+          c.lineNumber < endLine &&
+          c.isNested,
+      );
+    }
+
+    function collectArgsFromNestedArgsClass(argsClass: RawClassInfo, out: FieldArgInfo[], stack: Set<string>): void {
+      const stackKey = `${argsClass.filePath}:${argsClass.lineNumber}`;
+      if (stack.has(stackKey)) return;
+      stack.add(stackKey);
+      // Inherit from base args classes (e.g. `TypedBaseMutation.TypedArguments`).
+      for (const bc of argsClass.baseClasses) {
+        if (bc === 'TypedDict' || bc === 'typing.TypedDict' || GRAPHENE_BASE_CLASSES.has(bc)) continue;
+        const parent = resolveBaseClass(bc);
+        if (parent) collectArgsFromNestedArgsClass(parent, out, stack);
+      }
+      for (const a of parseAnnotationArgs(argsClass.lines, argsClass.lineNumber)) out.push(a);
+      for (const a of parseAssignmentArgs(argsClass.lines, argsClass.lineNumber)) out.push(a);
+      stack.delete(stackKey);
+    }
+
+    // True when a class's own top-level `name: Type` annotations should be
+    // treated as args. This is the case for @dataclass classes and for
+    // TypedDict subclasses (direct or transitive). Regular graphene
+    // ObjectType / Mutation classes carry class-level type hints (e.g.
+    // `validate: Callable[...]`, `execute: Callable[...]`) that LOOK like
+    // annotation fields but are not args — mutation args live on the nested
+    // `Arguments` / `TypedArguments` / `Input` class instead.
+    function isAnnotationClass(raw: RawClassInfo, visited: Set<string> = new Set()): boolean {
+      const key = `${raw.filePath}:${raw.lineNumber}`;
+      if (visited.has(key)) return false;
+      visited.add(key);
+      if (raw.isDataclass) return true;
+      for (const bc of raw.baseClasses) {
+        if (bc === 'TypedDict' || bc === 'typing.TypedDict') return true;
+        if (GRAPHENE_BASE_CLASSES.has(bc) || isLibraryBaseClass(bc)) continue;
+        const parent = resolveBaseClass(bc);
+        if (parent && isAnnotationClass(parent, visited)) return true;
+      }
+      return false;
+    }
+
     const unpackResolver: UnpackResolver = (className: string) => {
       const cached = unpackCache.get(className);
       if (cached !== undefined) return cached;
@@ -629,7 +730,21 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         if (!rawMultiMap.has(bc)) continue;
         for (const a of unpackResolver(bc)) collected.push(a);
       }
-      for (const a of parseAnnotationArgs(raw.lines, raw.lineNumber)) collected.push(a);
+      // Annotations on the class body are ONLY args when the class is a
+      // TypedDict / dataclass-shaped container. On ordinary graphene
+      // classes, top-level annotations are type hints for methods/attrs
+      // (e.g. `validate: Callable[...]`) and must not leak into the args
+      // list — otherwise every mutation inheriting `TypedBaseMutation`
+      // would report `validate`, `execute`, etc. as arguments.
+      if (isAnnotationClass(raw)) {
+        for (const a of parseAnnotationArgs(raw.lines, raw.lineNumber)) collected.push(a);
+      }
+      // Nested Arguments / TypedArguments / Input — graphene mutation case.
+      // The mutation class itself owns no args; its inner class does.
+      const nested = findNestedArgsClass(raw);
+      if (nested) {
+        collectArgsFromNestedArgsClass(nested, collected, new Set());
+      }
       // De-dup by name, child declaration wins over parent.
       const seen = new Set<string>();
       const unique: FieldArgInfo[] = [];
@@ -1104,10 +1219,17 @@ export function parseClassFields(
       const fieldName = dotFieldMatch[1];
       const className = dotFieldMatch[2];
 
+      // Mutation args live on the mutation class's nested `Arguments` /
+      // `TypedArguments` / `Input` class — not on the `.Field()` call itself.
+      // The unpack resolver is responsible for discovering the nested class
+      // and harvesting its annotations + assignment-style fields.
+      const args = unpackResolver ? unpackResolver(className) : [];
+
       fields.push({
         name: fieldName,
         fieldType: 'Field',
         resolvedType: className,
+        args: args.length > 0 ? args : undefined,
         filePath,
         lineNumber: i,
       });
@@ -1740,6 +1862,73 @@ export function parseAnnotationArgs(lines: string[], classLineNumber: number): F
 
     const { type, required } = annotationToArgShape(typeExpr);
     out.push({ name: argName, type, required });
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * Parse graphene-style assignment args — the convention for mutation
+ * `class Arguments: name = String(required=True)` inner classes. Each
+ * `name = Type(...)` line contributes one arg; `required=True` at the top
+ * level of the call marks it required. Matching `parseAnnotationArgs`'s
+ * indentation / method-body / nested-class skipping semantics so the two
+ * can be composed on the same inner class body.
+ */
+export function parseAssignmentArgs(lines: string[], classLineNumber: number): FieldArgInfo[] {
+  const classLine = lines[classLineNumber];
+  const classIndent = classLine?.match(/^(\s*)/)?.[1].length ?? 0;
+  const out: FieldArgInfo[] = [];
+  let methodIndent = -1;
+
+  for (let i = classLineNumber + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    const lineIndent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    if (lineIndent <= classIndent && line.trim().length > 0) break;
+    if (methodIndent >= 0 && lineIndent > methodIndent) continue;
+    if (methodIndent >= 0 && lineIndent <= methodIndent) methodIndent = -1;
+    if (/^\s*@/.test(line)) continue;
+    if (/^\s*(async\s+)?def\s+\w/.test(line)) { methodIndent = lineIndent; continue; }
+    if (/^\s+class\s+\w/.test(line)) { methodIndent = lineIndent; continue; }
+
+    const assignMatch = line.match(/^(\s+)(\w+)\s*=\s*(?:graphene\s*\.\s*)?(\w+)\s*\(/);
+    if (!assignMatch) continue;
+    const argName = assignMatch[2];
+    let argType = assignMatch[3];
+
+    // Collect the full call text so multi-line declarations with trailing
+    // commas still see `required=True`.
+    let fullDef = line;
+    let depth = 0;
+    for (const ch of line) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+    }
+    let j = i;
+    while (depth > 0 && j + 1 < lines.length) {
+      j++;
+      fullDef += '\n' + lines[j];
+      for (const ch of lines[j]) {
+        if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+      }
+    }
+
+    // Argument(X) / InputField(X) wraps the real type as its first positional.
+    const openParenIdx = fullDef.indexOf('(', line.indexOf(argType) + argType.length);
+    const inner = openParenIdx >= 0 ? extractBalancedContent(fullDef, openParenIdx) : null;
+    if (ARG_WRAPPER_TYPES.has(argType) && inner != null) {
+      const unwrapped = firstPositionalType(inner);
+      if (unwrapped) argType = unwrapped;
+    }
+
+    const required = /\brequired\s*=\s*True\b/.test(inner ?? fullDef);
+    out.push({
+      name: argName,
+      type: GRAPHENE_ARG_TYPES[argType] ?? argType,
+      required,
+    });
     i = j;
   }
   return out;

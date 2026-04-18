@@ -68,6 +68,44 @@ query StockQuery($companyId: ID!) {
 - Arguments shown with variable declarations
 - `snake_case` auto-converted to `camelCase`
 
+### Live Query Inspector
+
+Open a **side-by-side** panel that auto-follows the cursor inside any `gql`/`graphql` template. It shows:
+
+- The operation signature (`query X($var: Type!, …)`) with every variable declared at the top
+- Per-field backend args, but only the args the user actually passed — not every arg the backend allows
+- A JSON-tree view of the entire selection with missing-field markers
+- Lazy **▸ expand** markers on any subtree truncated by the depth cap or cycle guard — click to load another two levels on demand, same as a debugger inspecting a variable
+
+Open via **Django GraphQL: Open Live Query Structure** (Command Palette) or the icon in the Schema Explorer title bar.
+
+### Captain-style Graphene Patterns
+
+The parser understands modern graphene codebases that mix `@dataclass` types, `TypedField`, and `TypedDict`-based argument containers:
+
+```python
+@dataclass
+class RtccEmailEmailListItemSummary:
+    totalCount: int
+    deliveringCount: int
+    ...
+
+class RtccEmailEmailListQuery:
+    class RtccEmailEmailListQueryArguments(TypedDict):
+        company_id: IDStr
+        page: NotRequired[int]
+
+    rtcc_email_list = TypedField(
+        RtccEmailEmailList,
+        **RtccEmailEmailListQueryArguments.__annotations__,
+    )
+```
+
+- `list[X]` / `Optional[X]` / `X | None` / `Union[X, None]` unwrap to `X`
+- Python primitives (`str`/`int`/`float`/`bool`/`Decimal`/`UUID`/`datetime.*`) map to GraphQL scalars for leaf display
+- `**ArgsClass.__annotations__` / `**Unpack[ArgsClass]` expands to the class's annotation fields (including inherited TypedDict chains)
+- Mutation args come from `X.Field()` → `X.Arguments` / `X.TypedArguments` / `X.Input` (follows dotted inheritance like `TypedBaseMutation.TypedArguments`)
+
 ## Supported Frameworks
 
 | Framework | Detection | Schema Parsing |
@@ -89,9 +127,22 @@ query StockQuery($companyId: ID!) {
 - VS Code 1.75.0+
 - A Django project with one of the supported GraphQL frameworks
 
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| **Django GraphQL: Refresh Schema** | Re-scans all project files. |
+| **Django GraphQL: Open Live Query Structure** | Opens the side-by-side live inspector that follows the cursor. |
+| **Django GraphQL: Inspect Type…** | Quick-pick any class to view its SDL preview. |
+| **Django GraphQL: Clear Parse Cache** | Drops the persisted parse cache and re-scans from scratch. Useful after an extension upgrade or when a stale result looks suspicious. |
+
 ## Extension Settings
 
-No configuration required. The extension auto-detects projects on activation.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `djangoGraphqlExplorer.inlayHints` | `false` | Show inline `→ TypeName` chips after every gql field. Disabled by default in favor of the Live Query Graph (Beside panel). |
+
+No further configuration required. The extension auto-detects projects on activation.
 
 ## Known Limitations
 

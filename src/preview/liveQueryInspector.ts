@@ -2,8 +2,8 @@ import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { FieldIndex } from '../codelens/gqlResolver';
 import { resolveTemplateAtCursor, TemplateContext } from '../codelens/gqlCursorResolver';
-import { buildQueryStructure, buildPartialStructureFromGql, QueryStructure } from '../analysis/queryStructure';
-import { renderTemplateStructuresHtml, QUERY_STRUCTURE_JSON_STYLES } from './queryStructureJson';
+import { buildQueryStructure, buildPartialStructureFromGql, buildLazySubtree, QueryStructure } from '../analysis/queryStructure';
+import { renderTemplateStructuresHtml, renderJsonSubtreeHtml, QUERY_STRUCTURE_JSON_STYLES } from './queryStructureJson';
 
 interface StateSource {
   (): { classMap: Map<string, ClassInfo>; fieldIndex: FieldIndex };
@@ -38,6 +38,32 @@ export class LiveQueryInspector {
       this.panel.onDidDispose(() => {
         this.panel = undefined;
         this.lastContextKey = undefined;
+      });
+      // Lazy expansion: the webview asks for a class's fields when the user
+      // clicks the ▸ marker on a truncated subtree. We resolve against the
+      // LIVE classMap so the response reflects any refreshes that happened
+      // since the panel was opened.
+      this.panel.webview.onDidReceiveMessage((msg) => {
+        if (!msg || msg.type !== 'expandType') return;
+        const { classMap } = this.readState();
+        const target = classMap.get(msg.typeName);
+        if (!target) {
+          this.postMessage({
+            type: 'jsonSubtree',
+            nodeId: msg.nodeId,
+            error: `Class '${msg.typeName}' is not in the current schema index.`,
+          });
+          return;
+        }
+        const ancestry: string[] = Array.isArray(msg.ancestry) ? msg.ancestry : [];
+        // The clicked <details>'s own depth comes from data-depth. Its
+        // children live one level deeper — so we start subtree rendering at
+        // `depth + 1` to line up visually with siblings that would have been
+        // rendered eagerly at the same level.
+        const parentDepth = typeof msg.depth === 'number' ? msg.depth : 0;
+        const nodes = buildLazySubtree(target, classMap, ancestry, 2);
+        const html = renderJsonSubtreeHtml(nodes, [...ancestry, msg.typeName], parentDepth + 1);
+        this.postMessage({ type: 'jsonSubtree', nodeId: msg.nodeId, html });
       });
     } else {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
@@ -124,6 +150,7 @@ export class LiveQueryInspector {
     const body = renderTemplateStructuresHtml({
       operationKind: tpl.operationKind,
       operationName: tpl.operationName,
+      operationVariables: tpl.operationVariables,
       structures,
       unresolved,
     });
@@ -162,14 +189,36 @@ export class LiveQueryInspector {
 <div id="content">
   <div class="empty">No gql field under cursor yet.</div>
 </div>
-<div class="legend">Green ✓ = queried · Red ✗ = available but not queried · Gray italic = type not in the indexed schema · Click <code>▾</code> to collapse a block.</div>
+<div class="legend">Green ✓ = queried · Red ✗ = available but not queried · Gray italic = type not in the indexed schema · Click <code>▾</code>/<code>▸</code> to collapse or expand · Blue <code>▸</code> loads deeper fields on first open.</div>
 <script>
+  const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
   const header = document.getElementById('header');
   const content = document.getElementById('content');
 
   function escapeHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+
+  // Fire a lazy request the first time a block-lazy <details> opens. The
+  // 'toggle' event doesn't bubble, so capture=true is required for delegated
+  // handling across lazily-inserted descendants. Subsequent open/close cycles
+  // are handled natively by <details> — no reload needed.
+  content.addEventListener('toggle', (e) => {
+    const el = e.target;
+    if (!(el instanceof Element)) return;
+    if (!el.classList.contains('block-lazy') || !el.open) return;
+    if (el.dataset.loaded === '1' || el.dataset.loading === '1') return;
+    el.dataset.loading = '1';
+    const slot = el.querySelector(':scope > .lazy-content');
+    if (slot) slot.innerHTML = '<span class="line muted">  loading…</span>';
+    vscode.postMessage({
+      type: 'expandType',
+      nodeId: el.dataset.nodeId,
+      typeName: el.dataset.lazyType,
+      ancestry: (el.dataset.ancestry || '').split(',').filter(Boolean),
+      depth: Number(el.dataset.depth || '0'),
+    });
+  }, true);
 
   window.addEventListener('message', (ev) => {
     const msg = ev.data;
@@ -178,6 +227,20 @@ export class LiveQueryInspector {
         '<div class="title">Live Query Structure</div>' +
         '<div class="subtitle">' + escapeHtml(msg.reason || 'Nothing to show.') + '</div>';
       content.innerHTML = '<div class="empty">' + escapeHtml(msg.reason || '') + '</div>';
+      return;
+    }
+    if (msg.type === 'jsonSubtree') {
+      const el = content.querySelector('[data-node-id="' + msg.nodeId + '"]');
+      if (!el) return;
+      const slot = el.querySelector(':scope > .lazy-content');
+      if (!slot) return;
+      if (msg.error) {
+        slot.innerHTML = '<span class="line lazy-error">  ' + escapeHtml(msg.error) + '</span>';
+      } else {
+        slot.innerHTML = msg.html || '';
+      }
+      el.dataset.loaded = '1';
+      el.dataset.loading = '0';
       return;
     }
     if (msg.type !== 'render') return;

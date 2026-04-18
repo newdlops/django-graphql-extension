@@ -466,6 +466,14 @@ export interface GqlField {
   nameOffset: number;   // offset of the actual field name in gql body (after alias ':')
   nameLength: number;   // length of the actual field name in source
   children: GqlField[];
+  /**
+   * Names of the arguments the user actually wrote between `(` and `)` for
+   * this field (e.g. `["companyId", "page"]` for `rtccEmailList(companyId:
+   * $companyId, page: $page)`). Lets downstream rendering show ONLY the
+   * args that appear in the query — not every arg declared on the backend.
+   * Undefined when there was no parenthesised arg list at all.
+   */
+  argNames?: string[];
 }
 
 function stripTemplateExpressions(body: string): string {
@@ -747,13 +755,19 @@ function parseFieldsBlock(
         }
       }
 
-      // Skip arguments (...)
+      // Parse argument list `(name: value, …)` — we need the arg NAMES so
+      // downstream rendering can show only the args the user actually wrote.
+      // Values are just skipped (can be $var, literals, nested objects/lists).
+      let fieldArgNames: string[] | undefined;
       if (gql[i] === '(') {
-        i = skipBracket(gql, i, '(', ')');
+        const argsEnd = skipBracket(gql, i, '(', ')');
+        fieldArgNames = collectArgNames(gql, i + 1, argsEnd - 1);
+        i = argsEnd;
         while (i < gql.length && /\s/.test(gql[i])) i++;
       }
 
-      // Skip directives @skip, @include etc.
+      // Skip directives @skip, @include etc. — their args don't count toward
+      // the field's own arg list.
       while (gql[i] === '@') {
         while (i < gql.length && /\w/.test(gql[i]) || gql[i] === '@') i++;
         while (i < gql.length && /\s/.test(gql[i])) i++;
@@ -763,7 +777,7 @@ function parseFieldsBlock(
         }
       }
 
-      const field: GqlField = { name: fieldName, offset: fieldOffset, nameOffset, nameLength, children: [] };
+      const field: GqlField = { name: fieldName, offset: fieldOffset, nameOffset, nameLength, children: [], argNames: fieldArgNames };
 
       // If followed by { }, parse children
       if (gql[i] === '{') {
@@ -779,6 +793,74 @@ function parseFieldsBlock(
   }
 
   return i;
+}
+
+/**
+ * Pull the names from a gql field's `(…)` argument list. `start` is the
+ * first character AFTER the opening paren; `end` is the index OF the closing
+ * paren. Each arg is `name: value` — we collect `name` identifiers and skip
+ * over values (including nested `()` / `[]` / `{}`). GraphQL allows
+ * comma-less lists, so the value-skip loop also terminates at the start of
+ * the next top-level `Name:` pair. Unknown / malformed chunks are silently
+ * tolerated to avoid breaking the rest of the parse.
+ */
+function collectArgNames(gql: string, start: number, end: number): string[] {
+  const names: string[] = [];
+  let i = start;
+  while (i < end) {
+    // Skip whitespace, commas, comments.
+    while (i < end && /[\s,]/.test(gql[i])) i++;
+    if (gql[i] === '#') {
+      while (i < end && gql[i] !== '\n') i++;
+      continue;
+    }
+    if (i >= end) break;
+    // Grab arg name.
+    const nameMatch = gql.substring(i, end).match(/^([A-Za-z_]\w*)/);
+    if (!nameMatch) { i++; continue; }
+    const name = nameMatch[1];
+    i += nameMatch[0].length;
+    while (i < end && /\s/.test(gql[i])) i++;
+    if (gql[i] !== ':') {
+      // Malformed — bail on this pair but keep scanning the list.
+      continue;
+    }
+    i++; // past ':'
+    // Skip value — walk until the next top-level comma, the end of the
+    // list, OR the start of the next comma-less `Name:` pair. We balance
+    // brackets/strings so nested values (`{x: 1, y: 2}`) don't trigger a
+    // premature exit.
+    let depth = 0;
+    let inString: string | null = null;
+    while (i < end) {
+      const ch = gql[i];
+      if (inString) {
+        if (ch === '\\') { i += 2; continue; }
+        if (ch === inString) inString = null;
+        i++;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inString = ch; i++; continue; }
+      if (ch === '(' || ch === '[' || ch === '{') { depth++; i++; continue; }
+      if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth === 0) break;
+        depth--; i++; continue;
+      }
+      if (ch === ',' && depth === 0) break;
+      // Comma-less lists: GraphQL allows `name1: v1\n  name2: v2` without a
+      // separator. When we hit an identifier-then-colon at depth 0, bail
+      // out so the outer loop can collect the next arg name. Enum / bool
+      // literals are bare identifiers NOT followed by `:`, so they won't
+      // accidentally trigger this.
+      if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+        const rest = gql.substring(i, end);
+        if (/^([A-Za-z_]\w*)\s*:/.test(rest)) break;
+      }
+      i++;
+    }
+    names.push(name);
+  }
+  return names;
 }
 
 function skipBracket(text: string, start: number, open: string, close: string): number {
