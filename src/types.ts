@@ -13,6 +13,13 @@ export interface FieldInfo {
   args?: FieldArgInfo[];
   filePath: string;
   lineNumber: number;
+  /**
+   * Set by resolveInheritedFields to the name of the class that **declares**
+   * the field. Undefined for fields declared directly on the owning class.
+   * Drives: (1) field-index routing to the true owner, (2) inspector "origin"
+   * display, (3) click-to-source navigation.
+   */
+  definedIn?: string;
 }
 
 export interface ClassInfo {

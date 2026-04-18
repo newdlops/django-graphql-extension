@@ -2,18 +2,92 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { ClassInfo, FieldInfo } from '../types';
 import { log } from '../logger';
+import {
+  FieldIndex,
+  IndexEntry,
+  MatchedEntry,
+  buildFieldIndex,
+  findEntry as findEntryShared,
+} from './gqlResolver';
 
-function camelToSnake(str: string): string {
-  return str.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+export function camelToSnake(str: string): string {
+  // Two-pass conversion so consecutive capitals stay in one segment:
+  //   HTTPStatus → http_status   (not h_t_t_p_status)
+  //   parseHTTPResponse → parse_http_response
+  return str
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/([a-z\d])([A-Z])/g, '$1_$2')
+    .toLowerCase();
 }
 
-function snakeToCamel(str: string): string {
+export function snakeToCamel(str: string): string {
   return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-interface IndexEntry {
-  cls: ClassInfo;
-  field: FieldInfo;
+/**
+ * Compute which fields of `backendCls` were NOT queried in `frontendChildren`.
+ * Walks mixin base classes if the class itself has no direct fields.
+ * Pure function — no dependency on provider state beyond the supplied classMap.
+ */
+export function computeMissingFields(
+  frontendChildren: GqlField[],
+  backendCls: ClassInfo,
+  classMap: Map<string, ClassInfo>,
+): FieldInfo[] {
+  const available = getAllTypeFields(backendCls, classMap);
+  const usedSnakeNames = new Set(frontendChildren.map((gf) => camelToSnake(gf.name)));
+  return available.filter((f) => !usedSnakeNames.has(f.name));
+}
+
+function getAllTypeFields(cls: ClassInfo, classMap: Map<string, ClassInfo>): FieldInfo[] {
+  if (cls.fields.length > 0) return cls.fields;
+  const out: FieldInfo[] = [];
+  const seen = new Set<string>();
+  flattenBaseFields(cls, classMap, out, seen);
+  return out;
+}
+
+// The `seen` set alone prevents cycles; no arbitrary depth cap needed.
+function flattenBaseFields(
+  cls: ClassInfo,
+  classMap: Map<string, ClassInfo>,
+  out: FieldInfo[],
+  seen: Set<string>,
+): void {
+  if (seen.has(cls.name)) return;
+  seen.add(cls.name);
+  for (const baseName of cls.baseClasses) {
+    const base = classMap.get(baseName);
+    if (!base) continue;
+    if (base.fields.length > 0) {
+      out.push(...base.fields);
+    } else {
+      flattenBaseFields(base, classMap, out, seen);
+    }
+  }
+}
+
+// IndexEntry / MatchedEntry / collectAncestors live in gqlResolver.ts and are
+// re-exported from this module for back-compat with anyone importing them here.
+export type { IndexEntry, MatchedEntry };
+
+/** JSON-safe subset of a GqlField — used for passing through VSCode command args. */
+export interface GqlFieldLite {
+  name: string;
+  children: GqlFieldLite[];
+}
+
+export function serializeGqlField(gf: GqlField): GqlFieldLite {
+  return { name: gf.name, children: gf.children.map(serializeGqlField) };
+}
+
+/** Inverse of serializeGqlField for test-harnesses / webview handlers. */
+export function hydrateGqlField(lite: GqlFieldLite): GqlField {
+  return {
+    name: lite.name,
+    offset: 0, nameOffset: 0, nameLength: lite.name.length,
+    children: lite.children.map(hydrateGqlField),
+  };
 }
 
 export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.HoverProvider {
@@ -21,7 +95,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
   readonly onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
 
   // snake_case field name → all classes that define it
-  private fieldIndex = new Map<string, IndexEntry[]>();
+  private fieldIndex: FieldIndex = new Map();
   private classMap = new Map<string, ClassInfo>();
   private updateTimer?: NodeJS.Timeout;
 
@@ -31,22 +105,35 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     // Debounce index rebuild + CodeLens refresh
     if (this.updateTimer) clearTimeout(this.updateTimer);
     this.updateTimer = setTimeout(() => {
-      this.fieldIndex.clear();
-      const kindCounts = { query: 0, mutation: 0, type: 0, subscription: 0 };
-      for (const [, cls] of this.classMap) {
-        kindCounts[cls.kind] = (kindCounts[cls.kind] ?? 0) + 1;
-        for (const field of cls.fields) {
-          const entries = this.fieldIndex.get(field.name);
-          if (entries) {
-            entries.push({ cls, field });
-          } else {
-            this.fieldIndex.set(field.name, [{ cls, field }]);
-          }
-        }
-      }
-      log(`[codeLens] Index built: ${this.fieldIndex.size} fields from ${this.classMap.size} classes (Q:${kindCounts.query} M:${kindCounts.mutation} T:${kindCounts.type} S:${kindCounts.subscription})`);
+      this.buildIndex();
       this._onDidChangeCodeLenses.fire();
     }, 200);
+  }
+
+  /**
+   * Synchronous index rebuild. Used by tests (which can't wait on the debounce
+   * timer) and by any future caller that needs the index up-to-date right now.
+   */
+  rebuildIndexNow(): void {
+    if (this.updateTimer) { clearTimeout(this.updateTimer); this.updateTimer = undefined; }
+    this.buildIndex();
+  }
+
+  private buildIndex(): void {
+    this.fieldIndex = buildFieldIndex(this.classMap);
+    const kindCounts = { query: 0, mutation: 0, type: 0, subscription: 0 };
+    for (const [, cls] of this.classMap) {
+      kindCounts[cls.kind] = (kindCounts[cls.kind] ?? 0) + 1;
+    }
+    log(`[codeLens] Index built: ${this.fieldIndex.size} fields from ${this.classMap.size} classes (Q:${kindCounts.query} M:${kindCounts.mutation} T:${kindCounts.type} S:${kindCounts.subscription})`);
+  }
+
+  /**
+   * Exposed so other providers (InlayHints, Diagnostics) can share the same
+   * resolved view of the schema without rebuilding indexes.
+   */
+  getSharedState(): { classMap: Map<string, ClassInfo>; fieldIndex: FieldIndex } {
+    return { classMap: this.classMap, fieldIndex: this.fieldIndex };
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
@@ -55,6 +142,11 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     const text = document.getText();
     const lenses: vscode.CodeLens[] = [];
     const fileName = path.basename(document.fileName);
+
+    // Collect every fragment defined anywhere in this document up front so
+    // spreads in one gql literal can resolve fragments defined in another
+    // (the `const F = gql\`fragment …\`; const Q = gql\`... ${F}\`` pattern).
+    const docFragments = collectDocumentFragments(text);
 
     // Detect gql template literals in multiple patterns:
     // gql`...`, graphql`...`, /* GraphQL */ `...`, gql(`...`), graphql(`...`)
@@ -71,7 +163,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
       const rawBody = text.substring(startOffset, templateEnd);
       const gqlBody = stripTemplateExpressions(rawBody);
-      const parsed = parseGqlFields(gqlBody);
+      const parsed = parseGqlFields(gqlBody, docFragments);
 
       // Log the operation type and parsed root fields
       const opType = gqlBody.match(/^\s*(query|mutation|subscription)/)?.[1] ?? 'unknown';
@@ -89,14 +181,27 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
           const snakeName = camelToSnake(gf.name);
           const entry = this.findEntry(snakeName, parent);
           if (entry) {
-            log(`[codeLens] ${indent}✓ ${gf.name} → ${snakeName} → ${entry.cls.name}.${entry.field.name} (${entry.cls.kind})`);
+            const conf = entry.confidence === 'inferred' ? ' [inferred]' : '';
+            log(`[codeLens] ${indent}✓ ${gf.name} → ${snakeName} → ${entry.cls.name}.${entry.field.name} (${entry.cls.kind})${conf}`);
             if (gf.children.length > 0) {
-              let resolved = entry.field.resolvedType ? this.classMap.get(entry.field.resolvedType) : undefined;
-              if (!resolved) resolved = this.inferTypeFromFieldName(gf.name) ?? undefined;
-              logFields(gf.children, depth + 1, resolved ?? entry.cls);
+              const resolvedTypeName = entry.field.resolvedType;
+              let resolved = resolvedTypeName ? this.classMap.get(resolvedTypeName) ?? null : null;
+              if (!resolved) resolved = this.inferTypeFromFieldName(gf.name);
+              if (resolved) {
+                logFields(gf.children, depth + 1, resolved);
+              } else {
+                // Don't fall back to the containing class — that would misleadingly
+                // blame the Query/Mutation container for children that actually
+                // live on the return type. Report exactly why resolution stopped.
+                const reason = resolvedTypeName
+                  ? `resolvedType='${resolvedTypeName}' not in class index`
+                  : `field '${entry.cls.name}.${entry.field.name}' has no resolvedType recorded`;
+                log(`[codeLens] ${indent}  ⊘ children skipped — ${reason}`);
+              }
             }
           } else {
-            log(`[codeLens] ${indent}✗ ${gf.name} → ${snakeName} — no match (parent: ${parent?.name ?? 'root'})`);
+            const parentLabel = parent ? parent.name : 'root';
+            log(`[codeLens] ${indent}✗ ${gf.name} → ${snakeName} — no such field on ${parentLabel}`);
           }
         }
       };
@@ -124,42 +229,48 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const range = new vscode.Range(linePos, linePos);
 
       const kindLabel = entry.cls.kind === 'type' ? 'Type' : entry.cls.kind === 'mutation' ? 'Mutation' : 'Query';
+      const marker = entry.confidence === 'inferred' ? '~' : '';
+      const tooltipSuffix = entry.confidence === 'inferred'
+        ? '\n\n(~ means inferred — multiple candidates existed; verify that this is the intended class.)'
+        : '';
 
       lenses.push(new vscode.CodeLens(range, {
-        title: `→ ${entry.cls.name}.${entry.field.name} [${kindLabel}]`,
-        tooltip: `${gf.name} → ${entry.field.name} in ${entry.cls.name}\n${entry.cls.filePath}:${entry.cls.lineNumber + 1}`,
+        title: `→ ${marker}${entry.cls.name}.${entry.field.name} [${kindLabel}]`,
+        tooltip: `${gf.name} → ${entry.field.name} in ${entry.cls.name}\n${entry.cls.filePath}:${entry.cls.lineNumber + 1}${tooltipSuffix}`,
         command: 'djangoGraphqlExplorer.openClass',
         arguments: [entry.cls.filePath, entry.cls.lineNumber],
       }));
 
-      // Recurse into children with the resolved type as parent context
+      // Recurse into children with the resolved type as parent context.
+      // If we don't know the child type, DO NOT fall back to the current
+      // class — that would falsely attribute descendants to the parent.
       if (gf.children.length > 0) {
         let resolvedCls = entry.field.resolvedType
           ? (this.classMap.get(entry.field.resolvedType) ?? null)
           : null;
-        // If no resolvedType, try to infer from field name convention
         if (!resolvedCls) {
           resolvedCls = this.inferTypeFromFieldName(gf.name);
         }
-        this.resolveFields(gf.children, resolvedCls ?? entry.cls, baseOffset, document, lenses);
 
-        // Show missing fields from the resolved type
         if (resolvedCls) {
+          this.resolveFields(gf.children, resolvedCls, baseOffset, document, lenses);
+
+          // Show missing fields from the resolved type
           const missing = this.getMissingFields(gf.children, resolvedCls);
           if (missing.length > 0) {
             const used = gf.children.length;
             const total = used + missing.length;
             const preview = missing.slice(0, 5).map((f) => snakeToCamel(f.name)).join(', ');
             const more = missing.length > 5 ? `, +${missing.length - 5}` : '';
+            // Pass enough info for the full-tree webview: target class + the
+            // user's gql subtree under this field. Also pass owner
+            // class+field names so the panel can look up the backend
+            // FieldInfo and render its args on the root row.
             lenses.push(new vscode.CodeLens(range, {
-              title: `⚠ ${used}/${total} fields — missing: ${preview}${more}`,
-              tooltip: 'Click to see all missing fields',
+              title: `⚠ ${used}/${total} fields — click to see full structure`,
+              tooltip: `Expand ${resolvedCls.name}: ${preview}${more}`,
               command: 'djangoGraphqlExplorer.showMissingFields',
-              arguments: [
-                resolvedCls.name,
-                gf.children.map((c) => c.name),
-                missing.map((f) => ({ name: snakeToCamel(f.name), type: `${f.fieldType}${f.resolvedType ? ' → ' + f.resolvedType : ''}` })),
-              ],
+              arguments: [resolvedCls.name, serializeGqlField(gf), entry.cls.name, entry.field.name],
             }));
           }
         }
@@ -168,33 +279,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
   }
 
   private getMissingFields(frontendFields: GqlField[], backendCls: ClassInfo): FieldInfo[] {
-    // Collect all fields available from this class (including inherited)
-    const available = this.getAllTypeFields(backendCls);
-    const usedSnakeNames = new Set(frontendFields.map((gf) => camelToSnake(gf.name)));
-    return available.filter((f) => !usedSnakeNames.has(f.name));
-  }
-
-  private getAllTypeFields(cls: ClassInfo): FieldInfo[] {
-    if (cls.fields.length > 0) return cls.fields;
-    // Flatten mixin base classes
-    const fields: FieldInfo[] = [];
-    const seen = new Set<string>();
-    this.flattenBaseFields(cls, fields, seen, 0);
-    return fields;
-  }
-
-  private flattenBaseFields(cls: ClassInfo, out: FieldInfo[], seen: Set<string>, depth: number): void {
-    if (depth > 4 || seen.has(cls.name)) return;
-    seen.add(cls.name);
-    for (const baseName of cls.baseClasses) {
-      const base = this.classMap.get(baseName);
-      if (!base) continue;
-      if (base.fields.length > 0) {
-        out.push(...base.fields);
-      } else {
-        this.flattenBaseFields(base, out, seen, depth + 1);
-      }
-    }
+    return computeMissingFields(frontendFields, backendCls, this.classMap);
   }
 
   /**
@@ -236,36 +321,8 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     return null;
   }
 
-  private findEntry(snakeFieldName: string, parentType: ClassInfo | null): IndexEntry | undefined {
-    const entries = this.fieldIndex.get(snakeFieldName);
-    if (!entries || entries.length === 0) return undefined;
-    if (entries.length === 1) return entries[0];
-
-    if (parentType) {
-      // Direct match: field belongs to parentType
-      const direct = entries.find((e) => e.cls.name === parentType.name);
-      if (direct) return direct;
-
-      // Base class match: field belongs to a base class of parentType
-      const baseMatch = entries.find((e) => parentType.baseClasses.includes(e.cls.name));
-      if (baseMatch) return baseMatch;
-
-      // Same kind match: if parent is a type, prefer type entries
-      const sameKind = entries.find((e) => e.cls.kind === parentType.kind);
-      if (sameKind) return sameKind;
-    }
-
-    // No parent context: could be root level or context was lost (unresolved type)
-    // Heuristic: common scalar-like field names (id, name, email, etc.) → prefer type
-    // Other names → prefer query/mutation (likely root fields)
-    const typeEntry = entries.find((e) => e.cls.kind === 'type');
-    const qmEntry = entries.find((e) => e.cls.kind === 'query' || e.cls.kind === 'mutation');
-    if (parentType) {
-      return typeEntry ?? qmEntry ?? entries[0];
-    }
-    // At root level, prefer query/mutation; but if the field name is very common, prefer type
-    if (qmEntry) return qmEntry;
-    return typeEntry ?? entries[0];
+  private findEntry(snakeFieldName: string, parentType: ClassInfo | null): MatchedEntry | undefined {
+    return findEntryShared(this.fieldIndex, this.classMap, snakeFieldName, parentType);
   }
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | undefined {
@@ -273,6 +330,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
     const text = document.getText();
     const offset = document.offsetAt(position);
+    const docFragments = collectDocumentFragments(text);
     const gqlRegex = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
     let gqlMatch;
 
@@ -286,7 +344,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
       const rawBody = text.substring(startOffset, templateEnd);
       const gqlBody = stripTemplateExpressions(rawBody);
-      const parsed = parseGqlFields(gqlBody);
+      const parsed = parseGqlFields(gqlBody, docFragments);
       const hover = this.findHoverInFields(parsed, null, startOffset, offset, document);
       if (hover) return hover;
     }
@@ -305,14 +363,17 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const snakeName = camelToSnake(gf.name);
       const entry = this.findEntry(snakeName, parentType);
 
-      // Check children first (more specific match)
+      // Check children first (more specific match). Mirror the CodeLens rule:
+      // don't fall back to the parent class when we cannot resolve the child type.
       if (gf.children.length > 0 && entry) {
         let resolvedCls = entry.field.resolvedType
           ? (this.classMap.get(entry.field.resolvedType) ?? null)
           : null;
         if (!resolvedCls) resolvedCls = this.inferTypeFromFieldName(gf.name);
-        const childHover = this.findHoverInFields(gf.children, resolvedCls ?? entry.cls, baseOffset, cursorOffset, document);
-        if (childHover) return childHover;
+        if (resolvedCls) {
+          const childHover = this.findHoverInFields(gf.children, resolvedCls, baseOffset, cursorOffset, document);
+          if (childHover) return childHover;
+        }
       }
 
       // Check both the display name (alias) and the actual field name positions
@@ -399,7 +460,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
 // ── GQL Parsing ──
 
-interface GqlField {
+export interface GqlField {
   name: string;
   offset: number;       // offset of the display name (alias or field name) in gql body
   nameOffset: number;   // offset of the actual field name in gql body (after alias ':')
@@ -450,20 +511,91 @@ function findTemplateEnd(text: string, start: number): number {
   return -1;
 }
 
-function parseGqlFields(gql: string): GqlField[] {
-  // Skip fragment definitions — they are not operations
-  if (/^\s*fragment\b/s.test(gql)) {
-    return [];
-  }
+/**
+ * Fragment definition. `source` carries the gql text that `bodyStart` is an
+ * offset into — for local fragments it's the same gql literal being parsed,
+ * for cross-literal fragments (collected via `collectDocumentFragments`) it's
+ * a different literal's body text.
+ * `fields` is lazily populated the first time the fragment is inlined so
+ * cyclic references trip the `resolving` guard without infinite recursion.
+ */
+export interface FragmentDef {
+  source: string;
+  bodyStart: number;
+  fields: GqlField[] | null;
+  resolving: boolean;
+}
 
-  // Find operation body — match opening brace after operation declaration
-  // Handle multi-line variable declarations by matching nested parens
+/**
+ * Find every `fragment Name on Type { ... }` block in a gql body. Used by the
+ * per-literal parser and by `collectDocumentFragments` (via a different
+ * `source` string).
+ */
+function collectFragmentDefsFromSource(gqlSource: string): Map<string, FragmentDef> {
+  const out = new Map<string, FragmentDef>();
+  const re = /\bfragment\s+([A-Za-z_]\w*)\s+on\s+[A-Za-z_]\w*\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(gqlSource)) !== null) {
+    const name = m[1];
+    const braceIdx = m.index + m[0].length - 1;
+    out.set(name, { source: gqlSource, bodyStart: braceIdx + 1, fields: null, resolving: false });
+  }
+  return out;
+}
+
+/**
+ * Scan an entire source file (TypeScript / JavaScript / JSX / TSX) for every
+ * gql / graphql template literal and harvest fragment definitions from each.
+ * Returns a name → FragmentDef map that `parseGqlFields` can consult when a
+ * `...FragmentName` spread can't be resolved inside the current literal.
+ *
+ * This covers the common pattern:
+ *
+ *     const USER_FRAGMENT = gql`fragment UserFields on User { id name }`;
+ *     const QUERY = gql`query { users { ...UserFields } } ${USER_FRAGMENT}`;
+ *
+ * where `UserFields` is defined in one gql literal and used in another.
+ * Cross-file fragments (imported from another module) are NOT resolved here.
+ */
+export function collectDocumentFragments(docText: string): Map<string, FragmentDef> {
+  const merged = new Map<string, FragmentDef>();
+  const re = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(docText)) !== null) {
+    const backtickIdx = docText.indexOf('`', m.index);
+    if (backtickIdx === -1) continue;
+    const start = backtickIdx + 1;
+    const end = findTemplateEnd(docText, start);
+    if (end === -1) continue;
+    const rawBody = docText.substring(start, end);
+    const gqlBody = stripTemplateExpressions(rawBody);
+    const local = collectFragmentDefsFromSource(gqlBody);
+    // First definition wins — later redefinitions are ignored (same as real gql).
+    for (const [name, def] of local) {
+      if (!merged.has(name)) merged.set(name, def);
+    }
+  }
+  return merged;
+}
+
+export function parseGqlFields(gql: string, externalFragments?: Map<string, FragmentDef>): GqlField[] {
+  // Fragment defs in the same gql literal are inlined at spread sites.
+  const local = collectFragmentDefsFromSource(gql);
+  // Local fragments win over external ones (same name = same-literal wins).
+  const fragments = new Map<string, FragmentDef>();
+  if (externalFragments) {
+    for (const [name, def] of externalFragments) fragments.set(name, def);
+  }
+  for (const [name, def] of local) fragments.set(name, def);
+
+  // Find operation body — match opening brace after operation declaration.
+  // Fragment definitions may appear before the operation in the same literal,
+  // so scan anywhere in the gql string instead of only the leading token.
   let bodyStart: number | undefined;
 
-  // Try to find operation keyword
-  const keywordMatch = gql.match(/^\s*(query|mutation|subscription)\b/s);
+  const keywordMatch = /(^|[^A-Za-z_0-9])(query|mutation|subscription)\b/.exec(gql);
   if (keywordMatch) {
-    let i = keywordMatch.index! + keywordMatch[0].length;
+    let i = keywordMatch.index + keywordMatch[0].length;
     // Skip operation name
     const nameMatch = gql.substring(i).match(/^\s*(\w+)/);
     if (nameMatch) i += nameMatch[0].length;
@@ -482,6 +614,10 @@ function parseGqlFields(gql: string): GqlField[] {
   }
 
   if (bodyStart === undefined) {
+    // Fragment-only body: nothing to report at the operation level.
+    if (/^\s*fragment\b/s.test(gql)) {
+      return [];
+    }
     const braceIdx = gql.indexOf('{');
     if (braceIdx === -1) {
       log(`[codeLens] parseGqlFields: no opening brace found`);
@@ -491,11 +627,16 @@ function parseGqlFields(gql: string): GqlField[] {
   }
 
   const result: GqlField[] = [];
-  parseFieldsBlock(gql, bodyStart, result);
+  parseFieldsBlock(gql, bodyStart, result, fragments);
   return result;
 }
 
-function parseFieldsBlock(gql: string, start: number, out: GqlField[]): number {
+function parseFieldsBlock(
+  gql: string,
+  start: number,
+  out: GqlField[],
+  fragments?: Map<string, FragmentDef>,
+): number {
   let i = start;
 
   while (i < gql.length) {
@@ -510,24 +651,70 @@ function parseFieldsBlock(gql: string, start: number, out: GqlField[]): number {
     // Skip comments
     if (ch === '#') { while (i < gql.length && gql[i] !== '\n') i++; continue; }
 
-    // Skip spreads: ...FragmentName or ... on Type { }
+    // Spreads: inline (`... on Type { ... }`) or named (`...FragmentName`).
+    // Both flatten their fields into the current selection so coverage,
+    // CodeLens and the structure inspector see them as regular children.
     if (ch === '.' && gql[i + 1] === '.' && gql[i + 2] === '.') {
       i += 3;
-      // skip whitespace
       while (i < gql.length && /\s/.test(gql[i])) i++;
-      // skip 'on' keyword and type name if inline fragment
-      if (gql.substring(i, i + 2) === 'on') {
+
+      // Inline fragment: `... on Type [@dir…] { selection }`. Merge its
+      // fields into the current selection set so downstream consumers treat
+      // them as regular children.
+      if (
+        gql[i] === 'o' && gql[i + 1] === 'n' &&
+        i + 2 < gql.length && /\s/.test(gql[i + 2])
+      ) {
         i += 2;
-        while (i < gql.length && /[\s\w]/.test(gql[i])) i++;
-      } else {
-        // named fragment spread
-        while (i < gql.length && /\w/.test(gql[i])) i++;
+        while (i < gql.length && /\s/.test(gql[i])) i++;
+        while (i < gql.length && /\w/.test(gql[i])) i++; // type name
+        while (i < gql.length && /\s/.test(gql[i])) i++;
+        while (gql[i] === '@') {
+          i++;
+          while (i < gql.length && /\w/.test(gql[i])) i++;
+          while (i < gql.length && /\s/.test(gql[i])) i++;
+          if (gql[i] === '(') { i = skipBracket(gql, i, '(', ')'); }
+          while (i < gql.length && /\s/.test(gql[i])) i++;
+        }
+        if (gql[i] === '{') {
+          i++;
+          i = parseFieldsBlock(gql, i, out, fragments);
+        }
+        continue;
       }
-      // if followed by { }, skip the selection set
-      const afterSpread = gql.substring(i).trimStart();
-      if (afterSpread.startsWith('{')) {
-        i += gql.substring(i).indexOf('{');
-        i = skipBracket(gql, i, '{', '}');
+
+      // Named fragment spread — inline the fragment's fields by looking up
+      // its definition in the same gql literal. Unknown fragments are
+      // silently dropped (same-literal scope by design).
+      const nameMatch = gql.substring(i).match(/^([A-Za-z_]\w*)/);
+      if (nameMatch) {
+        const fragName = nameMatch[1];
+        i += nameMatch[0].length;
+        // Skip directives on the spread: `...F @include(if: $x)`
+        while (i < gql.length && /\s/.test(gql[i])) i++;
+        while (gql[i] === '@') {
+          i++;
+          while (i < gql.length && /\w/.test(gql[i])) i++;
+          while (i < gql.length && /\s/.test(gql[i])) i++;
+          if (gql[i] === '(') { i = skipBracket(gql, i, '(', ')'); }
+          while (i < gql.length && /\s/.test(gql[i])) i++;
+        }
+        if (fragments) {
+          const def = fragments.get(fragName);
+          if (def && !def.resolving) {
+            if (def.fields === null) {
+              def.resolving = true;
+              const resolved: GqlField[] = [];
+              // A fragment's body lives in the gql literal where it was
+              // defined — for cross-literal fragments that's a different
+              // source string than the one we're currently parsing.
+              parseFieldsBlock(def.source, def.bodyStart, resolved, fragments);
+              def.fields = resolved;
+              def.resolving = false;
+            }
+            for (const f of def.fields) out.push(f);
+          }
+        }
       }
       continue;
     }
@@ -581,7 +768,7 @@ function parseFieldsBlock(gql: string, start: number, out: GqlField[]): number {
       // If followed by { }, parse children
       if (gql[i] === '{') {
         i++; // skip '{'
-        i = parseFieldsBlock(gql, i, field.children);
+        i = parseFieldsBlock(gql, i, field.children, fragments);
       }
 
       out.push(field);

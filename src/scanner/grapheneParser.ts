@@ -16,7 +16,19 @@ const GRAPHENE_BASE_CLASSES = new Set([
   'DjangoObjectType',
   'SerializerMutation',
   'ClientIDMutation',
+  // Relay base classes — Connection classes become types; Node/ClientIDMutation
+  // are interface/mutation markers.
+  'Connection',
+  'relay.Connection',
+  'relay.Node',
+  'relay.ClientIDMutation',
 ]);
+
+const RELAY_CONNECTION_BASES = new Set(['Connection', 'relay.Connection']);
+
+function isLibraryBaseClass(name: string): boolean {
+  return name.startsWith('graphene.') || name.startsWith('relay.');
+}
 
 const MUTATION_BASE_CLASSES = new Set([
   'graphene.Mutation',
@@ -32,13 +44,13 @@ const GRAPHENE_FIELD_TYPES = new Set([
   'Argument', 'InputField',
 ]);
 
-interface ImportInfo {
+export interface ImportInfo {
   fromGraphene: Set<string>;
   fromGrapheneDjango: Set<string>;
   hasGrapheneImport: boolean;
 }
 
-const EMPTY_IMPORTS: ImportInfo = {
+export const EMPTY_IMPORTS: ImportInfo = {
   fromGraphene: new Set(),
   fromGrapheneDjango: new Set(),
   hasGrapheneImport: false,
@@ -51,6 +63,23 @@ interface RawClassInfo {
   lineNumber: number;
   lines: string[];
   imports: ImportInfo;
+  /**
+   * True if the class is decorated with `@dataclass` (or `@dataclasses.dataclass`).
+   * These classes use annotation-style field declarations (`id: IDStr`) rather
+   * than `id = graphene.ID()`, so parseClassFields needs to know to parse them.
+   */
+  isDataclass: boolean;
+  /**
+   * True when the class declaration was indented — i.e. nested inside another
+   * class or a function body. Nested classes are still useful to register
+   * (e.g. a `class Foo(TypedDict)` arg container inside a Query class), but
+   * when there's a name collision with a top-level class somewhere else in
+   * the project, the top-level class is almost always the canonical one.
+   * `resolveClassByProximity` uses this to break ties in favor of top-level
+   * candidates. Without it, a dummy `class Query(ObjectType):` inside a
+   * test case shadows the real production `Query`.
+   */
+  isNested: boolean;
 }
 
 interface SchemaCallInfo {
@@ -78,8 +107,17 @@ function resolveClassByProximity(
   if (!candidates || candidates.length === 0) return undefined;
   if (candidates.length === 1) return candidates[0];
 
-  // Score: prefer graphene-import files, then longest common path prefix
-  return candidates.reduce((best, candidate) => {
+  // When both top-level and nested declarations share a name, the top-level
+  // one is almost always the canonical class — nested ones are usually test
+  // doubles or private helpers. Filter first; if only nested remain we fall
+  // back to them (e.g. a nested TypedDict arg container that only lives
+  // inside one query class).
+  const topLevel = candidates.filter((c) => !c.isNested);
+  const pool = topLevel.length > 0 ? topLevel : candidates;
+  if (pool.length === 1) return pool[0];
+
+  // Score: prefer graphene-import files, then longest common path prefix.
+  return pool.reduce((best, candidate) => {
     const bestHasImports = best.imports !== EMPTY_IMPORTS;
     const candidateHasImports = candidate.imports !== EMPTY_IMPORTS;
     if (candidateHasImports && !bestHasImports) return candidate;
@@ -109,11 +147,15 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   // -------------------------------------------------------
   // Per-file parse function (used for both cache miss and fresh parse)
   // -------------------------------------------------------
-  const classRegex = /^class\s+(\w+)\s*(?:\(([^)]*(?:\n[^)]*)*)\))?\s*:/gm;
+  // Match both top-level and indented `class X(...):` declarations so nested
+  // TypedDict / dataclass helpers (commonly used as arg containers inside
+  // query classes) end up in rawMultiMap for later lookups.
+  const classRegex = /^[ \t]*class\s+(\w+)\s*(?:\(([^)]*(?:\n[^)]*)*)\))?\s*:/gm;
 
-  function extractClassesFromText(text: string): { name: string; baseClasses: string[]; lineNumber: number }[] {
+  function extractClassesFromText(text: string): { name: string; baseClasses: string[]; lineNumber: number; isDataclass: boolean; isNested: boolean }[] {
     classRegex.lastIndex = 0;
-    const results: { name: string; baseClasses: string[]; lineNumber: number }[] = [];
+    const results: { name: string; baseClasses: string[]; lineNumber: number; isDataclass: boolean; isNested: boolean }[] = [];
+    const allLines = text.split('\n');
     let classMatch;
     while ((classMatch = classRegex.exec(text)) !== null) {
       const baseClassRaw = classMatch[2] ?? '';
@@ -121,9 +163,30 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         .replace(/#[^\n]*/g, '')
         .split(',')
         .map((b) => b.trim())
-        .filter((b) => b.length > 0 && /^\w+$/.test(b));
+        .filter((b) => b.length > 0 && /^[\w.]+$/.test(b));
       const lineNumber = text.substring(0, classMatch.index).split('\n').length - 1;
-      results.push({ name: classMatch[1], baseClasses, lineNumber });
+      // Any leading whitespace on the class line means the declaration is
+      // nested (inside another class or a def body). Used by proximity
+      // resolution to break name collisions in favor of the top-level
+      // definition — the canonical one in virtually every real codebase.
+      const classLine = allLines[lineNumber] ?? '';
+      const isNested = /^[ \t]+class\b/.test(classLine);
+      // Look backwards for @dataclass / @dataclasses.dataclass decorator.
+      // Skip comments and blank lines; stop at any non-decorator statement.
+      let isDataclass = false;
+      for (let i = lineNumber - 1; i >= 0; i--) {
+        const prev = allLines[i].trim();
+        if (prev === '' || prev.startsWith('#')) continue;
+        if (prev.startsWith('@')) {
+          // `@dataclass`, `@dataclass(...)`, `@dataclasses.dataclass`, or `@dataclasses.dataclass(...)`
+          if (/^@\s*(?:dataclasses\s*\.\s*)?dataclass\b/.test(prev)) {
+            isDataclass = true;
+          }
+          continue; // keep scanning for decorators stacked above
+        }
+        break;
+      }
+      results.push({ name: classMatch[1], baseClasses, lineNumber, isDataclass, isNested });
     }
     return results;
   }
@@ -162,7 +225,13 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     return {
       contentHash: ParseCache.computeHash(text),
       containsGraphene,
-      classes: classes.map((c) => ({ name: c.name, baseClasses: c.baseClasses, lineNumber: c.lineNumber })),
+      classes: classes.map((c) => ({
+        name: c.name,
+        baseClasses: c.baseClasses,
+        lineNumber: c.lineNumber,
+        isDataclass: c.isDataclass,
+        isNested: c.isNested,
+      })),
       schemaEntries,
       imports: imports
         ? { fromGraphene: [...imports.fromGraphene], fromGrapheneDjango: [...imports.fromGrapheneDjango], hasGrapheneImport: imports.hasGrapheneImport }
@@ -179,6 +248,10 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   const nonGrapheneFilePaths: string[] = [];
   // Store lines per file for later field parsing (only cache misses read the file)
   const fileLinesMap = new Map<string, string[]>();
+  // When no cache is provided (or for non-graphene cache misses) we still need
+  // to be able to load a file's classes into rawMultiMap later. Keep the
+  // per-file CachedFileData around here so Pass 2 / saturation can read it.
+  const perFileData = new Map<string, CachedFileData>();
 
   function addToRawMultiMap(raw: RawClassInfo): void {
     const existing = rawMultiMap.get(raw.name);
@@ -205,6 +278,11 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         lineNumber: cls.lineNumber,
         lines,
         imports: effectiveImports,
+        isDataclass: cls.isDataclass ?? false,
+        // `isNested` is an optional field for back-compat with v7 cache
+        // entries. Fall back to checking the raw line when not present so
+        // upgrades don't silently mis-classify.
+        isNested: cls.isNested ?? /^[ \t]+class\b/.test(lines[cls.lineNumber] ?? ''),
       });
     }
 
@@ -229,16 +307,12 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     // Check cache
     const cached = cache?.get(filePath);
     if (cached && cached.contentHash === hash) {
+      perFileData.set(filePath, cached);
       // Cache hit — reconstruct from cached data
       if (cached.containsGraphene) {
         reconstructFromCache(cached, filePath, lines);
       } else {
         nonGrapheneFilePaths.push(filePath);
-        // Still extract classes for Pass 2 (cached)
-        const effectiveImports = EMPTY_IMPORTS;
-        for (const cls of cached.classes) {
-          // Don't add to rawMultiMap yet — deferred to Pass 2
-        }
       }
       continue;
     }
@@ -246,6 +320,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     // Cache miss — full parse
     const fileData = parseFileData(text, filePath);
     cache?.set(filePath, fileData);
+    perFileData.set(filePath, fileData);
 
     if (!fileData.containsGraphene) {
       nonGrapheneFilePaths.push(filePath);
@@ -288,7 +363,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     for (const [, entries] of rawMultiMap) {
       for (const raw of entries) {
         for (const bc of raw.baseClasses) {
-          if (!rawMultiMap.has(bc) && !GRAPHENE_BASE_CLASSES.has(bc) && !bc.startsWith('graphene.')) {
+          if (!rawMultiMap.has(bc) && !GRAPHENE_BASE_CLASSES.has(bc) && !isLibraryBaseClass(bc)) {
             missing.add(bc);
           }
         }
@@ -298,20 +373,20 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   }
 
   function extractClassesFromCachedFile(filePath: string): void {
-    const cached = cache?.get(filePath);
+    const data = perFileData.get(filePath) ?? cache?.get(filePath);
     const lines = fileLinesMap.get(filePath);
-    if (!lines) return;
-    if (cached) {
-      for (const cls of cached.classes) {
-        addToRawMultiMap({
-          name: cls.name,
-          baseClasses: cls.baseClasses,
-          filePath,
-          lineNumber: cls.lineNumber,
-          lines,
-          imports: EMPTY_IMPORTS,
-        });
-      }
+    if (!lines || !data) return;
+    for (const cls of data.classes) {
+      addToRawMultiMap({
+        name: cls.name,
+        baseClasses: cls.baseClasses,
+        filePath,
+        lineNumber: cls.lineNumber,
+        lines,
+        imports: EMPTY_IMPORTS,
+        isDataclass: cls.isDataclass ?? false,
+        isNested: cls.isNested ?? /^[ \t]+class\b/.test(lines[cls.lineNumber] ?? ''),
+      });
     }
   }
 
@@ -343,6 +418,16 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     for (const filePath of remainingPaths) {
       extractClassesFromCachedFile(filePath);
     }
+  }
+
+  // Final saturation: pull every graphene-tree non-graphene file's classes into
+  // rawMultiMap. This is what lets `TypedField(SomeDataclass)` references find
+  // their target @dataclass even when that dataclass lives in a module that
+  // doesn't itself import graphene. The missing-base-class loop above is
+  // targeted; this catch-all covers resolvedType references discovered later.
+  for (const filePath of nonGrapheneFilePaths) {
+    if (!isInGrapheneTree(filePath)) continue;
+    extractClassesFromCachedFile(filePath);
   }
 
   // Save cache after all parsing is done
@@ -442,6 +527,48 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   }
 
   // -------------------------------------------------------
+  // Resolved-type expansion: pull @dataclass (or any other) classes into
+  // grapheneClassNames when they are referenced as a field's resolvedType
+  // (or used as an input argument type) from an already-known graphene class.
+  // This is what lets `TypedField(list[MyDataclass])` surface MyDataclass even
+  // though MyDataclass has no graphene base class.
+  // -------------------------------------------------------
+  const expansionFieldsCache = new Map<string, FieldInfo[]>();
+  function getExpansionFields(raw: RawClassInfo): FieldInfo[] {
+    const key = `${raw.filePath}:${raw.lineNumber}:${raw.name}`;
+    let cached = expansionFieldsCache.get(key);
+    if (!cached) {
+      cached = parseClassFields(raw.lines, raw.lineNumber, raw.filePath, raw.imports, raw.isDataclass);
+      expansionFieldsCache.set(key, cached);
+    }
+    return cached;
+  }
+
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const name of [...grapheneClassNames]) {
+      const raw = getAnyRaw(name);
+      if (!raw) continue;
+      const fields = getExpansionFields(raw);
+      for (const f of fields) {
+        if (f.resolvedType && rawMultiMap.has(f.resolvedType) && !grapheneClassNames.has(f.resolvedType)) {
+          grapheneClassNames.add(f.resolvedType);
+          changed = true;
+        }
+        if (f.args) {
+          for (const a of f.args) {
+            if (rawMultiMap.has(a.type) && !grapheneClassNames.has(a.type)) {
+              grapheneClassNames.add(a.type);
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------
   // For each Schema entry, build an independent resolution
   // context using directory proximity. Merge all results.
   // -------------------------------------------------------
@@ -481,11 +608,47 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
 
     // Build a single-resolution classMap for this schema context
     const classMap = new Map<string, ClassInfo>();
+
+    // Resolver for `**ArgsClass.__annotations__` / `**Unpack[ArgsClass]` in
+    // field arg lists. Looks up the annotation-bearing class by name and pulls
+    // its direct + inherited annotations as FieldArgInfo, with a cycle guard
+    // so mutually-referencing TypedDicts don't spin.
+    const unpackCache = new Map<string, FieldArgInfo[]>();
+    const unpackResolving = new Set<string>();
+    const unpackResolver: UnpackResolver = (className: string) => {
+      const cached = unpackCache.get(className);
+      if (cached !== undefined) return cached;
+      if (unpackResolving.has(className)) return [];
+      const raw = resolveClassByProximity(className, rawMultiMap, contextPath);
+      if (!raw) { unpackCache.set(className, []); return []; }
+      unpackResolving.add(className);
+      const collected: FieldArgInfo[] = [];
+      // Inherit args from parent annotation classes (e.g. PaginationArguments).
+      for (const bc of raw.baseClasses) {
+        if (bc === 'TypedDict' || bc === 'typing.TypedDict' || GRAPHENE_BASE_CLASSES.has(bc)) continue;
+        if (!rawMultiMap.has(bc)) continue;
+        for (const a of unpackResolver(bc)) collected.push(a);
+      }
+      for (const a of parseAnnotationArgs(raw.lines, raw.lineNumber)) collected.push(a);
+      // De-dup by name, child declaration wins over parent.
+      const seen = new Set<string>();
+      const unique: FieldArgInfo[] = [];
+      for (let k = collected.length - 1; k >= 0; k--) {
+        const a = collected[k];
+        if (seen.has(a.name)) continue;
+        seen.add(a.name);
+        unique.unshift(a);
+      }
+      unpackResolving.delete(className);
+      unpackCache.set(className, unique);
+      return unique;
+    };
+
     for (const name of grapheneClassNames) {
       const raw = resolveClassByProximity(name, rawMultiMap, contextPath);
       if (!raw) continue;
 
-      const fields = parseClassFields(raw.lines, raw.lineNumber, raw.filePath, raw.imports);
+      const fields = parseClassFields(raw.lines, raw.lineNumber, raw.filePath, raw.imports, raw.isDataclass, unpackResolver);
       classMap.set(name, {
         name: raw.name,
         baseClasses: raw.baseClasses,
@@ -493,6 +656,70 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         filePath: raw.filePath,
         lineNumber: raw.lineNumber,
         fields,
+        kind: 'type',
+      });
+    }
+
+    // Merge inherited fields from base classes (mixins, etc.) into each class.
+    // Must run after classMap is fully populated so lookups by base class name succeed.
+    for (const cls of classMap.values()) {
+      cls.fields = resolveInheritedFields(cls, classMap);
+    }
+
+    // Relay synthesis: for each `class FooConnection(relay.Connection)` whose
+    // Meta.node points at a real type, materialize synthetic `FooEdge` / `PageInfo`
+    // classes and attach `edges` / `page_info` fields on the Connection. This
+    // lets the frontend traversal `foo { edges { node { … } } }` resolve.
+    let anyConnection = false;
+    for (const cls of [...classMap.values()]) {
+      const isConnection = cls.baseClasses.some((b) => RELAY_CONNECTION_BASES.has(b));
+      if (!isConnection) continue;
+
+      const nodeMarkerIdx = cls.fields.findIndex((f) => f.name === '__relay_node__');
+      if (nodeMarkerIdx < 0) continue;
+      const nodeType = cls.fields[nodeMarkerIdx].resolvedType;
+      if (!nodeType) continue;
+
+      // Drop the internal marker so it doesn't leak into UI.
+      cls.fields.splice(nodeMarkerIdx, 1);
+
+      // Pick an edge name that doesn't clash with an existing user class.
+      const candidate = cls.name.replace(/Connection$/, '') + 'Edge';
+      const edgeName = classMap.has(candidate) ? `${cls.name}Edge` : candidate;
+
+      classMap.set(edgeName, {
+        name: edgeName,
+        baseClasses: [],
+        framework: 'graphene',
+        filePath: cls.filePath,
+        lineNumber: cls.lineNumber,
+        fields: [
+          { name: 'node', fieldType: 'Field', resolvedType: nodeType, filePath: cls.filePath, lineNumber: cls.lineNumber },
+          { name: 'cursor', fieldType: 'String', filePath: cls.filePath, lineNumber: cls.lineNumber },
+        ],
+        kind: 'type',
+      });
+
+      cls.fields.push(
+        { name: 'edges', fieldType: 'List', resolvedType: edgeName, filePath: cls.filePath, lineNumber: cls.lineNumber },
+        { name: 'page_info', fieldType: 'Field', resolvedType: 'PageInfo', filePath: cls.filePath, lineNumber: cls.lineNumber },
+      );
+      anyConnection = true;
+    }
+
+    if (anyConnection && !classMap.has('PageInfo')) {
+      classMap.set('PageInfo', {
+        name: 'PageInfo',
+        baseClasses: [],
+        framework: 'graphene',
+        filePath: '',
+        lineNumber: 0,
+        fields: [
+          { name: 'has_next_page', fieldType: 'Boolean', filePath: '', lineNumber: 0 },
+          { name: 'has_previous_page', fieldType: 'Boolean', filePath: '', lineNumber: 0 },
+          { name: 'start_cursor', fieldType: 'String', filePath: '', lineNumber: 0 },
+          { name: 'end_cursor', fieldType: 'String', filePath: '', lineNumber: 0 },
+        ],
         kind: 'type',
       });
     }
@@ -594,6 +821,15 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         if (field.resolvedType) {
           collectReachable(field.resolvedType);
         }
+        // InputObjectType (or any class-named arg type) is reachable when it
+        // is used as a field argument — frontends need to see its shape.
+        if (field.args) {
+          for (const a of field.args) {
+            if (classMap.has(a.type)) {
+              collectReachable(a.type);
+            }
+          }
+        }
       }
     }
     collectReachable(queryRootName);
@@ -649,7 +885,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
 
 // ----- helpers -----
 
-function detectSchemaCall(
+export function detectSchemaCall(
   text: string,
   imports: ImportInfo,
   cb: (query?: string, mutation?: string) => void,
@@ -683,7 +919,7 @@ function isDirectGrapheneClass(raw: RawClassInfo): boolean {
   );
 }
 
-function parseImports(text: string): ImportInfo {
+export function parseImports(text: string): ImportInfo {
   const fromGraphene = new Set<string>();
   const fromGrapheneDjango = new Set<string>();
   let hasGrapheneImport = false;
@@ -708,15 +944,23 @@ function parseImports(text: string): ImportInfo {
   return { fromGraphene, fromGrapheneDjango, hasGrapheneImport };
 }
 
-function parseClassFields(
+export function parseClassFields(
   lines: string[],
   classLineNumber: number,
   filePath: string,
   imports: ImportInfo,
+  isDataclass: boolean = false,
+  unpackResolver?: UnpackResolver,
 ): FieldInfo[] {
   const fields: FieldInfo[] = [];
   const classLine = lines[classLineNumber];
   const classIndent = classLine.match(/^(\s*)/)?.[1].length ?? 0;
+
+  // Track method boundaries so we don't mis-parse annotations inside method bodies.
+  // `def <name>(…):` opens a method; any subsequent line indented strictly more
+  // than `methodIndent` belongs to the method body and is ignored for field
+  // detection. Resets when we dedent back to method-indent level.
+  let methodIndent = -1;
 
   for (let i = classLineNumber + 1; i < lines.length; i++) {
     const line = lines[i];
@@ -728,6 +972,88 @@ function parseClassFields(
     const lineIndent = line.match(/^(\s*)/)?.[1].length ?? 0;
     if (lineIndent <= classIndent && line.trim().length > 0) {
       break;
+    }
+
+    if (methodIndent >= 0 && lineIndent > methodIndent) continue;
+    if (methodIndent >= 0 && lineIndent <= methodIndent) methodIndent = -1;
+
+    // Skip decorator lines (they aren't fields). We still consider the class
+    // decorator scan separately up front; here a `@decorator` inside a class
+    // body marks the following def/method.
+    if (/^\s*@/.test(line)) continue;
+
+    // Method def — remember its indent; skip until we dedent back.
+    if (/^\s*(async\s+)?def\s+\w/.test(line)) {
+      methodIndent = lineIndent;
+      continue;
+    }
+
+    // Pattern 0: nested `class Meta:` block — extract DjangoObjectType field list.
+    // Supported: fields = [...] / only_fields = [...] / fields = (...), with the
+    // list spanning multiple lines. NOT supported (needs Django model scan):
+    // fields = '__all__', exclude = [...].
+    const metaClassMatch = line.match(/^(\s+)class\s+Meta\s*:/);
+    if (metaClassMatch) {
+      const metaIndent = metaClassMatch[1].length;
+      let j = i + 1;
+      for (; j < lines.length; j++) {
+        const ml = lines[j];
+        if (/^\s*$/.test(ml) || /^\s*#/.test(ml)) continue;
+        const mli = ml.match(/^(\s*)/)?.[1].length ?? 0;
+        if (mli <= metaIndent && ml.trim().length > 0) break;
+
+        // Match start of: (only_)?fields = [ ... ]  or  fields = ( ... )
+        // Gather subsequent lines until brackets are balanced so long lists
+        // split across lines (the common Django pattern) still work.
+        const listHeadMatch = ml.match(/^(\s+)(?:only_fields|fields)\s*=\s*[[(]/);
+        if (listHeadMatch) {
+          let buf = ml.substring(listHeadMatch[0].length);
+          let depth = 1;
+          for (const ch of buf) {
+            if (ch === '[' || ch === '(') depth++;
+            else if (ch === ']' || ch === ')') depth--;
+          }
+          let k = j;
+          while (depth > 0 && k + 1 < lines.length) {
+            k++;
+            const next = lines[k];
+            buf += '\n' + next;
+            for (const ch of next) {
+              if (ch === '[' || ch === '(') depth++;
+              else if (ch === ']' || ch === ')') depth--;
+              if (depth === 0) break;
+            }
+          }
+          const names = [...buf.matchAll(/['"](\w+)['"]/g)].map((m) => m[1]);
+          for (const n of names) {
+            fields.push({ name: n, fieldType: 'DjangoField', filePath, lineNumber: j });
+          }
+          j = k; // skip past the gathered list
+          continue;
+        }
+        // Match: node = SomeType (Relay Connection — Meta.node)
+        const nodeMatch = ml.match(/^\s+node\s*=\s*(\w+)/);
+        if (nodeMatch) {
+          fields.push({
+            name: '__relay_node__',
+            fieldType: 'RelayNode',
+            resolvedType: nodeMatch[1],
+            filePath,
+            lineNumber: j,
+          });
+        }
+      }
+      i = j - 1; // resume outer loop after the Meta block
+      continue;
+    }
+
+    // Skip nested class declarations that aren't Meta (e.g. TypedDict argument
+    // containers inside a Query class). Their bodies live at deeper indent and
+    // would otherwise be mis-read as class fields.
+    const nestedClassMatch = line.match(/^\s+class\s+\w+/);
+    if (nestedClassMatch) {
+      methodIndent = lineIndent; // reuse the method-body-skip mechanism
+      continue;
     }
 
     // Pattern 1: field = graphene.Type(...) or field = Type(...)
@@ -745,11 +1071,24 @@ function parseClassFields(
         const resolvedType = extractResolvedType(lines, i, fieldType);
 
         // Extract keyword arguments as field args
-        const args = parseFieldArgs(lines, i);
+        const args = parseFieldArgs(lines, i, unpackResolver);
+
+        // When the ctor isn't itself a `List` but its first positional arg is
+        // a list-shaped container (Python `list[X]`, graphene `List(X)`,
+        // `NonNull(List(X))`, etc.), report fieldType as 'List' so the UI
+        // renders the expected `[X]` brackets. Without this, e.g.
+        // `TypedField(list[X])` would look like a bare `X`.
+        let effectiveFieldType = fieldType;
+        if (effectiveFieldType !== 'List') {
+          const firstArg = firstPositionalArgText(lines, i, fieldType);
+          if (firstArg && detectListShape(firstArg)) {
+            effectiveFieldType = 'List';
+          }
+        }
 
         fields.push({
           name: fieldName,
-          fieldType,
+          fieldType: effectiveFieldType,
           resolvedType,
           args: args.length > 0 ? args : undefined,
           filePath,
@@ -772,10 +1111,207 @@ function parseClassFields(
         filePath,
         lineNumber: i,
       });
+      continue;
+    }
+
+    // Pattern 3: dataclass annotation — `field_name: TypeAnnotation [= default]`.
+    // Only active when the class was declared with @dataclass, so we don't
+    // pick up stray local-variable annotations in non-dataclass classes.
+    // Collect a multi-line annotation when the declaration continues via
+    // bracket-depth > 0 (e.g., `x: list[\n    SomeType,\n]`).
+    if (isDataclass) {
+      const annMatch = line.match(/^(\s+)(\w+)\s*:\s*(.+)$/);
+      if (annMatch) {
+        // Dataclass authors sometimes spell fields in camelCase (e.g.
+        // `totalCount: int`) to match a GraphQL wire name directly. The
+        // frontend-matching pipeline always snake-cases the camel name from
+        // the gql query, so we normalize backend names to snake_case on
+        // storage — otherwise `totalCount` in the class wouldn't match
+        // `camelToSnake('totalCount') === 'total_count'` at lookup time.
+        const fieldName = normalizeFieldName(annMatch[2]);
+        // `ClassVar[...]` annotations are never dataclass fields.
+        let annotation = annMatch[3];
+        if (/^ClassVar\b/.test(annotation)) continue;
+
+        // If brackets aren't balanced on this line, accumulate subsequent
+        // lines until they are. Dataclasses commonly split long generics
+        // across lines for readability.
+        let depth = 0;
+        for (const ch of annotation) {
+          if (ch === '[' || ch === '(' || ch === '{') depth++;
+          else if (ch === ']' || ch === ')' || ch === '}') depth--;
+        }
+        let j = i;
+        while (depth > 0 && j + 1 < lines.length) {
+          j++;
+          annotation += ' ' + lines[j];
+          for (const ch of lines[j]) {
+            if (ch === '[' || ch === '(' || ch === '{') depth++;
+            else if (ch === ']' || ch === ')' || ch === '}') depth--;
+          }
+        }
+
+        // Drop trailing `= default` / `= field(...)` — dataclass default values
+        // don't participate in the type.
+        const eqIdx = topLevelEqualsIndex(annotation);
+        const typeExpr = (eqIdx >= 0 ? annotation.substring(0, eqIdx) : annotation).trim();
+
+        // Decide fieldType / resolvedType from the annotation shape:
+        //  - List wrapping (`list[X]`, `Sequence[X]`, `X | None` where X is a
+        //    list) → fieldType='List', resolvedType=inner payload.
+        //  - Pure scalar annotation (`int`, `datetime.datetime`, etc.) →
+        //    fieldType is the GraphQL scalar name, resolvedType undefined so
+        //    downstream consumers treat it as a leaf.
+        //  - Custom class (`UserType`, `FooDataclass`) → fieldType='Field',
+        //    resolvedType points to the class so the UI can expand it.
+        const inner = firstPositionalType(typeExpr);
+        const listLike = isListLikeAnnotation(typeExpr);
+        const isScalar = !!inner && GRAPHQL_SCALAR_NAMES.has(inner);
+
+        let fieldType: string;
+        let resolvedType: string | undefined = inner;
+        if (listLike) {
+          fieldType = 'List';
+        } else if (isScalar && inner) {
+          fieldType = inner;
+          resolvedType = undefined;
+        } else if (inner) {
+          fieldType = 'Field';
+        } else {
+          fieldType = 'DataclassField';
+        }
+
+        fields.push({
+          name: fieldName,
+          fieldType,
+          resolvedType,
+          filePath,
+          lineNumber: i,
+        });
+        i = j;
+        continue;
+      }
     }
   }
 
   return fields;
+}
+
+// GraphQL built-in + common-custom scalar names. When Pattern 3 resolves an
+// annotation to one of these, treat the field as a leaf and surface the scalar
+// as fieldType so the UI can render `Int` / `String` directly.
+const GRAPHQL_SCALAR_NAMES = new Set([
+  'String', 'Int', 'Float', 'Boolean', 'ID',
+  'DateTime', 'Date', 'Time', 'Decimal', 'JSONString', 'UUID',
+]);
+
+/**
+ * Extract the text of the first positional argument of `headType(...)` starting
+ * at `fieldLineNumber`. Used to let Pattern 1 detect list-wrapped payloads in
+ * Python or graphene syntax (`TypedField(list[X])`, `Field(List(X))`, …).
+ */
+function firstPositionalArgText(lines: string[], fieldLineNumber: number, headType: string): string | undefined {
+  let fullText = '';
+  let depth = 0;
+  for (let j = fieldLineNumber; j < lines.length && j < fieldLineNumber + 15; j++) {
+    const line = lines[j];
+    for (const ch of line) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+    }
+    fullText += line + '\n';
+    if (depth <= 0 && j > fieldLineNumber) break;
+  }
+  const headRe = new RegExp(String.raw`(?:graphene\s*\.\s*)?\b` + escapeRegex(headType) + String.raw`\s*\(`);
+  const match = headRe.exec(fullText);
+  if (!match) return undefined;
+  const openParen = match.index + match[0].length - 1;
+  const inner = extractBalancedContent(fullText, openParen);
+  if (inner === null) return undefined;
+  // First positional arg runs until the first top-level comma.
+  let d = 0;
+  for (let k = 0; k < inner.length; k++) {
+    const ch = inner[k];
+    if (ch === '(' || ch === '[' || ch === '{') d++;
+    else if (ch === ')' || ch === ']' || ch === '}') d--;
+    else if (ch === ',' && d === 0) return inner.substring(0, k);
+  }
+  return inner;
+}
+
+/**
+ * True when the supplied type expression is a list-like container. Recognizes
+ * both Python typing syntax (`list[X]`, `Sequence[X]`, `X | None` where X is
+ * a list) and graphene ctor syntax (`List(X)`, `graphene.List(X)`,
+ * `NonNull(List(X))`, `NonNull(graphene.List(X))`, `lambda: List(X)`).
+ */
+function detectListShape(typeExpr: string): boolean {
+  let trimmed = typeExpr.replace(/^(?:\s*(?:#[^\n]*\n)?)*/, '').trimStart();
+  // Strip union None arms — `list[X] | None` is still a list.
+  const arms = splitTopLevelUnion(trimmed)
+    .map((a) => a.trim())
+    .filter((a) => a !== 'None' && a !== 'NoneType');
+  if (arms.length > 0) trimmed = arms[0];
+  // Python typing containers (case-sensitive — `List[X]`, `list[X]`, etc.).
+  if (/^(?:typing\s*\.\s*)?(?:list|List|Sequence|Iterable|tuple|Tuple|set|Set|frozenset|FrozenSet|AsyncIterable|AsyncIterator|Iterator|Generator|AsyncGenerator)\s*\[/.test(trimmed)) return true;
+  // graphene List ctor.
+  if (/^(?:graphene\s*\.\s*)?List\s*\(/.test(trimmed)) return true;
+  // NonNull(List(...)) — unwrap NonNull.
+  const nnMatch = trimmed.match(/^(?:graphene\s*\.\s*)?NonNull\s*\(/);
+  if (nnMatch) {
+    const openIdx = trimmed.indexOf('(');
+    const inner = extractBalancedContent(trimmed, openIdx);
+    if (inner !== null) return detectListShape(inner);
+  }
+  // lambda: body — unwrap lambda.
+  const lambdaMatch = trimmed.match(/^lambda\s*:\s*/);
+  if (lambdaMatch) return detectListShape(trimmed.substring(lambdaMatch[0].length));
+  return false;
+}
+
+/**
+ * camelCase → snake_case — matches the conversion used by the frontend gql
+ * matcher so backend names written in camelCase still line up with the
+ * snake-cased lookup keys. Duplicated (not imported from
+ * gqlCodeLensProvider) to keep the scanner free of VS Code dependencies.
+ */
+function normalizeFieldName(name: string): string {
+  return name
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/([a-z\d])([A-Z])/g, '$1_$2')
+    .toLowerCase();
+}
+
+/**
+ * True when a dataclass annotation's top-level type (after stripping `None`
+ * union arms) is a list/sequence-like Python container. Used to decide
+ * whether the field should render as `[X]` vs. a bare `X` in the structure UI.
+ */
+function isListLikeAnnotation(typeExpr: string): boolean {
+  // Strip `None` / `NoneType` arms of a top-level union; the list-ness is
+  // determined by the non-None arm.
+  const arms = splitTopLevelUnion(typeExpr)
+    .map((a) => a.trim())
+    .filter((a) => a !== 'None' && a !== 'NoneType');
+  const primary = arms.length > 0 ? arms[0] : typeExpr.trim();
+  // list[X] / List[X] / Sequence[X] / Iterable[X] / tuple[X] / set[X] / …
+  return /^(?:typing\s*\.\s*)?(?:list|List|Sequence|Iterable|tuple|Tuple|set|Set|frozenset|FrozenSet|AsyncIterable|AsyncIterator|Iterator|Generator|AsyncGenerator)\s*\[/.test(primary);
+}
+
+function topLevelEqualsIndex(text: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '[' || ch === '(' || ch === '{') depth++;
+    else if (ch === ']' || ch === ')' || ch === '}') depth--;
+    else if (ch === '=' && depth === 0) {
+      // Skip comparison operators that happen to involve '=' — unlikely in
+      // annotations but safe.
+      if (text[i + 1] === '=' || text[i - 1] === '!' || text[i - 1] === '<' || text[i - 1] === '>') continue;
+      return i;
+    }
+  }
+  return -1;
 }
 
 const NON_TYPE_WORDS = new Set([
@@ -784,7 +1320,35 @@ const NON_TYPE_WORDS = new Set([
   'source', 'resolver', 'name',
 ]);
 
-function extractResolvedType(lines: string[], fieldLineNumber: number, fieldType: string): string | undefined {
+const WRAPPER_TYPES = new Set(['List', 'NonNull']);
+
+// Python primitive / stdlib types → their GraphQL scalar equivalents. These let
+// annotation-style fields (`count: int`, `title: str`, `ids: list[UUID]`) report
+// a meaningful leaf type instead of `undefined` — so the user sees `Int` /
+// `String` / `[ID]` in the query structure rather than a bare `DataclassField`.
+const PY_PRIMITIVE_SCALARS: Record<string, string> = {
+  str: 'String', int: 'Int', float: 'Float', bool: 'Boolean',
+  bytes: 'String',
+  Decimal: 'Decimal', UUID: 'ID',
+  datetime: 'DateTime', date: 'Date', time: 'Time',
+};
+
+// Dotted forms — `datetime.datetime` resolves to DateTime, etc. Values are the
+// GraphQL scalar name; keys are the full dotted path.
+const PY_DOTTED_SCALARS: Record<string, string> = {
+  'datetime.datetime': 'DateTime',
+  'datetime.date': 'Date',
+  'datetime.time': 'Time',
+  'decimal.Decimal': 'Decimal',
+  'uuid.UUID': 'ID',
+};
+
+function mapPythonScalar(name: string, dottedPath?: string): string | undefined {
+  if (dottedPath && PY_DOTTED_SCALARS[dottedPath]) return PY_DOTTED_SCALARS[dottedPath];
+  return PY_PRIMITIVE_SCALARS[name];
+}
+
+export function extractResolvedType(lines: string[], fieldLineNumber: number, fieldType: string): string | undefined {
   // Collect the full field definition text (up to 15 lines or closing paren)
   let fullText = '';
   let depth = 0;
@@ -798,69 +1362,232 @@ function extractResolvedType(lines: string[], fieldLineNumber: number, fieldType
     if (depth <= 0 && j > fieldLineNumber) break;
   }
 
-  // Find the opening paren of the field type call
-  const typeCallIdx = fullText.indexOf(fieldType);
-  if (typeCallIdx === -1) return undefined;
-  const afterType = fullText.substring(typeCallIdx + fieldType.length).trimStart();
-  if (!afterType.startsWith('(')) return undefined;
-  const argsContent = afterType.substring(1); // after '('
+  return unwrapFromText(fullText, fieldType, new Set());
+}
 
-  // Extract the first positional argument (before any keyword arg)
-  // Skip whitespace and newlines
-  const trimmed = argsContent.trimStart();
+function unwrapFromText(text: string, headType: string, visited: Set<string>): string | undefined {
+  // Guard against pathological input (shouldn't happen but be safe)
+  if (visited.has(headType) && visited.size > 8) return undefined;
+  visited.add(headType);
 
-  // Pattern 1: lambda: Type
-  const lambdaMatch = trimmed.match(/^lambda\s*:\s*(\w+)/);
-  if (lambdaMatch) {
-    const t = lambdaMatch[1];
-    return NON_TYPE_WORDS.has(t) ? undefined : t;
+  // Find `[graphene.]headType(` — use the first occurrence; `text` is already
+  // scoped to the balanced content of the previous layer on recursion.
+  const headRe = new RegExp(String.raw`(?:graphene\s*\.\s*)?\b` + escapeRegex(headType) + String.raw`\s*\(`);
+  const match = headRe.exec(text);
+  if (!match) return undefined;
+
+  const openParen = match.index + match[0].length - 1;
+  const inner = extractBalancedContent(text, openParen);
+  if (inner == null) return undefined;
+
+  const first = firstPositionalType(inner);
+  if (!first) return undefined;
+
+  if (WRAPPER_TYPES.has(first)) {
+    return unwrapFromText(inner, first, visited);
+  }
+  return first;
+}
+
+function extractBalancedContent(text: string, openIdx: number): string | null {
+  if (text[openIdx] !== '(') return null;
+  let depth = 1;
+  let i = openIdx + 1;
+  while (i < text.length && depth > 0) {
+    const ch = text[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return text.substring(openIdx + 1, i);
+    }
+    i++;
+  }
+  return null;
+}
+
+// Python typing containers whose payload type is the SINGLE type argument.
+// `list[X]` / `Optional[X]` / `tuple[X]` etc. — extract X via recursion.
+const PY_SINGLE_CONTAINERS = new Set([
+  'list', 'List', 'set', 'Set', 'frozenset', 'FrozenSet',
+  'tuple', 'Tuple', 'Iterable', 'Sequence', 'Optional',
+  'Awaitable', 'Coroutine', 'AsyncIterable', 'AsyncIterator',
+  'Iterator', 'Generator', 'AsyncGenerator', 'NotRequired',
+]);
+
+// Mapping-like containers where the VALUE type (2nd arg) is the interesting one.
+const PY_MAPPING_CONTAINERS = new Set([
+  'dict', 'Dict', 'Mapping', 'MutableMapping', 'DefaultDict', 'defaultdict',
+  'OrderedDict',
+]);
+
+function splitTopLevelCommas(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '[' || ch === '(' || ch === '{') depth++;
+    else if (ch === ']' || ch === ')' || ch === '}') depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(text.substring(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.substring(start));
+  return parts;
+}
+
+function splitTopLevelUnion(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '[' || ch === '(' || ch === '{') depth++;
+    else if (ch === ']' || ch === ')' || ch === '}') depth--;
+    else if (ch === '|' && depth === 0) {
+      parts.push(text.substring(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.substring(start));
+  return parts;
+}
+
+function extractBalancedBrackets(text: string, openIdx: number): string | null {
+  if (text[openIdx] !== '[') return null;
+  let depth = 1;
+  let i = openIdx + 1;
+  while (i < text.length && depth > 0) {
+    const ch = text[i];
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) return text.substring(openIdx + 1, i);
+    }
+    i++;
+  }
+  return null;
+}
+
+function firstPositionalType(args: string, lambdaDepth: number = 0): string | undefined {
+  // Strip leading whitespace/newlines/comments
+  let trimmed = args.replace(/^(?:\s*(?:#[^\n]*\n)?)*/, '').trimStart();
+
+  // Pattern 0a: `X | Y | None` / `None | X` union — return first non-None arm.
+  // Only split at top-level pipes (not inside [] or ()). Guards against
+  // recursing on the identical string if we only found one arm.
+  const unionArms = splitTopLevelUnion(trimmed);
+  if (unionArms.length > 1) {
+    for (const arm of unionArms) {
+      const armStr = arm.trim();
+      if (armStr === 'None' || armStr === 'NoneType') continue;
+      const resolved = firstPositionalType(armStr, lambdaDepth);
+      if (resolved) return resolved;
+    }
+    return undefined;
   }
 
-  // Pattern 2: 'StringType' or "StringType" (string reference)
+  // Pattern 0b: Python typing containers — list[X], Optional[X], tuple[X], etc.
+  // For `typing.list[X]` / `typing.List[X]`, strip the `typing.` prefix first.
+  const containerMatch = trimmed.match(/^(?:typing\s*\.\s*)?(\w+)\s*\[/);
+  if (containerMatch) {
+    const containerName = containerMatch[1];
+    const openIdx = trimmed.indexOf('[');
+    const inner = extractBalancedBrackets(trimmed, openIdx);
+    if (inner !== null) {
+      // Union[X, Y, None] — pick first non-None arm (same semantics as `X | None`).
+      if (containerName === 'Union') {
+        const parts = splitTopLevelCommas(inner);
+        for (const part of parts) {
+          const partTrimmed = part.trim();
+          if (partTrimmed === 'None' || partTrimmed === 'NoneType') continue;
+          const result = firstPositionalType(partTrimmed, lambdaDepth);
+          if (result) return result;
+        }
+        return undefined;
+      }
+      if (PY_SINGLE_CONTAINERS.has(containerName)) {
+        return firstPositionalType(inner, lambdaDepth);
+      }
+      if (PY_MAPPING_CONTAINERS.has(containerName)) {
+        const parts = splitTopLevelCommas(inner);
+        if (parts.length >= 2) return firstPositionalType(parts[1], lambdaDepth);
+        return firstPositionalType(inner, lambdaDepth);
+      }
+      // Unknown container with subscript (e.g., `Literal[...]`, `Annotated[X, ...]`) —
+      // `Annotated[X, ...]` should return X. For anything else, fall through to
+      // treat `containerName` itself as the type.
+      if (containerName === 'Annotated') {
+        const parts = splitTopLevelCommas(inner);
+        if (parts.length >= 1) return firstPositionalType(parts[0], lambdaDepth);
+      }
+      // fall through — treat as `ContainerName` if it's a capitalized class name
+    }
+  }
+
+  // Pattern 1: lambda : <body>  — recurse on the body. Supports lambda: 'X',
+  // lambda: graphene.X, lambda: List(X), etc. Guard against pathological
+  // nested lambdas.
+  const lambdaHead = trimmed.match(/^lambda\s*:\s*/);
+  if (lambdaHead) {
+    if (lambdaDepth > 4) return undefined;
+    return firstPositionalType(trimmed.substring(lambdaHead[0].length), lambdaDepth + 1);
+  }
+
+  // Pattern 2: 'StringType' or "StringType"
   const strMatch = trimmed.match(/^['"](\w+)['"]/);
   if (strMatch) {
     const t = strMatch[1];
     return NON_TYPE_WORDS.has(t) ? undefined : t;
   }
 
-  // Pattern 3: Regular positional argument — first word that's not a keyword arg
-  const firstArgMatch = trimmed.match(/^(\w+)/);
-  if (firstArgMatch) {
-    const word = firstArgMatch[1];
-    // Check it's not a keyword argument (word followed by =)
-    const afterWord = trimmed.substring(firstArgMatch[0].length).trimStart();
-    if (afterWord.startsWith('=')) return undefined; // keyword arg, not type
-    if (NON_TYPE_WORDS.has(word)) return undefined;
-    // Must start with uppercase to be a type
-    if (/^[A-Z]/.test(word)) return word;
+  // Pattern 3: graphene.Type
+  const grapheneMatch = trimmed.match(/^graphene\s*\.\s*(\w+)/);
+  if (grapheneMatch) {
+    const t = grapheneMatch[1];
+    if (NON_TYPE_WORDS.has(t)) return undefined;
+    if (!/^[A-Z]/.test(t)) return undefined;
+    return t;
   }
 
-  // Pattern 4: Multi-line — first line is empty or comment, look at next lines
-  const linesList = argsContent.split('\n');
-  for (const argLine of linesList) {
-    const t = argLine.trim();
-    if (t.length === 0 || t.startsWith('#') || t.startsWith(')')) continue;
+  // Pattern 4: dotted type like `datetime.datetime` / `decimal.Decimal` — take
+  // the rightmost identifier (it's the actual class name), or map stdlib
+  // dotted scalars to their GraphQL equivalent.
+  const dottedMatch = trimmed.match(/^(\w+(?:\s*\.\s*\w+)+)/);
+  if (dottedMatch) {
+    const segments = dottedMatch[1].split('.').map((s) => s.trim());
+    const last = segments[segments.length - 1];
+    const afterWord = trimmed.substring(dottedMatch[0].length).trimStart();
+    if (afterWord.startsWith('=')) return undefined;
+    if (NON_TYPE_WORDS.has(last)) return undefined;
+    const dottedPath = segments.join('.');
+    const mapped = mapPythonScalar(last, dottedPath);
+    if (mapped) return mapped;
+    if (!/^[A-Z]/.test(last)) return undefined;
+    return last;
+  }
 
-    // lambda: Type
-    const lm = t.match(/^lambda\s*:\s*(\w+)/);
-    if (lm) return NON_TYPE_WORDS.has(lm[1]) ? undefined : lm[1];
-
-    // 'StringType'
-    const sm = t.match(/^['"](\w+)['"]/);
-    if (sm) return NON_TYPE_WORDS.has(sm[1]) ? undefined : sm[1];
-
-    // Regular word
-    const wm = t.match(/^(\w+)/);
-    if (wm) {
-      const after = t.substring(wm[0].length).trimStart();
-      if (after.startsWith('=')) continue; // keyword arg — skip to next line
-      if (NON_TYPE_WORDS.has(wm[1])) return undefined;
-      if (/^[A-Z]/.test(wm[1])) return wm[1];
-    }
-    break;
+  // Pattern 5: plain identifier (must not be a keyword arg). Lowercase Python
+  // primitives map to the corresponding GraphQL scalar so downstream code sees
+  // a usable resolvedType for annotations like `count: int`.
+  const wordMatch = trimmed.match(/^(\w+)/);
+  if (wordMatch) {
+    const word = wordMatch[1];
+    const afterWord = trimmed.substring(wordMatch[0].length).trimStart();
+    if (afterWord.startsWith('=')) return undefined; // kwarg, not a positional type
+    if (NON_TYPE_WORDS.has(word)) return undefined;
+    const mapped = mapPythonScalar(word);
+    if (mapped) return mapped;
+    if (!/^[A-Z]/.test(word)) return undefined;
+    return word;
   }
 
   return undefined;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 const GRAPHENE_ARG_TYPES: Record<string, string> = {
@@ -870,7 +1597,21 @@ const GRAPHENE_ARG_TYPES: Record<string, string> = {
   Argument: 'Argument', InputField: 'InputField',
 };
 
-function parseFieldArgs(lines: string[], fieldLineNumber: number): FieldArgInfo[] {
+const ARG_WRAPPER_TYPES = new Set(['Argument', 'InputField']);
+
+/**
+ * Resolves a TypedDict-style class name to a list of FieldArgInfo. Used by
+ * `parseFieldArgs` to expand `**ArgsClass.__annotations__` kwargs-unpacking
+ * patterns. Implementations typically look the name up in rawMultiMap and
+ * parse its annotation-style fields.
+ */
+export type UnpackResolver = (className: string) => FieldArgInfo[];
+
+export function parseFieldArgs(
+  lines: string[],
+  fieldLineNumber: number,
+  unpackResolver?: UnpackResolver,
+): FieldArgInfo[] {
   const args: FieldArgInfo[] = [];
   // Collect the full field definition (may span multiple lines until closing ')')
   let fullDef = '';
@@ -892,13 +1633,26 @@ function parseFieldArgs(lines: string[], fieldLineNumber: number): FieldArgInfo[
   while ((m = kwargRegex.exec(fullDef)) !== null) {
     if (first) { first = false; continue; } // skip the field assignment itself (field_name = Type(...))
     const argName = m[1];
-    const argType = m[2];
+    let argType = m[2];
     // Skip non-type kwargs like description, default_value, deprecation_reason
     if (['description', 'default_value', 'deprecation_reason', 'name', 'source', 'resolver'].includes(argName)) continue;
     if (!GRAPHENE_ARG_TYPES[argType] && !/^[A-Z]/.test(argType)) continue;
 
-    const afterMatch = fullDef.substring(m.index + m[0].length);
-    const required = /required\s*=\s*True/.test(afterMatch.split(')')[0] ?? '');
+    // Unwrap Argument(X) / InputField(X) → X. The real type is the first
+    // positional arg inside the wrapper.
+    const wrapperOpenIdx = m.index + m[0].length - 1;
+    if (ARG_WRAPPER_TYPES.has(argType)) {
+      const inner = extractBalancedContent(fullDef, wrapperOpenIdx);
+      if (inner != null) {
+        const innerType = firstPositionalType(inner);
+        if (innerType) argType = innerType;
+      }
+    }
+
+    // Scope the required=True check to this arg's own parens (handles the case
+    // where `required=True` sits inside a wrapper like Argument(X, required=True)).
+    const ownInner = extractBalancedContent(fullDef, wrapperOpenIdx) ?? '';
+    const required = /\brequired\s*=\s*True\b/.test(ownInner);
     args.push({
       name: argName,
       type: GRAPHENE_ARG_TYPES[argType] ?? argType,
@@ -906,10 +1660,106 @@ function parseFieldArgs(lines: string[], fieldLineNumber: number): FieldArgInfo[
     });
   }
 
+  // Captain-style kwargs unpacking: `TypedField(X, **ArgsClass.__annotations__)`
+  // or `TypedField(X, **Unpack[ArgsClass])`. We resolve the referenced TypedDict
+  // (or @dataclass, or any annotation-bearing class) and inline its annotations
+  // as field args. Without this, graphene fields that derive their arg shape
+  // from a TypedDict wouldn't surface any args in the UI.
+  if (unpackResolver) {
+    const patterns = [
+      /\*\*\s*(\w+)\s*\.\s*__annotations__/g,
+      /\*\*\s*Unpack\s*\[\s*(\w+)\s*\]/g,
+    ];
+    const seen = new Set(args.map((a) => a.name));
+    for (const re of patterns) {
+      let u: RegExpExecArray | null;
+      while ((u = re.exec(fullDef)) !== null) {
+        const className = u[1];
+        const resolved = unpackResolver(className);
+        for (const a of resolved) {
+          if (seen.has(a.name)) continue;
+          seen.add(a.name);
+          args.push(a);
+        }
+      }
+    }
+  }
+
   return args;
 }
 
-function resolveInheritedFields(
+/**
+ * Parse `name: Type` annotation lines inside a TypedDict / dataclass-like class
+ * body and return them as field args. Skips decorators, methods, nested
+ * classes, and `ClassVar[…]` entries. Arg `required` is derived from:
+ *   - `NotRequired[X]` / `typing.NotRequired[X]` → not required
+ *   - `Optional[X]` / `X | None` / `None | X` → not required
+ *   - otherwise required.
+ */
+export function parseAnnotationArgs(lines: string[], classLineNumber: number): FieldArgInfo[] {
+  const classLine = lines[classLineNumber];
+  const classIndent = classLine?.match(/^(\s*)/)?.[1].length ?? 0;
+  const out: FieldArgInfo[] = [];
+  let methodIndent = -1;
+
+  for (let i = classLineNumber + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    const lineIndent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    if (lineIndent <= classIndent && line.trim().length > 0) break;
+    if (methodIndent >= 0 && lineIndent > methodIndent) continue;
+    if (methodIndent >= 0 && lineIndent <= methodIndent) methodIndent = -1;
+    if (/^\s*@/.test(line)) continue;
+    if (/^\s*(async\s+)?def\s+\w/.test(line)) { methodIndent = lineIndent; continue; }
+    if (/^\s+class\s+\w/.test(line)) { methodIndent = lineIndent; continue; }
+
+    const annMatch = line.match(/^(\s+)(\w+)\s*:\s*(.+)$/);
+    if (!annMatch) continue;
+    const argName = annMatch[2];
+    let annotation = annMatch[3];
+    if (/^ClassVar\b/.test(annotation)) continue;
+
+    // Multi-line bracket balance.
+    let depth = 0;
+    for (const ch of annotation) {
+      if (ch === '[' || ch === '(' || ch === '{') depth++;
+      else if (ch === ']' || ch === ')' || ch === '}') depth--;
+    }
+    let j = i;
+    while (depth > 0 && j + 1 < lines.length) {
+      j++;
+      annotation += ' ' + lines[j];
+      for (const ch of lines[j]) {
+        if (ch === '[' || ch === '(' || ch === '{') depth++;
+        else if (ch === ']' || ch === ')' || ch === '}') depth--;
+      }
+    }
+
+    const eqIdx = topLevelEqualsIndex(annotation);
+    const typeExpr = (eqIdx >= 0 ? annotation.substring(0, eqIdx) : annotation).trim();
+
+    const { type, required } = annotationToArgShape(typeExpr);
+    out.push({ name: argName, type, required });
+    i = j;
+  }
+  return out;
+}
+
+/** Given `company_id: IDStr` / `page: NotRequired[int]` / `x: A | None` etc. */
+function annotationToArgShape(typeExpr: string): { type: string; required: boolean } {
+  const hasNotRequired = /^\s*(?:typing\s*\.\s*)?NotRequired\s*\[/.test(typeExpr);
+  const hasOptional = /^\s*(?:typing\s*\.\s*)?Optional\s*\[/.test(typeExpr);
+  const unionArms = splitTopLevelUnion(typeExpr);
+  const hasNoneArm = unionArms.some((a) => {
+    const t = a.trim();
+    return t === 'None' || t === 'NoneType';
+  });
+  const required = !hasNotRequired && !hasOptional && !hasNoneArm;
+  const resolved = firstPositionalType(typeExpr) ?? typeExpr.trim();
+  return { type: resolved, required };
+}
+
+export function resolveInheritedFields(
   cls: ClassInfo,
   classMap: Map<string, ClassInfo>,
   visited: Set<string> = new Set(),
@@ -921,7 +1771,7 @@ function resolveInheritedFields(
   const seen = new Set(fields.map((f) => f.name));
 
   for (const baseName of cls.baseClasses) {
-    if (GRAPHENE_BASE_CLASSES.has(baseName) || baseName.startsWith('graphene.')) {
+    if (GRAPHENE_BASE_CLASSES.has(baseName) || isLibraryBaseClass(baseName)) {
       continue;
     }
     const parentCls = classMap.get(baseName);
@@ -929,7 +1779,14 @@ function resolveInheritedFields(
       const parentFields = resolveInheritedFields(parentCls, classMap, visited);
       for (const field of parentFields) {
         if (!seen.has(field.name)) {
-          fields.push({ ...field, filePath: field.filePath || parentCls.filePath });
+          fields.push({
+            ...field,
+            filePath: field.filePath || parentCls.filePath,
+            // Remember where this field was originally declared so downstream
+            // consumers (fieldIndex, inspector, click-to-source) can route to
+            // the true owner, not the subclass that merely inherits it.
+            definedIn: field.definedIn ?? parentCls.name,
+          });
           seen.add(field.name);
         }
       }

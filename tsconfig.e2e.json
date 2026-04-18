@@ -2,14 +2,15 @@
   "compilerOptions": {
     "module": "commonjs",
     "target": "ES2020",
-    "outDir": "out",
-    "rootDir": "src",
+    "outDir": "out-e2e",
+    "rootDir": "test-e2e",
     "lib": ["ES2020"],
     "sourceMap": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node", "mocha"]
   },
-  "exclude": ["node_modules", "out", "out-e2e", "vitest.config.ts", "src/__tests__/**", "test-e2e/**"]
+  "include": ["test-e2e/**/*"]
 }
