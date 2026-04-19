@@ -2,7 +2,7 @@
   "name": "django-graphql-explorer",
   "displayName": "Django GraphQL Explorer",
   "description": "Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -134,8 +134,11 @@
     "pretest:e2e": "npm run compile && npm run compile:e2e",
     "test:e2e": "node out-e2e/runTests.js",
     "icons": "node scripts/generate-icon.mjs",
-    "package": "npm run compile && vsce package",
-    "publish": "npm run compile && vsce publish"
+    "build:native": "cd native && npx napi build --release --platform",
+    "build:native:debug": "cd native && npx napi build --platform",
+    "build:all": "npm run build:native && npm run compile",
+    "package": "npm run build:native && npm run compile && vsce package",
+    "publish": "npm run build:native && npm run compile && vsce publish"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

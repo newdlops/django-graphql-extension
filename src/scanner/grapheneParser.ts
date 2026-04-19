@@ -1,7 +1,10 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { performance } from 'perf_hooks';
 import { ClassInfo, FieldInfo, FieldArgInfo, SchemaInfo } from '../types';
 import { ParseCache, CachedFileData } from './parseCache';
+import { info } from '../logger';
+import { isNativeAvailable, scanProjectNativeAsync } from './nativeScanner';
 
 const GRAPHENE_BASE_CLASSES = new Set([
   'graphene.ObjectType',
@@ -134,15 +137,22 @@ function resolveClassByProximity(
 // -------------------------------------------------------
 
 export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache): Promise<SchemaInfo[]> {
-  const pyFiles = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(rootDir, '**/*.py'),
-    '{**/migrations/**,**/__pycache__/**,**/node_modules/**,**/.venv/**,**/venv/**,**/env/**}',
-  );
-
-  // Prune cache entries for deleted files
-  if (cache) {
-    cache.pruneExcept(new Set(pyFiles.map((u) => u.fsPath)));
-  }
+  const __tStart = performance.now();
+  let __tReadFile = 0;
+  let __tHash = 0;
+  let __tSplit = 0;
+  let __tCacheGet = 0;
+  let __tParseFileData = 0;
+  let __tReconstruct = 0;
+  let __cacheHits = 0;
+  let __cacheMisses = 0;
+  let __totalBytes = 0;
+  let __tFindFiles = 0;
+  let __pyFileCount = 0;
+  let __usedNative = false;
+  let __nativeWalkMs = 0;
+  let __nativeReadMs = 0;
+  let __nativeParseMs = 0;
 
   // -------------------------------------------------------
   // Per-file parse function (used for both cache miss and fresh parse)
@@ -294,48 +304,158 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     }
   }
 
-  for (const uri of pyFiles) {
-    const filePath = uri.fsPath;
+  const __tFileLoopStart = performance.now();
 
-    // Read file content via fs API (fast, for hash computation)
-    const rawBytes = await vscode.workspace.fs.readFile(uri);
-    const text = Buffer.from(rawBytes).toString('utf-8');
-    const hash = ParseCache.computeHash(text);
-    const lines = text.split('\n');
-    fileLinesMap.set(filePath, lines);
+  // ---------- native fast path (Rust NAPI) ----------
+  // Rust walker + reader + 1차 파서를 한 번에 돌려 파일 루프를 대체한다.
+  // tests (vitest)와 macOS arm64 이외의 플랫폼에서는 native 바이너리가 로드되지
+  // 않으므로 `isNativeAvailable()`이 false를 반환하고 아래 JS fallback으로 내려간다.
+  // AsyncTask를 사용해 Rust 작업이 libuv 워커 스레드에서 돌아가며 이 기간 동안
+  // 익스텐션 호스트 메인 스레드가 VS Code UI에 계속 응답한다.
+  const __nativeResult = isNativeAvailable()
+    ? await scanProjectNativeAsync(rootDir, cache?.snapshotHashes() ?? {}, {
+        cachedNonemptyPaths: cache?.snapshotNonEmptyPaths(),
+      })
+    : null;
 
-    // Check cache
-    const cached = cache?.get(filePath);
-    if (cached && cached.contentHash === hash) {
-      perFileData.set(filePath, cached);
-      // Cache hit — reconstruct from cached data
-      if (cached.containsGraphene) {
-        reconstructFromCache(cached, filePath, lines);
+  if (__nativeResult) {
+    __usedNative = true;
+    __nativeWalkMs = __nativeResult.stats.walkMs;
+    __nativeReadMs = __nativeResult.stats.readMs;
+    __nativeParseMs = __nativeResult.stats.parseMs;
+    __pyFileCount = __nativeResult.stats.fileCount;
+
+    if (cache) cache.pruneExcept(new Set(__nativeResult.files.map((f) => f.path)));
+
+    for (const fr of __nativeResult.files) {
+      const filePath = fr.path;
+      const text = fr.text ?? '';
+      __totalBytes += text.length;
+
+      const __tSplitStart = performance.now();
+      const lines = text.split('\n');
+      fileLinesMap.set(filePath, lines);
+      __tSplit += performance.now() - __tSplitStart;
+
+      let fileData: CachedFileData;
+      if (fr.cacheHit) {
+        __cacheHits++;
+        // Cache hit — Rust confirmed the content hash matches, so the
+        // existing parsed entry is authoritative.
+        fileData = cache!.get(filePath)!;
+      } else {
+        __cacheMisses++;
+        const p = fr.data!;
+        fileData = {
+          contentHash: fr.contentHash,
+          containsGraphene: p.containsGraphene,
+          classes: p.classes.map((c) => ({
+            name: c.name,
+            baseClasses: c.baseClasses,
+            lineNumber: c.lineNumber,
+            isDataclass: c.isDataclass,
+            isNested: c.isNested,
+          })),
+          schemaEntries: p.schemaEntries.map((s) => ({
+            queryRootName: s.queryRootName,
+            mutationRootName: s.mutationRootName,
+          })),
+          imports: {
+            fromGraphene: p.imports.fromGraphene,
+            fromGrapheneDjango: p.imports.fromGrapheneDjango,
+            hasGrapheneImport: p.imports.hasGrapheneImport,
+          },
+        };
+        cache?.set(filePath, fileData);
+      }
+      perFileData.set(filePath, fileData);
+
+      const __tReconStart = performance.now();
+      if (fileData.containsGraphene) {
+        reconstructFromCache(fileData, filePath, lines);
       } else {
         nonGrapheneFilePaths.push(filePath);
       }
-      continue;
+      __tReconstruct += performance.now() - __tReconStart;
     }
+  } else {
+    // ---------- JS fallback (original path) ----------
+    // vitest 모킹된 vscode.workspace.fs 위에서 돌아가는 테스트와 native 바이너리가
+    // 없는 플랫폼을 위한 그대로의 TypeScript 구현.
+    const __tFindFilesStart = performance.now();
+    const pyFiles = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(rootDir, '**/*.py'),
+      '{**/migrations/**,**/__pycache__/**,**/node_modules/**,**/.venv/**,**/venv/**,**/env/**}',
+    );
+    __tFindFiles = performance.now() - __tFindFilesStart;
+    __pyFileCount = pyFiles.length;
 
-    // Cache miss — full parse
-    const fileData = parseFileData(text, filePath);
-    cache?.set(filePath, fileData);
-    perFileData.set(filePath, fileData);
+    if (cache) cache.pruneExcept(new Set(pyFiles.map((u) => u.fsPath)));
 
-    if (!fileData.containsGraphene) {
-      nonGrapheneFilePaths.push(filePath);
-      continue;
+    for (const uri of pyFiles) {
+      const filePath = uri.fsPath;
+
+      // Read file content via fs API (fast, for hash computation)
+      const __tReadStart = performance.now();
+      const rawBytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(rawBytes).toString('utf-8');
+      __tReadFile += performance.now() - __tReadStart;
+      __totalBytes += rawBytes.byteLength;
+
+      const __tHashStart = performance.now();
+      const hash = ParseCache.computeHash(text);
+      __tHash += performance.now() - __tHashStart;
+
+      const __tSplitStart = performance.now();
+      const lines = text.split('\n');
+      fileLinesMap.set(filePath, lines);
+      __tSplit += performance.now() - __tSplitStart;
+
+      // Check cache
+      const __tCacheStart = performance.now();
+      const cached = cache?.get(filePath);
+      __tCacheGet += performance.now() - __tCacheStart;
+      if (cached && cached.contentHash === hash) {
+        __cacheHits++;
+        perFileData.set(filePath, cached);
+        // Cache hit — reconstruct from cached data
+        const __tReconStart = performance.now();
+        if (cached.containsGraphene) {
+          reconstructFromCache(cached, filePath, lines);
+        } else {
+          nonGrapheneFilePaths.push(filePath);
+        }
+        __tReconstruct += performance.now() - __tReconStart;
+        continue;
+      }
+
+      __cacheMisses++;
+      // Cache miss — full parse
+      const __tParseStart = performance.now();
+      const fileData = parseFileData(text, filePath);
+      __tParseFileData += performance.now() - __tParseStart;
+      cache?.set(filePath, fileData);
+      perFileData.set(filePath, fileData);
+
+      if (!fileData.containsGraphene) {
+        nonGrapheneFilePaths.push(filePath);
+        continue;
+      }
+
+      // Reconstruct runtime data from freshly parsed data
+      const __tReconStart2 = performance.now();
+      reconstructFromCache(fileData, filePath, lines);
+      __tReconstruct += performance.now() - __tReconStart2;
     }
-
-    // Reconstruct runtime data from freshly parsed data
-    reconstructFromCache(fileData, filePath, lines);
   }
+  const __tFileLoop = performance.now() - __tFileLoopStart;
 
   // -------------------------------------------------------
   // Pass 2: Iteratively scan non-graphene files to find
   //         missing base classes referenced by known classes.
   // -------------------------------------------------------
 
+  const __tPass2Start = performance.now();
   const grapheneDirPrefixes: string[] = [];
   for (const d of grapheneDirs) {
     grapheneDirPrefixes.push(d);
@@ -430,13 +550,19 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     extractClassesFromCachedFile(filePath);
   }
 
+  const __tPass2 = performance.now() - __tPass2Start;
+
   // Save cache after all parsing is done
+  const __tCacheSaveStart = performance.now();
   cache?.save();
+  const __tCacheSave = performance.now() - __tCacheSaveStart;
 
   // -------------------------------------------------------
   // Determine which classes are graphene-related
   // by walking the inheritance graph transitively
   // -------------------------------------------------------
+
+  const __tTransitiveStart = performance.now();
 
   // For quick single-lookup (pick first candidate as default)
   function getAnyRaw(name: string): RawClassInfo | undefined {
@@ -526,6 +652,8 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     }
   }
 
+  const __tTransitive = performance.now() - __tTransitiveStart;
+
   // -------------------------------------------------------
   // Resolved-type expansion: pull @dataclass (or any other) classes into
   // grapheneClassNames when they are referenced as a field's resolvedType
@@ -533,6 +661,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
   // This is what lets `TypedField(list[MyDataclass])` surface MyDataclass even
   // though MyDataclass has no graphene base class.
   // -------------------------------------------------------
+  const __tResolvedExpStart = performance.now();
   const expansionFieldsCache = new Map<string, FieldInfo[]>();
   function getExpansionFields(raw: RawClassInfo): FieldInfo[] {
     const key = `${raw.filePath}:${raw.lineNumber}:${raw.name}`;
@@ -568,11 +697,27 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     }
   }
 
+  const __tResolvedExp = performance.now() - __tResolvedExpStart;
+
   // -------------------------------------------------------
   // For each Schema entry, build an independent resolution
   // context using directory proximity. Merge all results.
   // -------------------------------------------------------
 
+  const __tSchemaBuildStart = performance.now();
+  let __tFinalFieldsParse = 0;
+  let __tInheritedFields = 0;
+  let __finalFieldsCount = 0;
+  let __finalFieldsMemoHits = 0;
+  // Cross-schema memo for parseClassFields. Keyed by the raw class declaration
+  // (filePath + lineNumber), not name, because proximity resolution may point
+  // two different schema contexts at the same underlying class; caching by
+  // declaration site keeps the entries consistent. The cached array is used as
+  // the initial `cls.fields` value in each schema's classMap and is replaced
+  // by `resolveInheritedFields(...)` before any mutation (splice/push in the
+  // Connection synthesis step), so sharing the reference across schemas is
+  // safe — nobody mutates it in-place.
+  const classFieldsMemo = new Map<string, FieldInfo[]>();
   // Normalize schema entries: if none found, use convention defaults
   if (schemaEntries.length === 0) {
     schemaEntries.push({
@@ -763,7 +908,17 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
       const raw = resolveClassByProximity(name, rawMultiMap, contextPath);
       if (!raw) continue;
 
-      const fields = parseClassFields(raw.lines, raw.lineNumber, raw.filePath, raw.imports, raw.isDataclass, unpackResolver);
+      const memoKey = `${raw.filePath}:${raw.lineNumber}`;
+      let fields = classFieldsMemo.get(memoKey);
+      if (fields === undefined) {
+        const __tPcfStart = performance.now();
+        fields = parseClassFields(raw.lines, raw.lineNumber, raw.filePath, raw.imports, raw.isDataclass, unpackResolver);
+        __tFinalFieldsParse += performance.now() - __tPcfStart;
+        __finalFieldsCount++;
+        classFieldsMemo.set(memoKey, fields);
+      } else {
+        __finalFieldsMemoHits++;
+      }
       classMap.set(name, {
         name: raw.name,
         baseClasses: raw.baseClasses,
@@ -777,9 +932,16 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
 
     // Merge inherited fields from base classes (mixins, etc.) into each class.
     // Must run after classMap is fully populated so lookups by base class name succeed.
+    const __tInheritStart = performance.now();
+    // Per-schema memo: classMap is rebuilt per schemaEntry, so the memo
+    // lifecycle matches. Recursive calls from the outer loop share the
+    // memo, collapsing the O(classes × ancestor depth) walk into
+    // O(classes + unique ancestors) per schema.
+    const inheritedMemo = new Map<string, FieldInfo[]>();
     for (const cls of classMap.values()) {
-      cls.fields = resolveInheritedFields(cls, classMap);
+      cls.fields = resolveInheritedFields(cls, classMap, new Set(), inheritedMemo);
     }
+    __tInheritedFields += performance.now() - __tInheritStart;
 
     // Relay synthesis: for each `class FooConnection(relay.Connection)` whose
     // Meta.node points at a real type, materialize synthetic `FooEdge` / `PageInfo`
@@ -980,6 +1142,8 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     });
   }
 
+  const __tSchemaBuild = performance.now() - __tSchemaBuildStart;
+
   // Deduplicate by filePath: keep the most populated entry per file
   const filePathMap = new Map<string, SchemaInfo>();
   for (const result of results) {
@@ -994,6 +1158,25 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
       }
     }
   }
+
+  const __tTotal = performance.now() - __tStart;
+  const r = (n: number) => Math.round(n);
+  const mb = (__totalBytes / (1024 * 1024)).toFixed(1);
+  const __backend = __usedNative ? 'native' : 'js';
+  const __nativeSegment = __usedNative
+    ? `native[walk=${__nativeWalkMs} read=${__nativeReadMs} parse=${__nativeParseMs}] `
+    : '';
+  info(
+    `[timing] parseGrapheneSchemas(${path.basename(rootDir)}) [${__backend}] total=${r(__tTotal)}ms ` +
+    `files=${__pyFileCount}(${mb}MB) hit=${__cacheHits} miss=${__cacheMisses} | ` +
+    `findFiles=${r(__tFindFiles)}ms ` +
+    `fileLoop=${r(__tFileLoop)}ms ` +
+    `${__nativeSegment}` +
+    `[read=${r(__tReadFile)} hash=${r(__tHash)} split=${r(__tSplit)} cacheGet=${r(__tCacheGet)} parse=${r(__tParseFileData)} reconstruct=${r(__tReconstruct)}] ` +
+    `pass2=${r(__tPass2)}ms cacheSave=${r(__tCacheSave)}ms ` +
+    `transitiveRes=${r(__tTransitive)}ms resolvedTypeExp=${r(__tResolvedExp)}ms ` +
+    `schemaBuild=${r(__tSchemaBuild)}ms [parseClassFields=${r(__tFinalFieldsParse)}ms x${__finalFieldsCount} memoHits=${__finalFieldsMemoHits} resolveInherited=${r(__tInheritedFields)}ms]`,
+  );
 
   return [...filePathMap.values()];
 }
@@ -1952,7 +2135,16 @@ export function resolveInheritedFields(
   cls: ClassInfo,
   classMap: Map<string, ClassInfo>,
   visited: Set<string> = new Set(),
+  memo?: Map<string, FieldInfo[]>,
 ): FieldInfo[] {
+  // Optional memo cache keyed by className. Safe when the classMap topology
+  // is an acyclic inheritance graph (the normal case — Python forbids
+  // inheritance cycles outright). Callers that don't pass `memo` keep the
+  // original recompute-from-scratch behavior.
+  if (memo) {
+    const cached = memo.get(cls.name);
+    if (cached !== undefined) return cached;
+  }
   if (visited.has(cls.name)) return [];
   visited.add(cls.name);
 
@@ -1965,7 +2157,7 @@ export function resolveInheritedFields(
     }
     const parentCls = classMap.get(baseName);
     if (parentCls) {
-      const parentFields = resolveInheritedFields(parentCls, classMap, visited);
+      const parentFields = resolveInheritedFields(parentCls, classMap, visited, memo);
       for (const field of parentFields) {
         if (!seen.has(field.name)) {
           fields.push({
@@ -1982,5 +2174,6 @@ export function resolveInheritedFields(
     }
   }
 
+  if (memo) memo.set(cls.name, fields);
   return fields;
 }

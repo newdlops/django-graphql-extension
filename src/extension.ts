@@ -1,14 +1,16 @@
 import * as vscode from 'vscode';
+import { performance } from 'perf_hooks';
 import { GraphqlViewProvider } from './webview/graphqlViewProvider';
 import { GqlCodeLensProvider } from './codelens/gqlCodeLensProvider';
 import { GqlInlayHintsProvider } from './codelens/gqlInlayHintsProvider';
 import { GqlDiagnosticsManager } from './codelens/gqlDiagnostics';
 import { GqlDecorationManager } from './codelens/gqlDecorations';
 import { ParseCache } from './scanner/parseCache';
-import { detectProjects } from './scanner/djangoDetector';
+import { detectProjects, invalidateDetectCache } from './scanner/djangoDetector';
 import { scanProjects } from './scanner/scanAll';
+import { parseFileNative, hashTextNative, isNativeAvailable } from './scanner/nativeScanner';
 import { ClassInfo } from './types';
-import { log } from './logger';
+import { log, info } from './logger';
 import { prepareDocumentGql } from './analysis/gqlCoverage';
 import { buildQueryStructure, buildLazySubtree } from './analysis/queryStructure';
 import { renderQueryStructureHtml, renderSubtreeNodesHtml } from './preview/queryStructureWebview';
@@ -128,8 +130,15 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   async function doRefresh(): Promise<void> {
+    const __tTotalStart = performance.now();
+
+    const __tDetectStart = performance.now();
     const projects = await detectProjects();
+    const __tDetect = performance.now() - __tDetectStart;
+
+    const __tScanStart = performance.now();
     const allSchemas = await scanProjects(projects, parseCache);
+    const __tScan = performance.now() - __tScanStart;
 
     log(`[refresh] === SCHEMAS (${allSchemas.length}) ===`);
     for (const schema of allSchemas) {
@@ -139,16 +148,27 @@ export function activate(context: vscode.ExtensionContext) {
     viewProvider.updateSchemas(allSchemas);
 
     // Build classMap for CodeLens
+    const __tClassMapStart = performance.now();
     const classMap = new Map<string, ClassInfo>();
     for (const schema of allSchemas) {
       for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
         classMap.set(cls.name, cls);
       }
     }
+    const __tClassMap = performance.now() - __tClassMapStart;
+
     codeLensProvider.updateIndex(classMap);
     // After the CodeLens index's debounced rebuild, poke the InlayHints
     // provider so it re-queries getSharedState() and repaints.
     setTimeout(() => inlayHintsProvider.refresh(), 250);
+
+    const r = (n: number) => Math.round(n);
+    info(
+      `[timing] doRefresh total=${r(performance.now() - __tTotalStart)}ms ` +
+      `detect=${r(__tDetect)}ms scan=${r(__tScan)}ms ` +
+      `classMap=${r(__tClassMap)}ms(n=${classMap.size}) ` +
+      `(codeLens index build runs async after 200ms debounce)`,
+    );
   }
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -220,12 +240,77 @@ export function activate(context: vscode.ExtensionContext) {
     refreshTimeout = setTimeout(() => refresh(), 500);
   };
 
-  pyWatcher.onDidChange(debouncedRefresh);
-  pyWatcher.onDidCreate(debouncedRefresh);
-  pyWatcher.onDidDelete(debouncedRefresh);
+  // Optimistically update parseCache for the saved file before the debounced
+  // refresh fires. Uses the native parser for a single-file parse so the
+  // subsequent full scan sees a cache hit (no re-parse on that file) and the
+  // 500ms debounce window is spent doing useful work in parallel with the
+  // user's keystrokes instead of idle-waiting.
+  async function pokeCacheForFile(uri: vscode.Uri): Promise<void> {
+    if (!isNativeAvailable()) return;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString('utf-8');
+      const hash = hashTextNative(text);
+      const parsed = parseFileNative(text);
+      if (!hash || !parsed) return;
+      parseCache.set(uri.fsPath, {
+        contentHash: hash,
+        containsGraphene: parsed.containsGraphene,
+        classes: parsed.classes.map((c) => ({
+          name: c.name,
+          baseClasses: c.baseClasses,
+          lineNumber: c.lineNumber,
+          isDataclass: c.isDataclass,
+          isNested: c.isNested,
+        })),
+        schemaEntries: parsed.schemaEntries.map((s) => ({
+          queryRootName: s.queryRootName,
+          mutationRootName: s.mutationRootName,
+        })),
+        imports: {
+          fromGraphene: parsed.imports.fromGraphene,
+          fromGrapheneDjango: parsed.imports.fromGrapheneDjango,
+          hasGrapheneImport: parsed.imports.hasGrapheneImport,
+        },
+      });
+    } catch {
+      // Unreadable file or parse error — fall through; the full refresh will
+      // handle it. Not worth surfacing to the user.
+    }
+  }
+
+  // settings.py edits change framework detection; drop the detectProjects
+  // cache so the next refresh re-runs discovery instead of returning stale
+  // frameworks. Other .py edits don't affect detection.
+  function maybeInvalidateDetect(uri: vscode.Uri): void {
+    if (uri.fsPath.endsWith('/settings.py') || uri.fsPath.endsWith('\\settings.py')) {
+      invalidateDetectCache();
+    }
+  }
+
+  function onPyChange(uri: vscode.Uri): void {
+    maybeInvalidateDetect(uri);
+    pokeCacheForFile(uri);
+    debouncedRefresh();
+  }
+
+  pyWatcher.onDidChange(onPyChange);
+  pyWatcher.onDidCreate(onPyChange);
+  pyWatcher.onDidDelete((uri) => {
+    maybeInvalidateDetect(uri);
+    parseCache.delete(uri.fsPath);
+    debouncedRefresh();
+  });
   gqlWatcher.onDidChange(debouncedRefresh);
   gqlWatcher.onDidCreate(debouncedRefresh);
   gqlWatcher.onDidDelete(debouncedRefresh);
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      invalidateDetectCache();
+      debouncedRefresh();
+    }),
+  );
 
   // --- Active editor watcher — feeds gql coverage to the Inspector panel
   //     AND schedules diagnostic refresh for the focused document.

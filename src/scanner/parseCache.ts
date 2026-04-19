@@ -104,6 +104,33 @@ export class ParseCache {
     return this.cache.size;
   }
 
+  /**
+   * Snapshot of {path → contentHash} for every cached entry. Handed to the
+   * native scanner so it can short-circuit parsing for files whose on-disk
+   * content still matches the cache — the JS side then reuses the cached
+   * `CachedFileData` instead of re-materializing it from Rust.
+   */
+  snapshotHashes(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of this.cache) out[k] = v.contentHash;
+    return out;
+  }
+
+  /**
+   * Subset of cached file paths whose previous parse extracted at least one
+   * class. Passed alongside snapshotHashes() so the native scanner can omit
+   * the text payload for cache hits whose parsed form is already empty —
+   * those files contribute nothing to rawMultiMap downstream, so there's
+   * no reason to pay the NAPI string transfer cost for them on every scan.
+   */
+  snapshotNonEmptyPaths(): string[] {
+    const out: string[] = [];
+    for (const [k, v] of this.cache) {
+      if (v.classes.length > 0) out.push(k);
+    }
+    return out;
+  }
+
   static computeHash(text: string): string {
     return crypto.createHash('sha256').update(text).digest('hex');
   }

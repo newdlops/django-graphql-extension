@@ -120,12 +120,13 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
   }
 
   private buildIndex(): void {
+    const __t = Date.now();
     this.fieldIndex = buildFieldIndex(this.classMap);
     const kindCounts = { query: 0, mutation: 0, type: 0, subscription: 0 };
     for (const [, cls] of this.classMap) {
       kindCounts[cls.kind] = (kindCounts[cls.kind] ?? 0) + 1;
     }
-    log(`[codeLens] Index built: ${this.fieldIndex.size} fields from ${this.classMap.size} classes (Q:${kindCounts.query} M:${kindCounts.mutation} T:${kindCounts.type} S:${kindCounts.subscription})`);
+    log(`[codeLens] Index built: ${this.fieldIndex.size} fields from ${this.classMap.size} classes (Q:${kindCounts.query} M:${kindCounts.mutation} T:${kindCounts.type} S:${kindCounts.subscription}) [${Date.now() - __t}ms]`);
   }
 
   /**

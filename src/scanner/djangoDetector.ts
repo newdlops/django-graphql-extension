@@ -1,13 +1,92 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { performance } from 'perf_hooks';
 import { ProjectInfo, Framework } from '../types';
-import { log } from '../logger';
+import { log, info } from '../logger';
+import { isNativeAvailable, detectProjectsNativeAsync } from './nativeScanner';
+
+const KNOWN_FRAMEWORKS: ReadonlySet<Framework> = new Set<Framework>([
+  'graphene',
+  'strawberry',
+  'ariadne',
+  'graphql-schema',
+]);
+
+function sanitizeFrameworks(fws: string[]): Framework[] {
+  return fws.filter((f): f is Framework => (KNOWN_FRAMEWORKS as ReadonlySet<string>).has(f));
+}
+
+// TTL-keyed cache of the most recent detectProjects result. A full workspace
+// walk costs ~200-400ms even with the native scanner; the file watcher fires
+// this function for every .py save, and the project set essentially never
+// changes between saves — a short-lived in-memory cache collapses that cost
+// to ~0ms for the common case without risking stale state for long.
+// Explicitly invalidated on workspace folder changes and on settings.py
+// writes (see invalidateDetectCache) so the legitimate cases where the
+// project set actually shifts still re-run detection promptly.
+const DETECT_CACHE_TTL_MS = 30_000;
+let detectCache: { at: number; key: string; value: ProjectInfo[] } | null = null;
+
+function workspaceKey(): string {
+  return (vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).sort().join('|')) ?? '';
+}
+
+export function invalidateDetectCache(): void {
+  detectCache = null;
+}
 
 export async function detectProjects(): Promise<ProjectInfo[]> {
+  const __tStart = performance.now();
+
+  const now = Date.now();
+  const key = workspaceKey();
+  if (detectCache && detectCache.key === key && now - detectCache.at < DETECT_CACHE_TTL_MS) {
+    const r = (n: number) => Math.round(n);
+    info(
+      `[timing] detectProjects [cached] total=${r(performance.now() - __tStart)}ms ` +
+      `projects=${detectCache.value.length} (age=${now - detectCache.at}ms)`,
+    );
+    return detectCache.value;
+  }
+
+  // ---------- native fast path ----------
+  // Rust walks each workspace folder once, regex-matches settings.py for
+  // framework markers, pre-computes manage.py directories for root
+  // resolution, and bundles .graphql/.gql detection. Dozens of
+  // vscode.workspace.findFiles + openTextDocument calls collapse into a
+  // single NAPI call.
+  if (isNativeAvailable()) {
+    const workspaceFolders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+    if (workspaceFolders.length > 0) {
+      const native = await detectProjectsNativeAsync(workspaceFolders);
+      if (native) {
+        const out: ProjectInfo[] = [];
+        for (const p of native.projects) {
+          const frameworks = sanitizeFrameworks(p.frameworks);
+          if (frameworks.length === 0) continue;
+          out.push({ rootDir: p.rootDir, frameworks });
+        }
+        log(`[detectProjects] Found ${out.length} project(s)`);
+        for (const p of out) {
+          log(`  rootDir=${p.rootDir}, frameworks=[${p.frameworks.join(', ')}]`);
+        }
+        const r = (n: number) => Math.round(n);
+        info(
+          `[timing] detectProjects [native] total=${r(performance.now() - __tStart)}ms ` +
+          `walk=${native.walkMs}ms (rust=${native.totalMs}ms, projects=${out.length})`,
+        );
+        detectCache = { at: Date.now(), key, value: out };
+        return out;
+      }
+    }
+  }
+
+  // ---------- JS fallback ----------
   const projects: ProjectInfo[] = [];
   const seenRoots = new Set<string>();
 
   // Strategy 1: Find Django settings.py with any GraphQL framework
+  const __tS1Start = performance.now();
   const settingsFiles = await vscode.workspace.findFiles(
     '**/settings.py',
     '{**/node_modules/**,**/.venv/**,**/venv/**,**/env/**,**/site-packages/**}'
@@ -47,7 +126,10 @@ export async function detectProjects(): Promise<ProjectInfo[]> {
     }
   }
 
+  const __tS1 = performance.now() - __tS1Start;
+
   // Strategy 2: Find Python files importing graphql frameworks (no settings.py required)
+  const __tS2Start = performance.now();
   const pyFiles = await vscode.workspace.findFiles(
     '**/*.py',
     '{**/node_modules/**,**/.venv/**,**/venv/**,**/env/**,**/site-packages/**,**/migrations/**,**/__pycache__/**}',
@@ -89,7 +171,10 @@ export async function detectProjects(): Promise<ProjectInfo[]> {
     }
   }
 
+  const __tS2 = performance.now() - __tS2Start;
+
   // Strategy 3: Find .graphql / .gql schema files
+  const __tS3Start = performance.now();
   const graphqlFiles = await vscode.workspace.findFiles(
     '**/*.{graphql,gql}',
     '{**/node_modules/**,**/.venv/**,**/venv/**,**/env/**}',
@@ -111,11 +196,22 @@ export async function detectProjects(): Promise<ProjectInfo[]> {
     }
   }
 
+  const __tS3 = performance.now() - __tS3Start;
+
   log(`[detectProjects] Found ${projects.length} project(s)`);
   for (const p of projects) {
     log(`  rootDir=${p.rootDir}, frameworks=[${p.frameworks.join(', ')}]`);
   }
 
+  const r = (n: number) => Math.round(n);
+  info(
+    `[timing] detectProjects [js] total=${r(performance.now() - __tStart)}ms ` +
+    `s1.settings=${r(__tS1)}ms(n=${settingsFiles.length}) ` +
+    `s2.py=${r(__tS2)}ms(n=${pyFiles.length}) ` +
+    `s3.graphql=${r(__tS3)}ms(n=${graphqlFiles.length})`,
+  );
+
+  detectCache = { at: Date.now(), key, value: projects };
   return projects;
 }
 

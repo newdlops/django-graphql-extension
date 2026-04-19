@@ -1,0 +1,16 @@
+{
+  "name": "django-gql-scanner-native",
+  "version": "0.0.3",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "django-gql-scanner",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}
