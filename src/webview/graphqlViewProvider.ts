@@ -9,6 +9,7 @@ import { FragmentDef } from '../codelens/gqlCodeLensProvider';
 interface TreeNode {
   label: string;
   desc?: string;
+  kind: 'schema' | 'category' | 'class' | 'field' | 'folder' | 'file' | 'operation';
   icon: string;
   file?: string;
   line?: number;
@@ -153,16 +154,16 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     for (const schema of this.schemas) {
       const categories: TreeNode[] = [];
       const fq = this.filterAndSortClasses(schema.queries);
-      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, icon: 'symbol-namespace', children: fq.map((c) => this.buildClassNode(c)) });
+      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, kind: 'category', icon: 'symbol-namespace', children: fq.map((c) => this.buildClassNode(c)) });
       const fm = this.filterAndSortClasses(schema.mutations);
-      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, icon: 'symbol-namespace', children: fm.map((c) => this.buildClassNode(c)) });
+      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, kind: 'category', icon: 'symbol-namespace', children: fm.map((c) => this.buildClassNode(c)) });
       const fs = this.filterAndSortClasses(schema.subscriptions);
-      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, icon: 'symbol-namespace', children: fs.map((c) => this.buildClassNode(c)) });
+      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, kind: 'category', icon: 'symbol-namespace', children: fs.map((c) => this.buildClassNode(c)) });
       const ft = this.filterAndSortClasses(schema.types);
-      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, icon: 'symbol-namespace', children: ft.map((c) => this.buildClassNode(c)) });
+      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, kind: 'category', icon: 'symbol-namespace', children: ft.map((c) => this.buildClassNode(c)) });
 
       if (this.filterPattern && categories.length === 0) continue;
-      roots.push({ label: schema.name, icon: 'symbol-package', file: schema.filePath, children: categories });
+      roots.push({ label: schema.name, kind: 'schema', icon: 'symbol-package', file: schema.filePath, children: categories });
     }
     return roots;
   }
@@ -184,7 +185,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       for (const segment of segments.slice(0, -1)) {
         let folder = cursor.find((node) => node.icon === 'folder' && node.label === segment);
         if (!folder) {
-          folder = { label: segment, icon: 'folder', children: [] };
+          folder = { label: segment, kind: 'folder', icon: 'folder', children: [] };
           cursor.push(folder);
         }
         if (!folder.children) folder.children = [];
@@ -195,6 +196,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       const operationNodes: TreeNode[] = usage.operations.map((operation) => ({
         label: operation.label,
         desc: operation.rootFields.length > 0 ? operation.rootFields.join(', ') : undefined,
+        kind: 'operation',
         icon: 'symbol-event',
         file: usage.filePath,
         line: operation.lineNumber,
@@ -203,6 +205,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       cursor.push({
         label: fileLabel,
         desc: usage.operationCount === 1 ? usage.operations[0].label : `${usage.operationCount} gql blocks`,
+        kind: 'file',
         icon: 'file-code',
         file: usage.filePath,
         line: usage.operations[0]?.lineNumber ?? 0,
@@ -252,6 +255,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       return {
         label: f.name,
         desc: f.fieldType + (f.resolvedType ? ` → ${f.resolvedType}` : ''),
+        kind: 'field',
         icon: 'symbol-field',
         file: f.filePath || cls.filePath,
         line: f.lineNumber,
@@ -261,6 +265,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     return {
       label: cls.name,
       desc: `${cls.fields.length}`,
+      kind: 'class',
       icon: 'symbol-class',
       file: cls.filePath,
       line: cls.lineNumber,
@@ -275,6 +280,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     return cls.fields.map((f) => ({
       label: f.name,
       desc: f.fieldType,
+      kind: 'field',
       icon: 'symbol-field',
       file: f.filePath || cls.filePath,
       line: f.lineNumber,
@@ -573,7 +579,7 @@ body {
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size);
   color: var(--vscode-foreground);
-  overflow-y: auto;
+  overflow: auto;
 }
 
 /* ── Search bar ── */
@@ -684,7 +690,10 @@ body {
   font-size: 0.9em;
   white-space: nowrap;
 }
-.section-body { padding: 4px 0 8px; }
+.section-body {
+  padding: 4px 0 8px;
+  overflow-x: auto;
+}
 .section-empty {
   padding: 10px 14px;
   color: var(--vscode-descriptionForeground);
@@ -692,7 +701,12 @@ body {
 }
 
 /* ── Tree ── */
-.tree { padding: 2px 0; }
+.tree {
+  display: inline-block;
+  min-width: 100%;
+  width: max-content;
+  padding: 2px 0;
+}
 .tree-empty {
   padding: 12px 20px;
   color: var(--vscode-descriptionForeground);
@@ -702,10 +716,12 @@ body {
   display: flex;
   align-items: center;
   height: 22px;
+  min-width: 100%;
   padding-right: 8px;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
+  width: max-content;
 }
 .node:hover { background: var(--vscode-list-hoverBackground); }
 .node .indent { flex-shrink: 0; }
@@ -732,10 +748,11 @@ body {
 }
 .node .label { flex-shrink: 0; }
 .node .desc {
+  flex-shrink: 0;
   margin-left: 6px;
   color: var(--vscode-descriptionForeground);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
 }
 .children { display: none; }
 .children.open { display: block; }
@@ -758,6 +775,7 @@ body {
     <button class="toggle" id="word" title="Match Whole Word (Alt+W)"><b>ab</b>|</button>
     <button class="toggle" id="regex" title="Use Regular Expression (Alt+R)">.*</button>
     <span class="sep"></span>
+    <button class="toggle" id="expand" title="Tree: Expand all (Alt+E)">▾▾</button>
     <button class="toggle" id="sort" title="Sort: click to cycle (none → A-Z → Z-A)">↕</button>
   </div>
 </div>
@@ -769,6 +787,7 @@ const input = document.getElementById('q');
 const caseBtn = document.getElementById('case');
 const wordBtn = document.getElementById('word');
 const regexBtn = document.getElementById('regex');
+const expandBtn = document.getElementById('expand');
 const sortBtn = document.getElementById('sort');
 const sectionsEl = document.getElementById('sections');
 
@@ -777,6 +796,9 @@ const sortCycle = ['none', 'asc', 'desc'];
 const sortLabels = { none: '↕', asc: 'A↓', desc: 'Z↓' };
 let sortIdx = 0;
 const sectionState = { backend: true, frontend: true };
+let expandMode = 'default';
+let lastSections = [];
+let lastHasFilter = false;
 
 function emitSearch() {
   vscode.postMessage({ type: 'search', query: input.value, ...searchState });
@@ -787,10 +809,32 @@ function toggleBtn(btn, key) {
   emitSearch();
 }
 
+function syncExpandButton() {
+  const expandAll = expandMode === 'expand-all';
+  expandBtn.textContent = expandAll ? '▸▸' : '▾▾';
+  expandBtn.title = expandAll ? 'Tree: Collapse all (Alt+E)' : 'Tree: Expand all (Alt+E)';
+  expandBtn.classList.toggle('active', expandAll);
+}
+
+function shouldStartOpen(depth, autoExpand) {
+  if (expandMode === 'expand-all') return true;
+  if (expandMode === 'collapse-all') return false;
+  return autoExpand || depth < 1;
+}
+
+function rerenderTree() {
+  renderSections(lastSections, lastHasFilter);
+}
+
 input.addEventListener('input', emitSearch);
 caseBtn.addEventListener('click', () => toggleBtn(caseBtn, 'caseSensitive'));
 wordBtn.addEventListener('click', () => toggleBtn(wordBtn, 'wholeWord'));
 regexBtn.addEventListener('click', () => toggleBtn(regexBtn, 'useRegex'));
+expandBtn.addEventListener('click', () => {
+  expandMode = expandMode === 'expand-all' ? 'collapse-all' : 'expand-all';
+  syncExpandButton();
+  rerenderTree();
+});
 
 sortBtn.addEventListener('click', () => {
   sortIdx = (sortIdx + 1) % sortCycle.length;
@@ -805,8 +849,10 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey && e.key === 'c') { toggleBtn(caseBtn, 'caseSensitive'); e.preventDefault(); }
   if (e.altKey && e.key === 'w') { toggleBtn(wordBtn, 'wholeWord'); e.preventDefault(); }
   if (e.altKey && e.key === 'r') { toggleBtn(regexBtn, 'useRegex'); e.preventDefault(); }
+  if (e.altKey && e.key === 'e') { expandBtn.click(); e.preventDefault(); }
   if (e.altKey && e.key === 's') { sortBtn.click(); e.preventDefault(); }
 });
+syncExpandButton();
 
 // ── Section + tree rendering ──
 function escapeHtml(s) {
@@ -852,7 +898,7 @@ function buildSection(section, hasFilter) {
     const tree = document.createElement('div');
     tree.className = 'tree';
     for (const node of section.children) {
-      tree.appendChild(buildNode(node, 0, hasFilter));
+      tree.appendChild(buildNode(node, 0, hasFilter, section.id));
     }
     body.appendChild(tree);
   }
@@ -865,7 +911,7 @@ function buildSection(section, hasFilter) {
   return details;
 }
 
-function buildNode(node, depth, autoExpand) {
+function buildNode(node, depth, autoExpand, sectionId) {
   const wrapper = document.createElement('div');
   const hasChildren = node.children && node.children.length > 0;
 
@@ -907,32 +953,45 @@ function buildNode(node, depth, autoExpand) {
     childrenEl = document.createElement('div');
     childrenEl.className = 'children';
 
-    // Auto-expand when filtering, or first 2 levels
-    if (autoExpand || depth < 1) {
+    if (shouldStartOpen(depth, autoExpand)) {
       childrenEl.classList.add('open');
       twistie.textContent = '▾';
       for (const child of node.children) {
-        childrenEl.appendChild(buildNode(child, depth + 1, autoExpand));
+        childrenEl.appendChild(buildNode(child, depth + 1, autoExpand, sectionId));
       }
     }
 
     wrapper.appendChild(childrenEl);
   }
 
-  // Click: toggle expand. Double-click: open source + preview schema.
-  row.addEventListener('click', (e) => {
-    if (hasChildren) {
-      const isOpen = childrenEl.classList.toggle('open');
-      twistie.textContent = isOpen ? '▾' : '▸';
-      if (isOpen && childrenEl.children.length === 0) {
-        for (const child of node.children) {
-          childrenEl.appendChild(buildNode(child, depth + 1, false));
-        }
+  function toggleChildren() {
+    if (!hasChildren || !childrenEl) return;
+    const isOpen = childrenEl.classList.toggle('open');
+    twistie.textContent = isOpen ? '▾' : '▸';
+    if (isOpen && childrenEl.children.length === 0) {
+      for (const child of node.children) {
+        childrenEl.appendChild(buildNode(child, depth + 1, false, sectionId));
       }
     }
-    // Show GraphQL preview for class nodes on single click
+  }
+
+  if (hasChildren) {
+    twistie.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleChildren();
+    });
+  }
+
+  row.addEventListener('click', () => {
+    if (sectionId === 'frontend' && node.file && (node.kind === 'file' || node.kind === 'operation')) {
+      vscode.postMessage({ type: 'open', file: node.file, line: node.line });
+      return;
+    }
     if (node.className) {
       vscode.postMessage({ type: 'preview', className: node.className });
+    }
+    if (hasChildren && (sectionId !== 'frontend' || node.kind === 'folder')) {
+      toggleChildren();
     }
   });
   row.addEventListener('dblclick', (e) => {
@@ -949,6 +1008,8 @@ function buildNode(node, depth, autoExpand) {
 window.addEventListener('message', (e) => {
   const msg = e.data;
   if (msg.type === 'tree') {
+    lastSections = msg.sections;
+    lastHasFilter = msg.hasFilter;
     renderSections(msg.sections, msg.hasFilter);
   }
 });

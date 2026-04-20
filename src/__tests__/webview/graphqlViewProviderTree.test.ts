@@ -66,13 +66,16 @@ describe('GraphqlViewProvider tree sections', () => {
     const frontendRoot = findNodeByLabel(sections[1].children, 'src');
     expect(frontendRoot).toBeDefined();
     expect(frontendRoot.desc).toBe('2 files');
+    expect(frontendRoot.kind).toBe('folder');
 
     const dashboardFile = findNodeByLabel(sections[1].children, 'Dashboard.tsx');
     expect(dashboardFile.desc).toBe('query Dashboard');
+    expect(dashboardFile.kind).toBe('file');
     expect(dashboardFile.file).toBe('/ws/src/pages/Dashboard.tsx');
     expect(dashboardFile.children[0]).toMatchObject({
       label: 'query Dashboard',
       desc: 'viewer, team',
+      kind: 'operation',
       line: 10,
     });
   });
@@ -97,5 +100,14 @@ describe('GraphqlViewProvider tree sections', () => {
     expect(findNodeByLabel(frontend.children, 'Dashboard.tsx')).toBeUndefined();
     expect(findNodeByLabel(frontend.children, 'src')).toBeDefined();
     expect(findNodeByLabel(frontend.children, 'pages')).toBeDefined();
+  });
+
+  it('renders expand-all control and horizontal scrolling in the webview shell', () => {
+    const provider = new GraphqlViewProvider();
+    const html = (provider as any).getHtml();
+
+    expect(html).toContain('id="expand"');
+    expect(html).toContain('overflow-x: auto;');
+    expect(html).toContain("node.kind === 'file' || node.kind === 'operation'");
   });
 });
