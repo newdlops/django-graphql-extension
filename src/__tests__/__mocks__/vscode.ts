@@ -1,3 +1,5 @@
+import * as path from 'path';
+
 // Minimal vscode API mock for vitest unit tests.
 // Only implements the surface actually touched during parser/provider unit tests.
 
@@ -154,6 +156,23 @@ export function __clearMockFiles(): void {
   __mockFiles.clear();
 }
 
+function __mockWorkspaceRoot(): string | undefined {
+  const files = [...__mockFiles.keys()];
+  if (files.length === 0) return undefined;
+  const dirParts = files.map((filePath) => path.dirname(filePath).split(/[\\/]/).filter((part, idx) => !(idx === 0 && part === '')));
+  const shared: string[] = [];
+  const limit = Math.min(...dirParts.map((parts) => parts.length));
+  for (let i = 0; i < limit; i++) {
+    const segment = dirParts[0][i];
+    if (dirParts.every((parts) => parts[i] === segment)) shared.push(segment);
+    else break;
+  }
+  if (shared.length === 0) return path.sep;
+  const commonDir = path.join(path.sep, ...shared);
+  if (commonDir === path.sep || shared.length === 1) return commonDir;
+  return path.dirname(commonDir);
+}
+
 export const workspace = {
   findFiles: async (_include: unknown, _exclude?: unknown) => {
     return [...__mockFiles.keys()].map((p) => Uri.file(p));
@@ -163,6 +182,10 @@ export const workspace = {
       const content = __mockFiles.get(uri.fsPath) ?? '';
       return new Uint8Array(Buffer.from(content, 'utf-8'));
     },
+  },
+  getWorkspaceFolder: (_uri: Uri) => {
+    const root = __mockWorkspaceRoot();
+    return root ? { uri: Uri.file(root), name: path.basename(root), index: 0 } : undefined;
   },
   createFileSystemWatcher: () => ({
     onDidChange: () => ({ dispose: () => {} }),

@@ -13,6 +13,7 @@ import { ClassInfo } from './types';
 import { log, info } from './logger';
 import { prepareDocumentGql } from './analysis/gqlCoverage';
 import { buildQueryStructure, buildLazySubtree } from './analysis/queryStructure';
+import { scanFrontendGqlUsages } from './analysis/frontendGqlUsage';
 import { renderQueryStructureHtml, renderSubtreeNodesHtml } from './preview/queryStructureWebview';
 import { hydrateGqlField, GqlFieldLite } from './codelens/gqlCodeLensProvider';
 import { LiveQueryInspector } from './preview/liveQueryInspector';
@@ -140,12 +141,17 @@ export function activate(context: vscode.ExtensionContext) {
     const allSchemas = await scanProjects(projects, parseCache);
     const __tScan = performance.now() - __tScanStart;
 
+    const __tFrontendStart = performance.now();
+    const frontendUsages = await scanFrontendGqlUsages();
+    const __tFrontend = performance.now() - __tFrontendStart;
+
     log(`[refresh] === SCHEMAS (${allSchemas.length}) ===`);
     for (const schema of allSchemas) {
       log(`[refresh]   ${schema.name}: Q=${schema.queries.length} M=${schema.mutations.length} T=${schema.types.length}`);
     }
 
-    viewProvider.updateSchemas(allSchemas);
+    log(`[refresh] Frontend gql files: ${frontendUsages.length}`);
+    viewProvider.updateSchemas(allSchemas, frontendUsages);
 
     // Build classMap for CodeLens
     const __tClassMapStart = performance.now();
@@ -165,7 +171,7 @@ export function activate(context: vscode.ExtensionContext) {
     const r = (n: number) => Math.round(n);
     info(
       `[timing] doRefresh total=${r(performance.now() - __tTotalStart)}ms ` +
-      `detect=${r(__tDetect)}ms scan=${r(__tScan)}ms ` +
+      `detect=${r(__tDetect)}ms scan=${r(__tScan)}ms frontend=${r(__tFrontend)}ms ` +
       `classMap=${r(__tClassMap)}ms(n=${classMap.size}) ` +
       `(codeLens index build runs async after 200ms debounce)`,
     );
@@ -231,6 +237,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Watch for Python and GraphQL file changes
   const pyWatcher = vscode.workspace.createFileSystemWatcher('**/*.py');
   const gqlWatcher = vscode.workspace.createFileSystemWatcher('**/*.{graphql,gql}');
+  const frontendWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs,vue,svelte,astro}');
 
   let refreshTimeout: NodeJS.Timeout | undefined;
   const debouncedRefresh = () => {
@@ -304,6 +311,9 @@ export function activate(context: vscode.ExtensionContext) {
   gqlWatcher.onDidChange(debouncedRefresh);
   gqlWatcher.onDidCreate(debouncedRefresh);
   gqlWatcher.onDidDelete(debouncedRefresh);
+  frontendWatcher.onDidChange(debouncedRefresh);
+  frontendWatcher.onDidCreate(debouncedRefresh);
+  frontendWatcher.onDidDelete(debouncedRefresh);
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -346,7 +356,17 @@ export function activate(context: vscode.ExtensionContext) {
   );
   pushCoverage();
 
-  context.subscriptions.push(refreshCommand, clearCacheCommand, inspectTypeCommand, openLiveInspectorCommand, openClassCommand, showMissingFieldsCommand, pyWatcher, gqlWatcher);
+  context.subscriptions.push(
+    refreshCommand,
+    clearCacheCommand,
+    inspectTypeCommand,
+    openLiveInspectorCommand,
+    openClassCommand,
+    showMissingFieldsCommand,
+    pyWatcher,
+    gqlWatcher,
+    frontendWatcher,
+  );
 
   // Initial scan
   refresh();

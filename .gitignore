@@ -4,3 +4,5 @@ out-e2e/
 node_modules/
 *.vsix
 log.txt
+.lh
+.zoek-rs

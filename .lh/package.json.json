@@ -3,11 +3,15 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 0,
+            "activePatchIndex": 1,
             "patches": [
                 {
                     "date": 1776598965430,
                     "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1776694610715,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-graphql-explorer\",\n   \"displayName\": \"Django GraphQL Explorer\",\n   \"description\": \"Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace\",\n-  \"version\": \"0.0.3\",\n+  \"version\": \"0.0.4\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
                 }
             ],
             "date": 1776598965430,

@@ -3,6 +3,7 @@ import { SchemaInfo, ClassInfo } from '../types';
 import { buildInspectorData } from '../preview/inspector';
 import { buildReverseIndex, TypeReferences } from '../scanner/reverseIndex';
 import { computeQueryCoverage, CoverageMap } from '../analysis/gqlCoverage';
+import { FrontendGqlFileUsage } from '../analysis/frontendGqlUsage';
 import { FragmentDef } from '../codelens/gqlCodeLensProvider';
 
 interface TreeNode {
@@ -15,6 +16,15 @@ interface TreeNode {
   children?: TreeNode[];
 }
 
+interface TreeSection {
+  id: 'backend' | 'frontend';
+  label: string;
+  desc: string;
+  emptyMessage: string;
+  openByDefault: boolean;
+  children: TreeNode[];
+}
+
 export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'djangoGraphqlExplorer.view';
 
@@ -23,6 +33,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   private classMap = new Map<string, ClassInfo>();
   private reverseIndex: Map<string, TypeReferences> = new Map();
   private coverage: CoverageMap = new Map();
+  private frontendUsages: FrontendGqlFileUsage[] = [];
   private filterPattern: RegExp | null = null;
   private sortMode: 'none' | 'asc' | 'desc' = 'none';
 
@@ -92,8 +103,9 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  updateSchemas(schemas: SchemaInfo[]): void {
+  updateSchemas(schemas: SchemaInfo[], frontendUsages: FrontendGqlFileUsage[] = this.frontendUsages): void {
     this.schemas = schemas;
+    this.frontendUsages = frontendUsages;
     this.classMap.clear();
     for (const schema of schemas) {
       for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
@@ -136,7 +148,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     return result;
   }
 
-  private buildTree(): TreeNode[] {
+  private buildBackendTree(): TreeNode[] {
     const roots: TreeNode[] = [];
     for (const schema of this.schemas) {
       const categories: TreeNode[] = [];
@@ -153,6 +165,84 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       roots.push({ label: schema.name, icon: 'symbol-package', file: schema.filePath, children: categories });
     }
     return roots;
+  }
+
+  private buildFrontendTree(): TreeNode[] {
+    const usages = [...this.frontendUsages];
+    if (this.sortMode === 'asc') {
+      usages.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    } else if (this.sortMode === 'desc') {
+      usages.sort((a, b) => b.relativePath.localeCompare(a.relativePath));
+    }
+
+    const roots: TreeNode[] = [];
+    for (const usage of usages) {
+      const segments = usage.relativePath.split('/').filter(Boolean);
+      if (segments.length === 0) continue;
+
+      let cursor = roots;
+      for (const segment of segments.slice(0, -1)) {
+        let folder = cursor.find((node) => node.icon === 'folder' && node.label === segment);
+        if (!folder) {
+          folder = { label: segment, icon: 'folder', children: [] };
+          cursor.push(folder);
+        }
+        if (!folder.children) folder.children = [];
+        cursor = folder.children;
+      }
+
+      const fileLabel = segments[segments.length - 1];
+      const operationNodes: TreeNode[] = usage.operations.map((operation) => ({
+        label: operation.label,
+        desc: operation.rootFields.length > 0 ? operation.rootFields.join(', ') : undefined,
+        icon: 'symbol-event',
+        file: usage.filePath,
+        line: operation.lineNumber,
+      }));
+
+      cursor.push({
+        label: fileLabel,
+        desc: usage.operationCount === 1 ? usage.operations[0].label : `${usage.operationCount} gql blocks`,
+        icon: 'file-code',
+        file: usage.filePath,
+        line: usage.operations[0]?.lineNumber ?? 0,
+        children: operationNodes.length > 0 ? operationNodes : undefined,
+      });
+    }
+
+    const visible = this.filterPattern ? this.filterTreeNodes(roots) : roots;
+    this.decorateFrontendFolderCounts(visible);
+    return visible;
+  }
+
+  private buildSections(): TreeSection[] {
+    const backendTree = this.buildBackendTree();
+    const frontendTree = this.buildFrontendTree();
+    const backendCount = this.countNodesByIcon(backendTree, 'symbol-class');
+    const frontendCount = this.countNodesByIcon(frontendTree, 'file-code');
+
+    return [
+      {
+        id: 'backend',
+        label: 'Backend',
+        desc: `${backendCount} ${backendCount === 1 ? 'class' : 'classes'}`,
+        emptyMessage: this.filterPattern
+          ? 'No backend schema items matched the current filter.'
+          : 'No backend schemas loaded yet.',
+        openByDefault: true,
+        children: backendTree,
+      },
+      {
+        id: 'frontend',
+        label: 'Frontend',
+        desc: `${frontendCount} ${frontendCount === 1 ? 'file' : 'files'}`,
+        emptyMessage: this.filterPattern
+          ? 'No frontend gql files matched the current filter.'
+          : 'No frontend gql templates found.',
+        openByDefault: true,
+        children: frontendTree,
+      },
+    ];
   }
 
   private buildClassNode(cls: ClassInfo): TreeNode {
@@ -189,6 +279,51 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       file: f.filePath || cls.filePath,
       line: f.lineNumber,
     }));
+  }
+
+  private filterTreeNodes(nodes: TreeNode[]): TreeNode[] {
+    if (!this.filterPattern) return nodes;
+    const out: TreeNode[] = [];
+    for (const node of nodes) {
+      const ownMatch = this.matchesFilter(node.label) || this.matchesFilter(node.desc);
+      if (ownMatch) {
+        out.push({ ...node });
+        continue;
+      }
+
+      const children = node.children ? this.filterTreeNodes(node.children) : undefined;
+      if (children && children.length > 0) {
+        out.push({ ...node, children });
+      }
+    }
+    return out;
+  }
+
+  private matchesFilter(value?: string): boolean {
+    return !!(value && this.filterPattern && this.filterPattern.test(value));
+  }
+
+  private decorateFrontendFolderCounts(nodes: TreeNode[]): number {
+    let fileCount = 0;
+    for (const node of nodes) {
+      if (node.icon === 'folder') {
+        const childCount = this.decorateFrontendFolderCounts(node.children ?? []);
+        node.desc = `${childCount} ${childCount === 1 ? 'file' : 'files'}`;
+        fileCount += childCount;
+      } else if (node.icon === 'file-code') {
+        fileCount++;
+      }
+    }
+    return fileCount;
+  }
+
+  private countNodesByIcon(nodes: TreeNode[], icon: string): number {
+    let total = 0;
+    for (const node of nodes) {
+      if (node.icon === icon) total++;
+      if (node.children) total += this.countNodesByIcon(node.children, icon);
+    }
+    return total;
   }
 
   private previewPanel?: vscode.WebviewPanel;
@@ -424,8 +559,8 @@ window.addEventListener('message', (e) => {
 
   private sendTree(): void {
     if (!this.view) return;
-    const tree = this.buildTree();
-    this.view.webview.postMessage({ type: 'tree', data: tree, hasFilter: !!this.filterPattern, sortMode: this.sortMode });
+    const sections = this.buildSections();
+    this.view.webview.postMessage({ type: 'tree', sections, hasFilter: !!this.filterPattern, sortMode: this.sortMode });
   }
 
   private getHtml(): string {
@@ -501,6 +636,61 @@ body {
   color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
 }
 
+/* ── Sections / accordion ── */
+.sections { padding: 6px 0 12px; }
+.accordion {
+  margin: 8px;
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--vscode-sideBar-background);
+}
+.accordion[open] {
+  background: var(--vscode-editor-background);
+}
+.accordion summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  padding: 8px 10px;
+  background: var(--vscode-sideBarSectionHeader-background, rgba(128,128,128,0.06));
+}
+.accordion summary::-webkit-details-marker { display: none; }
+.accordion summary:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+.section-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.section-chevron {
+  width: 10px;
+  color: var(--vscode-descriptionForeground);
+  transition: transform 120ms ease;
+  transform-origin: 50% 50%;
+}
+.accordion[open] .section-chevron {
+  transform: rotate(90deg);
+}
+.section-label {
+  font-weight: 600;
+}
+.section-desc {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.section-body { padding: 4px 0 8px; }
+.section-empty {
+  padding: 10px 14px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
 /* ── Tree ── */
 .tree { padding: 2px 0; }
 .tree-empty {
@@ -555,6 +745,9 @@ body {
 .icon-symbol-namespace::before { content: '{}'; font-size: 10px; font-weight: bold; color: var(--vscode-symbolIcon-namespaceForeground, #9cdcfe); }
 .icon-symbol-class::before { content: 'C'; font-size: 11px; font-weight: bold; color: var(--vscode-symbolIcon-classForeground, #ee9d28); }
 .icon-symbol-field::before { content: 'F'; font-size: 11px; font-weight: bold; color: var(--vscode-symbolIcon-fieldForeground, #75beff); }
+.icon-folder::before { content: 'D'; font-size: 11px; font-weight: 700; color: var(--vscode-symbolIcon-folderForeground, #dcb67a); }
+.icon-file-code::before { content: 'JS'; font-size: 8px; font-weight: 700; color: var(--vscode-symbolIcon-fileForeground, #cccccc); }
+.icon-symbol-event::before { content: 'G'; font-size: 11px; font-weight: 700; color: var(--vscode-symbolIcon-eventForeground, #4ec9b0); }
 </style>
 </head>
 <body>
@@ -568,7 +761,7 @@ body {
     <button class="toggle" id="sort" title="Sort: click to cycle (none → A-Z → Z-A)">↕</button>
   </div>
 </div>
-<div id="tree" class="tree"></div>
+<div id="sections" class="sections"></div>
 
 <script>
 const vscode = acquireVsCodeApi();
@@ -577,12 +770,13 @@ const caseBtn = document.getElementById('case');
 const wordBtn = document.getElementById('word');
 const regexBtn = document.getElementById('regex');
 const sortBtn = document.getElementById('sort');
-const treeEl = document.getElementById('tree');
+const sectionsEl = document.getElementById('sections');
 
 let searchState = { caseSensitive: false, wholeWord: false, useRegex: false };
 const sortCycle = ['none', 'asc', 'desc'];
 const sortLabels = { none: '↕', asc: 'A↓', desc: 'Z↓' };
 let sortIdx = 0;
+const sectionState = { backend: true, frontend: true };
 
 function emitSearch() {
   vscode.postMessage({ type: 'search', query: input.value, ...searchState });
@@ -614,18 +808,61 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey && e.key === 's') { sortBtn.click(); e.preventDefault(); }
 });
 
-// ── Tree rendering ──
-function renderTree(nodes, hasFilter) {
-  if (!nodes || nodes.length === 0) {
-    treeEl.innerHTML = '<div class="tree-empty">No items found</div>';
+// ── Section + tree rendering ──
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function renderSections(sections, hasFilter) {
+  sectionsEl.innerHTML = '';
+  if (!sections || sections.length === 0) {
+    sectionsEl.innerHTML = '<div class="tree-empty">No items found</div>';
     return;
   }
-  treeEl.innerHTML = '';
   const frag = document.createDocumentFragment();
-  for (const node of nodes) {
-    frag.appendChild(buildNode(node, 0, hasFilter));
+  for (const section of sections) {
+    frag.appendChild(buildSection(section, hasFilter));
   }
-  treeEl.appendChild(frag);
+  sectionsEl.appendChild(frag);
+}
+
+function buildSection(section, hasFilter) {
+  const details = document.createElement('details');
+  details.className = 'accordion';
+  const remembered = Object.prototype.hasOwnProperty.call(sectionState, section.id)
+    ? sectionState[section.id]
+    : !!section.openByDefault;
+  details.open = hasFilter ? true : remembered;
+  details.dataset.sectionId = section.id;
+
+  const summary = document.createElement('summary');
+  summary.innerHTML =
+    '<div class="section-left">' +
+    '<span class="section-chevron">▸</span>' +
+    '<span class="section-label">' + escapeHtml(section.label) + '</span>' +
+    '</div>' +
+    '<span class="section-desc">' + escapeHtml(section.desc || '') + '</span>';
+  details.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'section-body';
+  if (!section.children || section.children.length === 0) {
+    body.innerHTML = '<div class="section-empty">' + escapeHtml(section.emptyMessage || 'No items found') + '</div>';
+  } else {
+    const tree = document.createElement('div');
+    tree.className = 'tree';
+    for (const node of section.children) {
+      tree.appendChild(buildNode(node, 0, hasFilter));
+    }
+    body.appendChild(tree);
+  }
+  details.appendChild(body);
+
+  details.addEventListener('toggle', () => {
+    sectionState[section.id] = details.open;
+  });
+
+  return details;
 }
 
 function buildNode(node, depth, autoExpand) {
@@ -712,7 +949,7 @@ function buildNode(node, depth, autoExpand) {
 window.addEventListener('message', (e) => {
   const msg = e.data;
   if (msg.type === 'tree') {
-    renderTree(msg.data, msg.hasFilter);
+    renderSections(msg.sections, msg.hasFilter);
   }
 });
 </script>

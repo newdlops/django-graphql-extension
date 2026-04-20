@@ -2,7 +2,7 @@
   "name": "django-graphql-explorer",
   "displayName": "Django GraphQL Explorer",
   "description": "Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
