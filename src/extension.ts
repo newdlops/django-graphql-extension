@@ -83,7 +83,7 @@ export function activate(context: vscode.ExtensionContext) {
       );
       panel.webview.html = renderQueryStructureHtml(
         structure,
-        `Expand all fields & args on ${typeName}. Red rows are available but not queried — add them to your gql to include the data.`,
+        `Expand all fields & args on ${typeName}. Red rows are available on the backend but missing from your gql. Blue rows exist only in your gql and could not be matched to the backend schema.`,
       );
 
       // Lazy expansion: the webview asks for a subtree whenever the user clicks
@@ -226,11 +226,12 @@ export function activate(context: vscode.ExtensionContext) {
           label: c.name,
           description: `[${c.kind}] ${c.fieldCount} field${c.fieldCount === 1 ? '' : 's'}`,
           detail: c.filePath,
+          classId: c.classId,
           className: c.name,
         })),
         { title: 'Inspect GraphQL type', matchOnDescription: true, matchOnDetail: true, placeHolder: 'Type a class name…' },
       );
-      if (picked) viewProvider.showInspectorForClass(picked.className);
+      if (picked) viewProvider.showInspectorForClass(picked.classId ?? picked.className);
     },
   );
 

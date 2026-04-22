@@ -93,7 +93,7 @@ describe('GqlDecorationManager integration (phase w)', () => {
       if (!opts?.backgroundColor) continue;
       if (opts.backgroundColor.includes('76, 175, 80')) types.exact = t;
       if (opts.backgroundColor.includes('255, 179, 0')) types.inferred = t;
-      if (opts.backgroundColor.includes('244, 67, 54')) types.unresolved = t;
+      if (opts.backgroundColor.includes('55, 148, 255')) types.unresolved = t;
     }
     expect(types.exact.lastRanges.length).toBe(2); // user, id
     expect(types.unresolved.lastRanges.length).toBe(1); // bogus

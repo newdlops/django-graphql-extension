@@ -75,6 +75,66 @@ describe('GraphqlViewProvider inspector panel (phase p)', () => {
     expect(panel.title).toBe('CompanyType');
   });
 
+  it('keeps inspector navigation inside the same schema when duplicate class names exist', () => {
+    const provider = new GraphqlViewProvider();
+    const userTypeA = {
+      name: 'UserType',
+      baseClasses: [],
+      framework: 'graphene' as const,
+      filePath: '/proj/a/types.py',
+      lineNumber: 10,
+      kind: 'type' as const,
+      fields: [f('id', 'ID', { filePath: '/proj/a/types.py', lineNumber: 11 })],
+    };
+    const queryA = {
+      name: 'Query',
+      baseClasses: [],
+      framework: 'graphene' as const,
+      filePath: '/proj/a/query.py',
+      lineNumber: 1,
+      kind: 'query' as const,
+      fields: [f('user', 'Field', { resolvedType: 'UserType', filePath: '/proj/a/query.py', lineNumber: 2 })],
+    };
+    const userTypeB = {
+      name: 'UserType',
+      baseClasses: [],
+      framework: 'graphene' as const,
+      filePath: '/proj/b/types.py',
+      lineNumber: 20,
+      kind: 'type' as const,
+      fields: [f('name', 'String', { filePath: '/proj/b/types.py', lineNumber: 21 })],
+    };
+
+    provider.updateSchemas([
+      mkSchema({ queries: [queryA], types: [userTypeA] }),
+      {
+        name: 'other',
+        filePath: '/proj/b/schema.py',
+        queries: [],
+        mutations: [],
+        subscriptions: [],
+        types: [userTypeB],
+      },
+    ]);
+
+    const schemaAUser = provider.listInspectableClasses().find((item) => item.filePath === '/proj/a/types.py');
+    expect(schemaAUser).toBeDefined();
+
+    provider.showInspectorForClass(schemaAUser!.classId);
+    const panel = __getLastPanel() as FakeWebviewPanel;
+    const msgs = panel.webview.postedMessages as Array<{ type: string; data: any }>;
+    expect(msgs[0].data.filePath).toBe('/proj/a/types.py');
+    expect(msgs[0].data.fields.map((row: any) => row.name)).toEqual(['id']);
+
+    const queryRef = msgs[0].data.usedAsFieldType[0];
+    expect(queryRef.fromClassId).toBeDefined();
+    panel.simulateMessage({ type: 'navigate', classId: queryRef.fromClassId });
+
+    const latest = panel.webview.postedMessages[panel.webview.postedMessages.length - 1] as { data: any };
+    expect(latest.data.filePath).toBe('/proj/a/query.py');
+    expect(latest.data.fields.map((row: any) => row.name)).toEqual(['user']);
+  });
+
   it('handles open-file messages without throwing', () => {
     const provider = new GraphqlViewProvider();
     const userType = cls('UserType', [f('id')]);

@@ -20,6 +20,9 @@ interface RenderState {
  */
 export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: string): string {
   const rootArgsHtml = renderHeaderArgs(structure.rootField.args);
+  const frontendOnlyPill = structure.frontendOnlyCount > 0
+    ? `<span class="pill pill-frontend-only">+ ${structure.frontendOnlyCount} frontend-only</span>`
+    : '';
   const header = `
     <div class="header">
       <div class="title">${escape(structure.rootField.displayName)}${rootArgsHtml}
@@ -29,6 +32,7 @@ export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: s
       <div class="summary">
         <span class="pill pill-queried">✓ ${structure.queriedCount} queried</span>
         <span class="pill pill-missing">✗ ${structure.totalCount - structure.queriedCount} missing</span>
+        ${frontendOnlyPill}
         <span class="muted">of ${structure.totalCount} total fields</span>
       </div>
     </div>`;
@@ -81,6 +85,7 @@ body {
 }
 .pill-queried { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
 .pill-missing { background: rgba(244, 67, 54, 0.18); color: #f44747; }
+.pill-frontend-only { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
 .muted { color: var(--vscode-descriptionForeground); }
 
 .tree { padding: 8px 12px 24px; }
@@ -93,7 +98,9 @@ body {
 }
 .row.queried { border-left-color: #4caf50; background: rgba(76, 175, 80, 0.06); }
 .row.missing { border-left-color: #f44747; background: rgba(244, 67, 54, 0.07); }
+.row.frontend-only { border-left-color: #3794ff; background: rgba(55, 148, 255, 0.08); }
 .row.unknown-type { opacity: 0.7; font-style: italic; }
+.row.frontend-only.unknown-type { opacity: 1; font-style: normal; }
 .row:hover { background: var(--vscode-list-hoverBackground); }
 
 .marker {
@@ -103,13 +110,16 @@ body {
 }
 .marker.queried { color: #4caf50; }
 .marker.missing { color: #f44747; }
+.marker.frontend-only { color: #3794ff; }
 .marker.unknown { color: var(--vscode-descriptionForeground); }
 
 .field-name { font-weight: 500; }
 .field-name.missing { color: #f44747; }
+.field-name.frontend-only { color: #3794ff; }
 .snake { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
 .type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .type.clickable { cursor: pointer; text-decoration: underline dashed; }
+.type.frontend-only { color: #3794ff; }
 
 .args {
   display: inline-block; margin-left: 6px; padding: 0 4px;
@@ -117,7 +127,9 @@ body {
 }
 .arg { white-space: nowrap; }
 .arg.required { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
+.arg.frontend-only { color: #3794ff; }
 .arg-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
+.arg-type.frontend-only { color: #3794ff; }
 
 .children { margin-left: 22px; border-left: 1px dashed rgba(128,128,128,0.25); padding-left: 6px; }
 .hidden { display: none; }
@@ -140,7 +152,7 @@ body {
 </style></head><body>
 ${header}
 <div class="tree">${body}</div>
-<div class="legend">Green = queried · Red = missing (add this to your gql to include it) · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
+<div class="legend">Green = queried · Red = available on the backend but missing from your gql · Blue = present only in your gql and not found in the backend schema · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
 <script>
 (function () {
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
@@ -228,13 +240,16 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
   const hasChildren = node.children.length > 0;
   const isLazy = !hasChildren && node.hasMoreChildren;
   const rowClasses = ['row'];
-  if (node.queried) rowClasses.push('queried');
+  if (node.frontendOnly) rowClasses.push('frontend-only');
+  else if (node.queried) rowClasses.push('queried');
   else rowClasses.push('missing');
   if (node.resolvedType && !node.resolvedTypeKnown) rowClasses.push('unknown-type');
 
-  const marker = node.queried
-    ? '<span class="marker queried">✓</span>'
-    : '<span class="marker missing">✗</span>';
+  const marker = node.frontendOnly
+    ? '<span class="marker frontend-only">+</span>'
+    : node.queried
+      ? '<span class="marker queried">✓</span>'
+      : '<span class="marker missing">✗</span>';
   let twistie: string;
   if (hasChildren) {
     twistie = '<span class="twistie">▾</span>';
@@ -248,7 +263,9 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
     ? ` <span class="snake">(${escape(node.name)})</span>`
     : '';
 
-  const typeClass = node.resolvedTypeKnown ? 'type clickable' : 'type';
+  const typeClass = node.frontendOnly
+    ? 'type frontend-only'
+    : node.resolvedTypeKnown ? 'type clickable' : 'type';
   const typeLabel = escape(node.typeLabel);
 
   const args = renderArgs(node.args);
@@ -271,7 +288,9 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
     if (node.resolvedType) state.ancestry.pop();
   }
 
-  const fieldClass = node.queried ? 'field-name' : 'field-name missing';
+  const fieldClass = node.frontendOnly
+    ? 'field-name frontend-only'
+    : node.queried ? 'field-name' : 'field-name missing';
 
   return `<div class="${rowClasses.join(' ')}" data-node-id="${nodeId}"${lazyAttrs}>
     ${twistie}${marker}<span class="${fieldClass}">${escape(node.displayName)}</span>${displaySnake}:
@@ -292,9 +311,10 @@ export function renderSubtreeNodesHtml(nodes: QueryStructureNode[], ancestry: st
 function renderArgs(args: QueryStructureArg[]): string {
   if (args.length === 0) return '';
   const parts = args.map((a) => {
-    const cls = a.required ? 'arg required' : 'arg';
+    const cls = a.frontendOnly ? 'arg frontend-only' : a.required ? 'arg required' : 'arg';
     const req = a.required ? '!' : '';
-    return `<span class="${cls}">${escape(a.displayName)}: <span class="arg-type">${escape(a.type)}${req}</span></span>`;
+    const typeCls = a.frontendOnly ? 'arg-type frontend-only' : 'arg-type';
+    return `<span class="${cls}">${escape(a.displayName)}: <span class="${typeCls}">${escape(a.type)}${req}</span></span>`;
   });
   return `<span class="args">(${parts.join(', ')})</span>`;
 }
@@ -308,9 +328,10 @@ function renderArgs(args: QueryStructureArg[]): string {
 function renderHeaderArgs(args: QueryStructureArg[]): string {
   if (args.length === 0) return '';
   const parts = args.map((a) => {
-    const cls = a.required ? 'arg required' : 'arg';
+    const cls = a.frontendOnly ? 'arg frontend-only' : a.required ? 'arg required' : 'arg';
     const req = a.required ? '!' : '';
-    return `<span class="${cls}">${escape(a.displayName)}: <span class="arg-type">${escape(a.type)}${req}</span></span>`;
+    const typeCls = a.frontendOnly ? 'arg-type frontend-only' : 'arg-type';
+    return `<span class="${cls}">${escape(a.displayName)}: <span class="${typeCls}">${escape(a.type)}${req}</span></span>`;
   });
   return `<span class="header-args">(${parts.join(', ')})</span>`;
 }

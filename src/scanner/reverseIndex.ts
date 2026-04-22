@@ -8,6 +8,8 @@ import { ClassInfo } from '../types';
 export interface TypeReference {
   /** Class that contains the reference. */
   fromClass: string;
+  /** Stable UI identity for `fromClass` when the caller can provide one. */
+  fromClassId?: string;
   /** Field name within `fromClass`. */
   fromField: string;
   /** How the type is referenced. */

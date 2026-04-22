@@ -59,9 +59,23 @@ describe('renderTemplateStructuresHtml (phase δ)', () => {
       structures: [{ structure: s }],
       unresolved: [{ name: 'stats', reason: 'no matching root field in the schema' }],
     });
-    expect(html).toContain('Unresolved root fields');
+    expect(html).toContain('Frontend-only root fields');
     expect(html).toContain('<code>stats</code>');
     expect(html).toContain('no matching root field');
+  });
+
+  it('aggregates frontend-only counts across resolved roots', () => {
+    const userType = cls('UserType', [f('id')]);
+    const map = new Map([[userType.name, userType]]);
+    const s = buildQueryStructure(parseGqlFields('query { user { id ghostField } }')[0], userType, map);
+
+    const html = renderTemplateStructuresHtml({
+      operationKind: 'query',
+      structures: [{ structure: s }],
+      unresolved: [],
+    });
+
+    expect(html).toContain('+ 1 frontend-only');
   });
 
   it('pluralization: 1 root field is singular, 2+ is plural', () => {

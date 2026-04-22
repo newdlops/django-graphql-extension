@@ -42,6 +42,19 @@ function findNodeByLabel(nodes: Array<{ label: string; children?: any[] }>, labe
   return undefined;
 }
 
+function findChildByLabel(node: { children?: any[] }, label: string): any {
+  return (node.children ?? []).find((child: any) => child.label === label);
+}
+
+function findPath(node: { children?: any[] }, labels: string[]): any {
+  let cursor: any = node;
+  for (const label of labels) {
+    cursor = findChildByLabel(cursor, label);
+    if (!cursor) return undefined;
+  }
+  return cursor;
+}
+
 describe('GraphqlViewProvider tree sections', () => {
   it('builds backend and frontend sections together', () => {
     const provider = new GraphqlViewProvider();
@@ -109,5 +122,113 @@ describe('GraphqlViewProvider tree sections', () => {
     expect(html).toContain('id="expand"');
     expect(html).toContain('overflow-x: auto;');
     expect(html).toContain("node.kind === 'file' || node.kind === 'operation'");
+  });
+
+  it('keeps resolved backend path expansions schema-local when duplicate type names exist', () => {
+    const provider = new GraphqlViewProvider();
+    const queryA: ClassInfo = {
+      name: 'Query',
+      baseClasses: [],
+      framework: 'graphene',
+      filePath: '/proj/a/query.py',
+      lineNumber: 1,
+      kind: 'query',
+      fields: [{ name: 'user', fieldType: 'Field', resolvedType: 'UserType', filePath: '/proj/a/query.py', lineNumber: 2 }],
+    };
+    const userTypeA: ClassInfo = {
+      name: 'UserType',
+      baseClasses: [],
+      framework: 'graphene',
+      filePath: '/proj/a/types.py',
+      lineNumber: 10,
+      kind: 'type',
+      fields: [{ name: 'id', fieldType: 'ID', filePath: '/proj/a/types.py', lineNumber: 11 }],
+    };
+    const queryB: ClassInfo = {
+      name: 'Query',
+      baseClasses: [],
+      framework: 'graphene',
+      filePath: '/proj/b/query.py',
+      lineNumber: 1,
+      kind: 'query',
+      fields: [{ name: 'user', fieldType: 'Field', resolvedType: 'UserType', filePath: '/proj/b/query.py', lineNumber: 2 }],
+    };
+    const userTypeB: ClassInfo = {
+      name: 'UserType',
+      baseClasses: [],
+      framework: 'graphene',
+      filePath: '/proj/b/types.py',
+      lineNumber: 20,
+      kind: 'type',
+      fields: [{ name: 'name', fieldType: 'String', filePath: '/proj/b/types.py', lineNumber: 21 }],
+    };
+
+    provider.updateSchemas([
+      {
+        name: 'schema-a',
+        filePath: '/proj/a/schema.py',
+        queries: [queryA],
+        mutations: [],
+        subscriptions: [],
+        types: [userTypeA],
+      },
+      {
+        name: 'schema-b',
+        filePath: '/proj/b/schema.py',
+        queries: [queryB],
+        mutations: [],
+        subscriptions: [],
+        types: [userTypeB],
+      },
+    ]);
+
+    const sections = (provider as any).buildSections();
+    const backend = sections.find((section: any) => section.id === 'backend');
+    const schemaNodeA = findNodeByLabel(backend.children, 'schema-a');
+    const queriesA = findChildByLabel(schemaNodeA, 'Queries');
+    const queryNodeA = findPath(queriesA, ['proj', 'a', 'query.py', 'Query']);
+    const userFieldA = findChildByLabel(queryNodeA, 'user');
+
+    expect(userFieldA.children.map((child: any) => child.label)).toEqual(['id']);
+    expect(userFieldA.children[0].file).toBe('/proj/a/types.py');
+  });
+
+  it('places backend classes under their real source path, not just the schema path', () => {
+    const provider = new GraphqlViewProvider();
+    const schemaInfo: SchemaInfo = {
+      name: 'zuzu/app/graphql/schema.py',
+      filePath: '/workspace/zuzu/app/graphql/schema.py',
+      queries: [],
+      subscriptions: [],
+      mutations: [{
+        name: 'CreateOrEditStakeholder',
+        baseClasses: [],
+        framework: 'graphene',
+        filePath: '/workspace/zuzu/packages/company/stakeholder/graphql/mutations/create_or_edit_stakeholder_mutation.py',
+        lineNumber: 40,
+        kind: 'mutation',
+        fields: [],
+      }],
+      types: [],
+    };
+
+    provider.updateSchemas([schemaInfo]);
+    const sections = (provider as any).buildSections();
+    const backend = sections.find((section: any) => section.id === 'backend');
+    const schemaNode = findNodeByLabel(backend.children, 'zuzu/app/graphql/schema.py');
+    const mutations = findChildByLabel(schemaNode, 'Mutations');
+
+    expect(findPath(mutations, ['workspace', 'zuzu', 'app', 'graphql', 'schema.py', 'CreateOrEditStakeholder'])).toBeUndefined();
+    expect(findPath(mutations, [
+      'workspace',
+      'zuzu',
+      'packages',
+      'company',
+      'stakeholder',
+      'graphql',
+      'mutations',
+      'create_or_edit_stakeholder_mutation.py',
+      'CreateOrEditStakeholder',
+    ])).toBeDefined();
   });
 });

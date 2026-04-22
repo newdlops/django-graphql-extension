@@ -138,10 +138,10 @@ export class GqlDecorationManager {
       overviewRulerLane: vscode.OverviewRulerLane.Right,
     });
     this.unresolved = vscode.window.createTextEditorDecorationType({
-      backgroundColor: 'rgba(244, 67, 54, 0.18)',
+      backgroundColor: 'rgba(55, 148, 255, 0.18)',
       textDecoration: 'underline dotted',
       borderRadius: '2px',
-      overviewRulerColor: 'rgba(244, 67, 54, 0.85)',
+      overviewRulerColor: 'rgba(55, 148, 255, 0.85)',
       overviewRulerLane: vscode.OverviewRulerLane.Right,
     });
   }

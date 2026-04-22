@@ -74,7 +74,7 @@ Open a **side-by-side** panel that auto-follows the cursor inside any `gql`/`gra
 
 - The operation signature (`query X($var: Type!, …)`) with every variable declared at the top
 - Per-field backend args, but only the args the user actually passed — not every arg the backend allows
-- A JSON-tree view of the entire selection with missing-field markers
+- A JSON-tree view of the entire selection with missing-field markers and frontend-only markers
 - Lazy **▸ expand** markers on any subtree truncated by the depth cap or cycle guard — click to load another two levels on demand, same as a debugger inspecting a variable
 
 Open via **Django GraphQL: Open Live Query Structure** (Command Palette) or the icon in the Schema Explorer title bar.

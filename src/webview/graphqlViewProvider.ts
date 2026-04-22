@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { SchemaInfo, ClassInfo } from '../types';
 import { buildInspectorData } from '../preview/inspector';
-import { buildReverseIndex, TypeReferences } from '../scanner/reverseIndex';
+import { buildReverseIndex } from '../scanner/reverseIndex';
 import { computeQueryCoverage, CoverageMap } from '../analysis/gqlCoverage';
 import { FrontendGqlFileUsage } from '../analysis/frontendGqlUsage';
 import { FragmentDef } from '../codelens/gqlCodeLensProvider';
@@ -13,7 +14,7 @@ interface TreeNode {
   icon: string;
   file?: string;
   line?: number;
-  className?: string;
+  classId?: string;
   children?: TreeNode[];
 }
 
@@ -26,13 +27,18 @@ interface TreeSection {
   children: TreeNode[];
 }
 
+function classIdFor(cls: ClassInfo): string {
+  return `${cls.filePath}:${cls.lineNumber}:${cls.kind}:${cls.name}`;
+}
+
 export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'djangoGraphqlExplorer.view';
 
   private view?: vscode.WebviewView;
   private schemas: SchemaInfo[] = [];
+  private classContexts = new Map<string, { cls: ClassInfo; schemaClassMap: Map<string, ClassInfo> }>();
+  private classIdsByName = new Map<string, string[]>();
   private classMap = new Map<string, ClassInfo>();
-  private reverseIndex: Map<string, TypeReferences> = new Map();
   private coverage: CoverageMap = new Map();
   private frontendUsages: FrontendGqlFileUsage[] = [];
   private filterPattern: RegExp | null = null;
@@ -42,8 +48,9 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
    * List of class names the inspector can jump to (fed into the quick pick).
    * Each entry carries enough metadata for a useful QuickPickItem detail row.
    */
-  listInspectableClasses(): Array<{ name: string; kind: ClassInfo['kind']; filePath: string; fieldCount: number }> {
-    return [...this.classMap.values()].map((c) => ({
+  listInspectableClasses(): Array<{ classId: string; name: string; kind: ClassInfo['kind']; filePath: string; fieldCount: number }> {
+    return [...this.classContexts.entries()].map(([classId, { cls: c }]) => ({
+      classId,
       name: c.name,
       kind: c.kind,
       filePath: c.filePath,
@@ -52,8 +59,8 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Public entry point for extension commands to open the inspector for a specific class. */
-  showInspectorForClass(className: string): void {
-    this.showPreview(className);
+  showInspectorForClass(classTarget: string): void {
+    this.showPreview(classTarget);
   }
 
   /**
@@ -70,8 +77,8 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       schemaRoots,
       documentFragments,
     });
-    if (this.previewPanel && this.currentInspectorClass) {
-      this.renderInspector(this.currentInspectorClass);
+    if (this.previewPanel && this.currentInspectorClassId) {
+      this.renderInspector(this.currentInspectorClassId);
     }
   }
 
@@ -95,8 +102,8 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
         vscode.window.showTextDocument(uri, {
           selection: new vscode.Range(line, 0, line, 0),
         });
-      } else if (msg.type === 'preview' && msg.className) {
-        this.showPreview(msg.className);
+      } else if (msg.type === 'preview' && (msg.classId || msg.className)) {
+        this.showPreview(msg.classId ?? msg.className);
       } else if (msg.type === 'sort') {
         this.sortMode = msg.mode;
         this.sendTree();
@@ -107,17 +114,28 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   updateSchemas(schemas: SchemaInfo[], frontendUsages: FrontendGqlFileUsage[] = this.frontendUsages): void {
     this.schemas = schemas;
     this.frontendUsages = frontendUsages;
+    this.classContexts.clear();
+    this.classIdsByName.clear();
     this.classMap.clear();
     for (const schema of schemas) {
-      for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
+      const schemaClassMap = new Map<string, ClassInfo>();
+      const classes = [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types];
+      for (const cls of classes) {
+        schemaClassMap.set(cls.name, cls);
+      }
+      for (const cls of classes) {
+        const classId = classIdFor(cls);
+        this.classContexts.set(classId, { cls, schemaClassMap });
+        const ids = this.classIdsByName.get(cls.name);
+        if (ids) ids.push(classId);
+        else this.classIdsByName.set(cls.name, [classId]);
         this.classMap.set(cls.name, cls);
       }
     }
-    this.reverseIndex = buildReverseIndex(this.classMap);
     this.sendTree();
     // If the inspector panel is open, refresh it in place so it doesn't go stale.
-    if (this.previewPanel && this.currentInspectorClass) {
-      this.renderInspector(this.currentInspectorClass);
+    if (this.previewPanel && this.currentInspectorClassId) {
+      this.renderInspector(this.currentInspectorClassId);
     }
   }
 
@@ -152,15 +170,19 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   private buildBackendTree(): TreeNode[] {
     const roots: TreeNode[] = [];
     for (const schema of this.schemas) {
+      const schemaClassMap = new Map<string, ClassInfo>();
+      for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
+        schemaClassMap.set(cls.name, cls);
+      }
       const categories: TreeNode[] = [];
       const fq = this.filterAndSortClasses(schema.queries);
-      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, kind: 'category', icon: 'symbol-namespace', children: fq.map((c) => this.buildClassNode(c)) });
+      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fq, schemaClassMap) });
       const fm = this.filterAndSortClasses(schema.mutations);
-      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, kind: 'category', icon: 'symbol-namespace', children: fm.map((c) => this.buildClassNode(c)) });
+      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fm, schemaClassMap) });
       const fs = this.filterAndSortClasses(schema.subscriptions);
-      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, kind: 'category', icon: 'symbol-namespace', children: fs.map((c) => this.buildClassNode(c)) });
+      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fs, schemaClassMap) });
       const ft = this.filterAndSortClasses(schema.types);
-      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, kind: 'category', icon: 'symbol-namespace', children: ft.map((c) => this.buildClassNode(c)) });
+      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(ft, schemaClassMap) });
 
       if (this.filterPattern && categories.length === 0) continue;
       roots.push({ label: schema.name, kind: 'schema', icon: 'symbol-package', file: schema.filePath, children: categories });
@@ -248,10 +270,10 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     ];
   }
 
-  private buildClassNode(cls: ClassInfo): TreeNode {
+  private buildClassNode(cls: ClassInfo, schemaClassMap: Map<string, ClassInfo>): TreeNode {
     const children: TreeNode[] = cls.fields.map((f) => {
-      const hasResolved = f.resolvedType ? this.classMap.has(f.resolvedType) : false;
-      const resolvedChildren = hasResolved ? this.buildResolvedChildren(f.resolvedType!) : undefined;
+      const resolvedClass = f.resolvedType ? schemaClassMap.get(f.resolvedType) : undefined;
+      const resolvedChildren = resolvedClass ? this.buildResolvedChildren(resolvedClass) : undefined;
       return {
         label: f.name,
         desc: f.fieldType + (f.resolvedType ? ` → ${f.resolvedType}` : ''),
@@ -269,14 +291,59 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       icon: 'symbol-class',
       file: cls.filePath,
       line: cls.lineNumber,
-      className: cls.name,
+      classId: classIdFor(cls),
       children: children.length > 0 ? children : undefined,
     };
   }
 
-  private buildResolvedChildren(typeName: string): TreeNode[] | undefined {
-    const cls = this.classMap.get(typeName);
-    if (!cls || cls.fields.length === 0) return undefined;
+  private buildClassPathTree(classes: ClassInfo[], schemaClassMap: Map<string, ClassInfo>): TreeNode[] {
+    const roots: TreeNode[] = [];
+    for (const cls of classes) {
+      const classNode = this.buildClassNode(cls, schemaClassMap);
+      const relativeFilePath = this.relativeFilePath(cls.filePath);
+      const segments = relativeFilePath.split(/[\\/]/).filter(Boolean);
+      if (segments.length === 0) {
+        roots.push(classNode);
+        continue;
+      }
+
+      let cursor = roots;
+      for (let i = 0; i < segments.length; i++) {
+        const segment = segments[i];
+        const isFile = i === segments.length - 1;
+        let node = cursor.find((child) => child.label === segment && child.kind === (isFile ? 'file' : 'folder'));
+        if (!node) {
+          node = {
+            label: segment,
+            kind: isFile ? 'file' : 'folder',
+            icon: isFile ? 'file-code' : 'folder',
+            file: isFile ? cls.filePath : undefined,
+            line: isFile ? cls.lineNumber : undefined,
+            children: [],
+          };
+          cursor.push(node);
+        }
+        if (!node.children) node.children = [];
+        if (isFile) {
+          node.children.push(classNode);
+        } else {
+          cursor = node.children;
+        }
+      }
+    }
+    return roots;
+  }
+
+  private relativeFilePath(filePath: string): string {
+    if (!filePath) return '';
+    const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+    if (!folder) return filePath;
+    const relative = path.relative(folder.uri.fsPath, filePath);
+    return relative || path.basename(filePath);
+  }
+
+  private buildResolvedChildren(cls: ClassInfo): TreeNode[] | undefined {
+    if (cls.fields.length === 0) return undefined;
     return cls.fields.map((f) => ({
       label: f.name,
       desc: f.fieldType,
@@ -333,22 +400,30 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   }
 
   private previewPanel?: vscode.WebviewPanel;
-  private currentInspectorClass?: string;
+  private currentInspectorClassId?: string;
 
-  private showPreview(className: string): void {
-    if (!this.classMap.has(className)) return;
+  private resolveClassId(classTarget: string): string | undefined {
+    if (this.classContexts.has(classTarget)) return classTarget;
+    const ids = this.classIdsByName.get(classTarget);
+    return ids?.[0];
+  }
+
+  private showPreview(classTarget: string): void {
+    const classId = this.resolveClassId(classTarget);
+    const ctx = classId ? this.classContexts.get(classId) : undefined;
+    if (!classId || !ctx) return;
 
     if (!this.previewPanel) {
       this.previewPanel = vscode.window.createWebviewPanel(
         'graphqlPreview',
-        className,
+        ctx.cls.name,
         { viewColumn: vscode.ViewColumn.One, preserveFocus: true },
         { enableScripts: true, retainContextWhenHidden: true },
       );
       this.previewPanel.webview.html = this.getInspectorShellHtml();
       this.previewPanel.webview.onDidReceiveMessage((msg) => {
-        if (msg.type === 'navigate' && msg.className) {
-          this.renderInspector(msg.className);
+        if (msg.type === 'navigate' && (msg.classId || msg.className)) {
+          this.renderInspector(msg.classId ?? msg.className);
         } else if (msg.type === 'open' && msg.file) {
           const uri = vscode.Uri.file(msg.file);
           vscode.window.showTextDocument(uri, {
@@ -358,21 +433,31 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       });
       this.previewPanel.onDidDispose(() => {
         this.previewPanel = undefined;
-        this.currentInspectorClass = undefined;
+        this.currentInspectorClassId = undefined;
       });
     }
 
-    this.renderInspector(className);
+    this.renderInspector(classId);
     this.previewPanel.reveal(vscode.ViewColumn.One, true);
   }
 
-  private renderInspector(className: string): void {
+  private renderInspector(classTarget: string): void {
     if (!this.previewPanel) return;
-    const coverageForClass = this.coverage.get(className) ?? new Set<string>();
-    const payload = buildInspectorData(className, this.classMap, this.reverseIndex, coverageForClass);
+    const classId = this.resolveClassId(classTarget);
+    const ctx = classId ? this.classContexts.get(classId) : undefined;
+    if (!classId || !ctx) return;
+    const coverageForClass = this.coverage.get(ctx.cls.name) ?? new Set<string>();
+    const reverseIndex = buildReverseIndex(ctx.schemaClassMap);
+    const payload = buildInspectorData(
+      ctx.cls.name,
+      ctx.schemaClassMap,
+      reverseIndex,
+      coverageForClass,
+      (candidate) => classIdFor(candidate),
+    );
     if (!payload) return;
-    this.currentInspectorClass = className;
-    this.previewPanel.title = className;
+    this.currentInspectorClassId = classId;
+    this.previewPanel.title = ctx.cls.name;
     this.previewPanel.webview.postMessage({ type: 'inspector', data: payload });
   }
 
@@ -465,10 +550,10 @@ function renderSdl(sdl) {
     .replace(/:\\s*(\\[?)(\\w+)(]?!?)/g, ': $1<span class="type">$2</span>$3');
 }
 
-function typeChip(typeName, known) {
+function typeChip(typeName, targetId) {
   if (!typeName) return '';
-  const cls = known ? 'chip clickable' : 'chip unknown';
-  const attrs = known ? ' data-nav="' + escapeHtml(typeName) + '"' : '';
+  const cls = targetId ? 'chip clickable' : 'chip unknown';
+  const attrs = targetId ? ' data-nav="' + escapeHtml(targetId) + '"' : '';
   return '<span class="' + cls + '"' + attrs + '">' + escapeHtml(typeName) + '</span>';
 }
 
@@ -476,7 +561,7 @@ function argsFragment(args) {
   if (!args || args.length === 0) return '';
   const parts = args.map(a => {
     const req = a.required ? '!' : '';
-    const chip = typeChip(a.type, a.typeExists);
+    const chip = typeChip(a.type, a.typeId);
     return '<span class="muted">' + escapeHtml(a.name) + '</span>: ' + chip + req;
   });
   return '<div class="arg-row">args: ' + parts.join(', ') + '</div>';
@@ -489,7 +574,7 @@ function render(data) {
   const baseChips = data.baseClasses.length === 0
     ? '<span class="empty">—</span>'
     : '<div class="chips">' + data.baseClasses.map(b =>
-        typeChip(b, data.knownBaseClasses.indexOf(b) >= 0)
+        typeChip(b, data.baseClassTargets[b])
       ).join('') + '</div>';
 
   const coveragePill = data.totalCount === 0
@@ -504,7 +589,7 @@ function render(data) {
         const rowClasses = ['field-row'];
         if (r.origin === 'inherited') rowClasses.push('inherited');
         if (r.queried) rowClasses.push('queried');
-        const resolved = r.resolvedType ? ' → ' + typeChip(r.resolvedType, r.resolvedTypeExists) : '';
+        const resolved = r.resolvedType ? ' → ' + typeChip(r.resolvedType, r.resolvedTypeId) : '';
         return '<tr class="' + rowClasses.join(' ') + '" data-file="' + escapeHtml(r.filePath) + '" data-line="' + r.lineNumber + '">' +
           '<td><span class="name">' + escapeHtml(r.displayName) + '</span>' +
           (r.name !== r.displayName ? ' <span class="name-snake">(' + escapeHtml(r.name) + ')</span>' : '') +
@@ -517,7 +602,7 @@ function render(data) {
   const refItems = (refs, via) => refs.length === 0
     ? '<div class="empty">—</div>'
     : refs.map(r =>
-        '<div class="ref-item" data-nav="' + escapeHtml(r.fromClass) + '">' +
+        '<div class="ref-item"' + (r.fromClassId ? ' data-nav="' + escapeHtml(r.fromClassId) + '"' : '') + '>' +
         escapeHtml(r.fromClass) + '.<span class="muted">' + escapeHtml(r.fromField) + '</span>' +
         '<span class="via">(' + via + (r.label !== r.fromField ? ': ' + escapeHtml(r.label) : '') + ')</span>' +
         '</div>'
@@ -540,7 +625,7 @@ function render(data) {
   root.querySelectorAll('[data-nav]').forEach(el => {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      vscode.postMessage({ type: 'navigate', className: el.getAttribute('data-nav') });
+      vscode.postMessage({ type: 'navigate', classId: el.getAttribute('data-nav') });
     });
   });
   root.querySelectorAll('[data-file]').forEach(el => {
@@ -987,8 +1072,8 @@ function buildNode(node, depth, autoExpand, sectionId) {
       vscode.postMessage({ type: 'open', file: node.file, line: node.line });
       return;
     }
-    if (node.className) {
-      vscode.postMessage({ type: 'preview', className: node.className });
+    if (node.classId) {
+      vscode.postMessage({ type: 'preview', classId: node.classId });
     }
     if (hasChildren && (sectionId !== 'frontend' || node.kind === 'folder')) {
       toggleChildren();

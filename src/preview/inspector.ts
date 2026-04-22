@@ -8,6 +8,8 @@ export interface InspectorArgRow {
   required: boolean;
   /** If true, clicking the type chip should navigate to that class. */
   typeExists: boolean;
+  /** Stable UI identity for the type when available. */
+  typeId?: string;
 }
 
 export interface InspectorFieldRow {
@@ -19,6 +21,8 @@ export interface InspectorFieldRow {
   resolvedType?: string;
   /** Whether resolvedType is a class we know about (i.e., clickable chip). */
   resolvedTypeExists: boolean;
+  /** Stable UI identity for resolvedType when available. */
+  resolvedTypeId?: string;
   args: InspectorArgRow[];
   filePath: string;
   lineNumber: number;
@@ -36,6 +40,8 @@ export interface InspectorPayload {
   baseClasses: string[];
   /** Subset of baseClasses that exist in classMap — clickable chips. */
   knownBaseClasses: string[];
+  /** name -> class id for clickable base-class chips. */
+  baseClassTargets: Record<string, string>;
   fields: InspectorFieldRow[];
   /** Number of fields (inherited included) that at least one active gql template queries. */
   queriedCount: number;
@@ -66,9 +72,15 @@ export function buildInspectorData(
   classMap: Map<string, ClassInfo>,
   reverseIndex: Map<string, TypeReferences>,
   coverageForClass: Set<string> = new Set(),
+  idResolver?: (cls: ClassInfo) => string | undefined,
 ): InspectorPayload | null {
   const cls = classMap.get(className);
   if (!cls) return null;
+  const resolveId = (typeName: string | undefined): string | undefined => {
+    if (!typeName) return undefined;
+    const target = classMap.get(typeName);
+    return target ? idResolver?.(target) : undefined;
+  };
 
   const rows: InspectorFieldRow[] = cls.fields
     // Hide synthetic markers like __relay_node__ — they're internal wiring.
@@ -86,6 +98,7 @@ export function buildInspectorData(
         type: a.type,
         required: a.required,
         typeExists: classMap.has(a.type),
+        typeId: resolveId(a.type),
       }));
 
       return {
@@ -94,6 +107,7 @@ export function buildInspectorData(
         fieldType: f.fieldType,
         resolvedType: f.resolvedType,
         resolvedTypeExists: !!f.resolvedType && classMap.has(f.resolvedType),
+        resolvedTypeId: resolveId(f.resolvedType),
         args,
         filePath: f.filePath || cls.filePath,
         lineNumber: f.lineNumber,
@@ -105,6 +119,15 @@ export function buildInspectorData(
   const refs: TypeReferences = reverseIndex.get(className) ?? { usedAsFieldType: [], usedAsArgType: [] };
 
   const knownBaseClasses = cls.baseClasses.filter((b) => classMap.has(b));
+  const baseClassTargets = Object.fromEntries(
+    knownBaseClasses
+      .map((baseName) => {
+        const target = classMap.get(baseName);
+        const id = target ? idResolver?.(target) : undefined;
+        return id ? [baseName, id] as const : undefined;
+      })
+      .filter((entry): entry is readonly [string, string] => !!entry),
+  );
 
   const queriedCount = rows.filter((r) => r.queried).length;
 
@@ -115,11 +138,18 @@ export function buildInspectorData(
     lineNumber: cls.lineNumber,
     baseClasses: cls.baseClasses,
     knownBaseClasses,
+    baseClassTargets,
     fields: rows,
     queriedCount,
     totalCount: rows.length,
-    usedAsFieldType: refs.usedAsFieldType,
-    usedAsArgType: refs.usedAsArgType,
+    usedAsFieldType: refs.usedAsFieldType.map((ref) => ({
+      ...ref,
+      fromClassId: resolveId(ref.fromClass),
+    })),
+    usedAsArgType: refs.usedAsArgType.map((ref) => ({
+      ...ref,
+      fromClassId: resolveId(ref.fromClass),
+    })),
     sdl: classToGraphql(cls, classMap),
   };
 }

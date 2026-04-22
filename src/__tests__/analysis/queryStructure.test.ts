@@ -37,6 +37,23 @@ describe('buildQueryStructure (phase y)', () => {
     expect(byName.get('created_at')!.queried).toBe(false);
   });
 
+  it('retains gql-only fields as frontend-only nodes without inflating backend totals', () => {
+    const userType = cls('UserType', [f('id', 'Int'), f('name', 'String')]);
+    const gf = firstRoot('query { user { id ghostField { nestedGhost } } }')!;
+
+    const s = buildQueryStructure(gf, userType, new Map([[userType.name, userType]]));
+    expect(s.totalCount).toBe(2);
+    expect(s.queriedCount).toBe(1);
+    expect(s.frontendOnlyCount).toBe(2);
+
+    const byName = new Map(s.rootField.children.map((c) => [c.name, c]));
+    const ghost = byName.get('ghost_field')!;
+    expect(ghost.frontendOnly).toBe(true);
+    expect(ghost.queried).toBe(true);
+    expect(ghost.children.map((c) => c.name)).toEqual(['nested_ghost']);
+    expect(ghost.children[0].frontendOnly).toBe(true);
+  });
+
   it('expands nested types recursively up to the depth cap', () => {
     const addressType = cls('AddressType', [f('street'), f('city')]);
     const companyType = cls('CompanyType', [f('name'), f('address', 'Field', { resolvedType: 'AddressType' })]);
@@ -173,6 +190,33 @@ describe('buildLazySubtree — on-demand deeper expansion', () => {
     const names = s.rootField.args.map((a) => a.name);
     expect(names).toEqual(['company_id', 'page']);
     expect(s.rootField.args.every((a) => a.provided)).toBe(true);
+    expect(s.rootField.args.every((a) => a.frontendOnly === false)).toBe(true);
+  });
+
+  it('keeps gql-only args as frontend-only placeholders', () => {
+    const retType = cls('Ret', [f('id', 'Int')]);
+    const rootField: FieldInfo = {
+      name: 'foo',
+      fieldType: 'Field',
+      resolvedType: 'Ret',
+      filePath: '/q.py',
+      lineNumber: 0,
+      args: [
+        { name: 'known_arg', type: 'Int', required: false },
+      ],
+    };
+    const gf = firstRoot('query { foo(knownArg: 1, ghostArg: 2) { id } }')!;
+    const s = buildQueryStructure(gf, retType, new Map([[retType.name, retType]]), undefined, rootField);
+
+    expect(s.rootField.args.map((a) => a.name)).toEqual(['known_arg', 'ghost_arg']);
+    expect(s.rootField.args[0].frontendOnly).toBe(false);
+    expect(s.rootField.args[1]).toMatchObject({
+      name: 'ghost_arg',
+      displayName: 'ghostArg',
+      type: '?',
+      provided: true,
+      frontendOnly: true,
+    });
   });
 
   it('falls back to the full backend arg list when the gql has no arg list', () => {
@@ -195,6 +239,7 @@ describe('buildLazySubtree — on-demand deeper expansion', () => {
     const names = s.rootField.args.map((a) => a.name);
     expect(names).toEqual(['a', 'b']);
     expect(s.rootField.args.every((a) => a.provided === false)).toBe(true);
+    expect(s.rootField.args.every((a) => a.frontendOnly === false)).toBe(true);
   });
 
   it('surfaces rootFieldInfo.args on the root node when supplied', () => {

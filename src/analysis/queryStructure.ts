@@ -9,6 +9,8 @@ export interface QueryStructureArg {
   required: boolean;
   /** True if a value was provided for this argument in the user's gql. */
   provided: boolean;
+  /** True iff this arg exists only in the user's gql, not in the backend schema. */
+  frontendOnly: boolean;
 }
 
 /** One row in the expanded tree. Fields can have nested children when their type is known. */
@@ -25,6 +27,8 @@ export interface QueryStructureNode {
   resolvedTypeKnown: boolean;
   /** True iff the user's gql queries this field on this owner class. */
   queried: boolean;
+  /** True iff this field exists only in the user's gql, not in the backend schema. */
+  frontendOnly: boolean;
   /** Arguments declared on the backend side. */
   args: QueryStructureArg[];
   /** Children — only populated when the resolved type is known and max depth isn't reached. */
@@ -48,6 +52,7 @@ export interface QueryStructure {
   rootField: QueryStructureNode;
   queriedCount: number;
   totalCount: number;
+  frontendOnlyCount: number;
   rootTypeName: string;
 }
 
@@ -104,30 +109,7 @@ export function buildQueryStructure(
   rootFieldInfo?: FieldInfo,
 ): QueryStructure {
   const ctx: BuildCtx = { classMap, maxDepth, expanding: new Set() };
-
-  // If the gql field carries an explicit arg list (e.g. `foo(x: $x, y: $y)`),
-  // surface ONLY those args and mark them provided. This is what the user
-  // expects: the Query Structure panel should show the gql's arguments, not
-  // every arg the backend might accept. When the gql has no `(…)` at all
-  // (e.g. argument-less mutation or `__typename`-only selection), fall back
-  // to the full backend arg list so the user can still discover available
-  // args.
-  const providedArgNames = userField.argNames;
-  const providedSet = providedArgNames ? new Set(providedArgNames.map(camelToSnake)) : undefined;
-  const backendArgs = rootFieldInfo?.args ?? [];
-  const relevantArgs = providedSet
-    ? backendArgs.filter((a) => providedSet.has(a.name))
-    : backendArgs;
-  const rootArgs: QueryStructureArg[] = relevantArgs.map((a) => ({
-    name: a.name,
-    displayName: snakeToCamel(a.name),
-    type: a.type,
-    required: a.required,
-    // Explicit list ⇒ everything listed here was provided. Without the list
-    // we can't tell, so default to false — consumers that care still get the
-    // backend shape.
-    provided: !!providedSet,
-  }));
+  const rootArgs = buildArgs(rootFieldInfo?.args, userField.argNames);
 
   // The root node represents the field itself (e.g., `stocks`) whose type is rootCls.
   const root: QueryStructureNode = {
@@ -137,6 +119,7 @@ export function buildQueryStructure(
     resolvedType: rootCls.name,
     resolvedTypeKnown: true,
     queried: true, // the field itself is present in the gql
+    frontendOnly: false,
     args: rootArgs,
     children: expandClassFields(userField.children, rootCls, 1, ctx),
     hasMoreChildren: false,
@@ -147,10 +130,15 @@ export function buildQueryStructure(
 
   let queried = 0;
   let total = 0;
+  let frontendOnly = 0;
   const walk = (n: QueryStructureNode) => {
     for (const c of n.children) {
-      total++;
-      if (c.queried) queried++;
+      if (c.frontendOnly) {
+        frontendOnly++;
+      } else {
+        total++;
+        if (c.queried) queried++;
+      }
       walk(c);
     }
   };
@@ -160,6 +148,7 @@ export function buildQueryStructure(
     rootField: root,
     queriedCount: queried,
     totalCount: total,
+    frontendOnlyCount: frontendOnly,
     rootTypeName: rootCls.name,
   };
 }
@@ -176,13 +165,7 @@ export function buildPartialStructureFromGql(
 ): QueryStructure {
   const typeLabel = ownerHint?.resolvedTypeName ?? '?';
   const rootOwner = ownerHint?.className ?? '?';
-  const rootArgs: QueryStructureArg[] = (ownerHint?.args ?? []).map((a) => ({
-    name: a.name,
-    displayName: snakeToCamel(a.name),
-    type: a.type,
-    required: a.required,
-    provided: false,
-  }));
+  const rootArgs = buildArgs(ownerHint?.args, userField.argNames);
   const root: QueryStructureNode = {
     name: camelToSnake(userField.name),
     displayName: userField.name,
@@ -190,6 +173,7 @@ export function buildPartialStructureFromGql(
     resolvedType: ownerHint?.resolvedTypeName,
     resolvedTypeKnown: false,
     queried: true,
+    frontendOnly: false,
     args: rootArgs,
     children: userField.children.map(buildPartialChild),
     hasMoreChildren: false,
@@ -203,6 +187,7 @@ export function buildPartialStructureFromGql(
     rootField: root,
     queriedCount: count,
     totalCount: count,
+    frontendOnlyCount: 0,
     rootTypeName: typeLabel,
   };
 }
@@ -237,7 +222,8 @@ function buildPartialChild(gf: GqlField): QueryStructureNode {
     resolvedType: undefined,
     resolvedTypeKnown: false,
     queried: true,
-    args: [],
+    frontendOnly: false,
+    args: buildArgs(undefined, gf.argNames),
     children: gf.children.map(buildPartialChild),
     hasMoreChildren: false,
     ownerClass: '?',
@@ -267,22 +253,18 @@ function expandClassFields(
     // Index the user's queried children by their snake_case name.
     const userBySnake = new Map<string, GqlField>();
     for (const gf of userChildren) userBySnake.set(camelToSnake(gf.name), gf);
+    const backendFieldNames = new Set<string>();
 
     const nodes: QueryStructureNode[] = [];
     for (const field of cls.fields) {
       // Hide synthetic markers like __relay_node__.
       if (field.name.startsWith('__') && field.name.endsWith('__')) continue;
+      backendFieldNames.add(field.name);
 
       const userSubfield = userBySnake.get(field.name);
       const queried = !!userSubfield;
 
-      const args: QueryStructureArg[] = (field.args ?? []).map((a) => ({
-        name: a.name,
-        displayName: snakeToCamel(a.name),
-        type: a.type,
-        required: a.required,
-        provided: false, // cannot detect arg provision from selection-set alone; set by caller if available
-      }));
+      const args = buildArgs(field.args, userSubfield?.argNames);
 
       const resolvedType = field.resolvedType;
       const resolvedCls = resolvedType ? ctx.classMap.get(resolvedType) ?? null : null;
@@ -319,6 +301,7 @@ function expandClassFields(
         // the UI shouldn't dim them as `type-unknown`.
         resolvedTypeKnown: !!resolvedCls || isScalarLeaf,
         queried,
+        frontendOnly: false,
         args,
         children,
         hasMoreChildren,
@@ -327,8 +310,85 @@ function expandClassFields(
         lineNumber: field.lineNumber,
       });
     }
+
+    for (const [snakeName, userSubfield] of userBySnake) {
+      if (backendFieldNames.has(snakeName)) continue;
+      nodes.push(buildFrontendOnlyNode(userSubfield, cls.name, cls.filePath, cls.lineNumber));
+    }
     return nodes;
   } finally {
     ctx.expanding.delete(cls.name);
   }
+}
+
+function buildArgs(
+  backendArgs: FieldInfo['args'] | undefined,
+  providedArgNames?: string[],
+): QueryStructureArg[] {
+  const backend = backendArgs ?? [];
+  if (providedArgNames === undefined) {
+    return backend.map((a) => ({
+      name: a.name,
+      displayName: snakeToCamel(a.name),
+      type: a.type,
+      required: a.required,
+      provided: false,
+      frontendOnly: false,
+    }));
+  }
+
+  const backendByName = new Map(backend.map((a) => [a.name, a] as const));
+  const seen = new Set<string>();
+  const out: QueryStructureArg[] = [];
+  for (const providedName of providedArgNames) {
+    const snakeName = camelToSnake(providedName);
+    if (seen.has(snakeName)) continue;
+    seen.add(snakeName);
+
+    const backendArg = backendByName.get(snakeName);
+    if (backendArg) {
+      out.push({
+        name: backendArg.name,
+        displayName: snakeToCamel(backendArg.name),
+        type: backendArg.type,
+        required: backendArg.required,
+        provided: true,
+        frontendOnly: false,
+      });
+      continue;
+    }
+
+    out.push({
+      name: snakeName,
+      displayName: snakeToCamel(snakeName),
+      type: '?',
+      required: false,
+      provided: true,
+      frontendOnly: true,
+    });
+  }
+  return out;
+}
+
+function buildFrontendOnlyNode(
+  gf: GqlField,
+  ownerClass: string,
+  filePath: string,
+  lineNumber: number,
+): QueryStructureNode {
+  return {
+    name: camelToSnake(gf.name),
+    displayName: gf.name,
+    typeLabel: '?',
+    resolvedType: undefined,
+    resolvedTypeKnown: false,
+    queried: true,
+    frontendOnly: true,
+    args: buildArgs(undefined, gf.argNames),
+    children: gf.children.map((child) => buildFrontendOnlyNode(child, ownerClass, filePath, lineNumber)),
+    hasMoreChildren: false,
+    ownerClass,
+    filePath,
+    lineNumber,
+  };
 }

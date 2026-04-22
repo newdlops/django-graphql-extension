@@ -40,6 +40,17 @@ describe('renderQueryStructureHtml (phase y)', () => {
     expect(html).toMatch(/row[^"]*missing[^"]*"[^>]*>[\s\S]*?name\b/);
   });
 
+  it('renders gql-only fields as blue frontend-only rows', () => {
+    const user = cls('UserType', [f('id')]);
+    const gf = parseGqlFields('query { user { id ghostField } }')[0];
+    const struct = buildQueryStructure(gf, user, new Map([[user.name, user]]));
+    const html = renderQueryStructureHtml(struct);
+
+    expect(html).toContain('+ 1 frontend-only');
+    expect(html).toMatch(/row[^"]*frontend-only[^"]*"[^>]*>[\s\S]*?ghostField\b/);
+    expect(html).toContain('Blue = present only in your gql');
+  });
+
   it('expands nested types recursively so a missing branch still shows its subfields', () => {
     const address = cls('AddressType', [f('street'), f('city')]);
     const user = cls('UserType', [f('id'), f('address', 'Field', { resolvedType: 'AddressType' })]);
@@ -108,6 +119,23 @@ describe('renderQueryStructureHtml (phase y)', () => {
     expect(html).toContain('id: <span class="arg-type">Int!');
     expect(html).toContain('includeDeleted: <span class="arg-type">Boolean');
     expect(html).not.toContain('includeDeleted: <span class="arg-type">Boolean!'); // not required
+  });
+
+  it('renders gql-only args with frontend-only styling and ? type', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [
+      f('user', 'Field', {
+        resolvedType: 'UserType',
+        args: [{ name: 'id', type: 'Int', required: false }],
+      }),
+    ], 'query');
+    const map = new Map([[userType.name, userType], [query.name, query]]);
+
+    const gf = parseGqlFields('query { user(id: 1, ghostArg: 2) { id } }')[0];
+    const struct = buildQueryStructure(gf, query, map);
+    const html = renderQueryStructureHtml(struct);
+
+    expect(html).toContain('ghostArg: <span class="arg-type frontend-only">?</span>');
   });
 
   it('renders a friendly empty-state when the target has no fields', () => {

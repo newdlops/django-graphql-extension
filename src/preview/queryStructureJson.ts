@@ -20,10 +20,14 @@ interface RenderState {
  * back to the extension to fetch the deeper subtree.
  */
 export function renderQueryStructureJsonHtml(structure: QueryStructure): string {
+  const frontendOnlyPill = structure.frontendOnlyCount > 0
+    ? `<span class="pill pill-f">+ ${structure.frontendOnlyCount} frontend-only</span>`
+    : '';
   const summary = `
     <div class="summary">
       <span class="pill pill-q">✓ ${structure.queriedCount} queried</span>
       <span class="pill pill-m">✗ ${structure.totalCount - structure.queriedCount} missing</span>
+      ${frontendOnlyPill}
       <span class="muted">of ${structure.totalCount} total fields</span>
     </div>`;
 
@@ -56,14 +60,19 @@ export function renderTemplateStructuresHtml(params: {
 }): string {
   const aggQueried = params.structures.reduce((a, s) => a + s.structure.queriedCount, 0);
   const aggTotal = params.structures.reduce((a, s) => a + s.structure.totalCount, 0);
+  const aggFrontendOnly = params.structures.reduce((a, s) => a + s.structure.frontendOnlyCount, 0);
 
   const opLabel = `${params.operationKind}${params.operationName ? ' ' + escape(params.operationName) : ''}`;
+  const frontendOnlyPill = aggFrontendOnly > 0
+    ? `<span class="pill pill-f">+ ${aggFrontendOnly} frontend-only</span>`
+    : '';
 
   const summary = `
     <div class="summary">
       <span class="op-label">${escape(opLabel)}</span>
       <span class="pill pill-q">✓ ${aggQueried} queried</span>
       <span class="pill pill-m">✗ ${aggTotal - aggQueried} missing</span>
+      ${frontendOnlyPill}
       <span class="muted">across ${params.structures.length} root field${params.structures.length === 1 ? '' : 's'}</span>
     </div>${renderOperationVariables(params.operationVariables ?? [])}`;
 
@@ -81,7 +90,7 @@ export function renderTemplateStructuresHtml(params: {
   }
   if (params.unresolved.length > 0) {
     blocks.push(`<div class="unresolved-section">`);
-    blocks.push(`<div class="unresolved-title">Unresolved root fields</div>`);
+    blocks.push(`<div class="unresolved-title">Frontend-only root fields</div>`);
     for (const u of params.unresolved) {
       blocks.push(`<div class="unresolved-row"><code>${escape(u.name)}</code> <span class="muted">— ${escape(u.reason)}</span></div>`);
     }
@@ -110,15 +119,21 @@ function renderRoot(node: QueryStructureNode, state: RenderState): string {
 }
 
 function renderField(node: QueryStructureNode, depth: number, state: RenderState): string {
-  const marker = node.queried
-    ? '<span class="mark mark-q">✓</span>'
-    : '<span class="mark mark-m">✗</span>';
-  const keyClass = node.queried ? 'key key-queried' : 'key key-missing';
+  const marker = node.frontendOnly
+    ? '<span class="mark mark-f">+</span>'
+    : node.queried
+      ? '<span class="mark mark-q">✓</span>'
+      : '<span class="mark mark-m">✗</span>';
+  const keyClass = node.frontendOnly
+    ? 'key key-frontend-only'
+    : node.queried ? 'key key-queried' : 'key key-missing';
   const isUnknownType =
     (node.resolvedType && !node.resolvedTypeKnown) ||
     node.typeLabel === '?' ||
     node.typeLabel.startsWith('?');
-  const typeClass = isUnknownType ? 'type type-unknown' : 'type';
+  const typeClass = node.frontendOnly
+    ? 'type type-frontend-only'
+    : isUnknownType ? 'type type-unknown' : 'type';
   const indent = indentSpan(depth);
   const argBlock = renderArgs(node.args);
 
@@ -129,7 +144,8 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
 
   // Leaf field: no children to expand AND no lazy handle.
   if (!hasChildren && !isLazy) {
-    return `<span class="line ${node.queried ? 'line-q' : 'line-m'}">${keyLine}<span class="${typeClass}">${escape(node.typeLabel)}</span></span>`;
+    const lineClass = node.frontendOnly ? 'line-f' : node.queried ? 'line-q' : 'line-m';
+    return `<span class="line ${lineClass}">${keyLine}<span class="${typeClass}">${escape(node.typeLabel)}</span></span>`;
   }
 
   // Object/list field — collapsible. List types are surfaced with [] brackets.
@@ -164,7 +180,7 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
   if (node.resolvedType) state.ancestry.pop();
 
   return [
-    `<details open class="block ${node.queried ? 'block-q' : 'block-m'}">`,
+    `<details open class="block ${node.frontendOnly ? 'block-f' : node.queried ? 'block-q' : 'block-m'}">`,
     `<summary><span class="line">${keyLine}${typeTag} ${open}</span></summary>`,
     inner,
     `<span class="line">${indentSpan(depth)}${close}</span>`,
@@ -223,9 +239,10 @@ function renderOperationVariables(vars: TemplateOperationVariable[]): string {
 function renderArgs(args: QueryStructureArg[]): string {
   if (args.length === 0) return '';
   const parts = args.map((a) => {
-    const cls = a.required ? 'arg arg-req' : 'arg';
+    const cls = a.frontendOnly ? 'arg arg-f' : a.required ? 'arg arg-req' : 'arg';
     const req = a.required ? '!' : '';
-    return `<span class="${cls}">${escape(a.displayName)}: <span class="arg-type">${escape(a.type)}${req}</span></span>`;
+    const typeCls = a.frontendOnly ? 'arg-type arg-type-f' : 'arg-type';
+    return `<span class="${cls}">${escape(a.displayName)}: <span class="${typeCls}">${escape(a.type)}${req}</span></span>`;
   });
   return `<span class="args">(${parts.join(', ')})</span>`;
 }
@@ -255,6 +272,7 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 .pill { display: inline-block; padding: 1px 8px; margin-right: 6px; border-radius: 10px; font-size: 0.85em; }
 .pill-q { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
 .pill-m { background: rgba(244, 67, 54, 0.18); color: #f44747; }
+.pill-f { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
 .muted { color: var(--vscode-descriptionForeground); }
 
 .json-tree { margin: 0; padding: 12px 18px 22px; white-space: pre; line-height: 1.55; overflow: auto; }
@@ -271,18 +289,23 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 }
 .mark-q { color: #4caf50; }
 .mark-m { color: #f44747; }
+.mark-f { color: #3794ff; }
 
 .key { font-weight: 500; }
 .key-root { color: var(--vscode-symbolIcon-classForeground, #ee9d28); }
 .key-queried { color: var(--vscode-symbolIcon-propertyForeground, #75beff); }
 .key-missing { color: #f44747; text-decoration: underline dotted rgba(244, 67, 54, 0.5); }
+.key-frontend-only { color: #3794ff; text-decoration: underline dotted rgba(55, 148, 255, 0.55); }
 
 .type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .type-unknown { color: var(--vscode-descriptionForeground); font-style: italic; text-decoration: underline dotted; }
+.type-frontend-only { color: #3794ff; }
 
 .args { color: var(--vscode-descriptionForeground); font-size: 0.9em; margin: 0 2px; }
 .arg-req { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
+.arg-f { color: #3794ff; }
 .arg-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
+.arg-type-f { color: #3794ff; }
 
 .brace { color: var(--vscode-descriptionForeground); font-weight: 600; }
 
@@ -308,6 +331,7 @@ details.block > summary:hover { background: var(--vscode-list-hoverBackground); 
 details.block > summary:hover:before { color: var(--vscode-editor-foreground); }
 details.block-m > summary .key-missing,
 details.block-q > summary .key-queried { /* keep existing colors */ }
+details.block-f > summary .key-frontend-only { /* keep existing colors */ }
 
 .empty { padding: 24px; color: var(--vscode-descriptionForeground); font-style: italic; text-align: center; }
 .legend { padding: 8px 14px; border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); color: var(--vscode-descriptionForeground); font-size: 0.78em; }
@@ -321,7 +345,8 @@ details.block-q > summary .key-queried { /* keep existing colors */ }
 .opvar-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .opvar-default { color: var(--vscode-descriptionForeground); font-style: italic; }
 .root-note { padding: 4px 14px 0; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
-.unresolved-section { margin: 14px 14px 0; padding: 8px 12px; border: 1px dashed rgba(128,128,128,0.35); border-radius: 4px; }
-.unresolved-title { font-size: 0.8em; font-weight: 600; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
+.unresolved-section { margin: 14px 14px 0; padding: 8px 12px; border: 1px dashed rgba(55, 148, 255, 0.45); border-radius: 4px; background: rgba(55, 148, 255, 0.06); }
+.unresolved-title { font-size: 0.8em; font-weight: 600; color: #3794ff; margin-bottom: 4px; }
 .unresolved-row { font-size: 0.85em; }
+.unresolved-row code { color: #3794ff; }
 `;
