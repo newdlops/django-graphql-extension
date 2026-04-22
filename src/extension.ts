@@ -83,7 +83,7 @@ export function activate(context: vscode.ExtensionContext) {
       );
       panel.webview.html = renderQueryStructureHtml(
         structure,
-        `Expand all fields & args on ${typeName}. Red rows are available on the backend but missing from your gql. Blue rows exist only in your gql and could not be matched to the backend schema.`,
+        `Expand all fields & args on ${typeName}. Red rows are available on the backend but missing from your gql. Fields that exist only in your gql are highlighted in the source editor.`,
       );
 
       // Lazy expansion: the webview asks for a subtree whenever the user clicks

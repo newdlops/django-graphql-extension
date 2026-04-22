@@ -8,6 +8,9 @@ import {
   MatchedEntry,
   buildFieldIndex,
   findEntry as findEntryShared,
+  readRootOperationKindFromGql,
+  resolveChildClass,
+  RootOperationKind,
 } from './gqlResolver';
 
 export function camelToSnake(str: string): string {
@@ -168,6 +171,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
       // Log the operation type and parsed root fields
       const opType = gqlBody.match(/^\s*(query|mutation|subscription)/)?.[1] ?? 'unknown';
+      const rootKind = readRootOperationKindFromGql(gqlBody);
       const rootNames = parsed.map((f) => f.name);
       log(`[codeLens] ${fileName}: ${opType} — root fields: [${rootNames.join(', ')}] (${parsed.length} fields from ${gqlBody.length} chars)`);
 
@@ -180,14 +184,13 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
         for (const gf of fields) {
           const indent = '  '.repeat(depth + 1);
           const snakeName = camelToSnake(gf.name);
-          const entry = this.findEntry(snakeName, parent);
+          const entry = this.findEntry(snakeName, parent, rootKind);
           if (entry) {
             const conf = entry.confidence === 'inferred' ? ' [inferred]' : '';
             log(`[codeLens] ${indent}✓ ${gf.name} → ${snakeName} → ${entry.cls.name}.${entry.field.name} (${entry.cls.kind})${conf}`);
             if (gf.children.length > 0) {
               const resolvedTypeName = entry.field.resolvedType;
-              let resolved = resolvedTypeName ? this.classMap.get(resolvedTypeName) ?? null : null;
-              if (!resolved) resolved = this.inferTypeFromFieldName(gf.name);
+              const resolved = resolveChildClass(entry.field, gf.name, this.classMap);
               if (resolved) {
                 logFields(gf.children, depth + 1, resolved);
               } else {
@@ -208,7 +211,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       };
       logFields(parsed, 0, null);
 
-      this.resolveFields(parsed, null, startOffset, document, lenses);
+      this.resolveFields(parsed, null, startOffset, document, lenses, rootKind);
     }
 
     return lenses;
@@ -220,16 +223,23 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     baseOffset: number,
     document: vscode.TextDocument,
     lenses: vscode.CodeLens[],
+    rootKind: RootOperationKind,
   ): void {
     for (const gf of fields) {
       const snakeName = camelToSnake(gf.name);
-      const entry = this.findEntry(snakeName, parentType);
+      const entry = this.findEntry(snakeName, parentType, rootKind);
       if (!entry) continue;
 
       const linePos = document.positionAt(baseOffset + gf.offset);
       const range = new vscode.Range(linePos, linePos);
 
-      const kindLabel = entry.cls.kind === 'type' ? 'Type' : entry.cls.kind === 'mutation' ? 'Mutation' : 'Query';
+      const kindLabel = entry.cls.kind === 'type'
+        ? 'Type'
+        : entry.cls.kind === 'mutation'
+          ? 'Mutation'
+          : entry.cls.kind === 'subscription'
+            ? 'Subscription'
+            : 'Query';
       const marker = entry.confidence === 'inferred' ? '~' : '';
       const tooltipSuffix = entry.confidence === 'inferred'
         ? '\n\n(~ means inferred — multiple candidates existed; verify that this is the intended class.)'
@@ -246,15 +256,10 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       // If we don't know the child type, DO NOT fall back to the current
       // class — that would falsely attribute descendants to the parent.
       if (gf.children.length > 0) {
-        let resolvedCls = entry.field.resolvedType
-          ? (this.classMap.get(entry.field.resolvedType) ?? null)
-          : null;
-        if (!resolvedCls) {
-          resolvedCls = this.inferTypeFromFieldName(gf.name);
-        }
+        const resolvedCls = resolveChildClass(entry.field, gf.name, this.classMap);
 
         if (resolvedCls) {
-          this.resolveFields(gf.children, resolvedCls, baseOffset, document, lenses);
+          this.resolveFields(gf.children, resolvedCls, baseOffset, document, lenses, rootKind);
 
           // Show missing fields from the resolved type
           const missing = this.getMissingFields(gf.children, resolvedCls);
@@ -283,47 +288,12 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     return computeMissingFields(frontendFields, backendCls, this.classMap);
   }
 
-  /**
-   * Infer the backend type class from a frontend field name.
-   * e.g., "investors" → look for "InvestorType", "InvestorsType", "RtccInvestorType", etc.
-   *       "companyInfo" → look for "CompanyInfoType", "CompanyType"
-   */
-  private inferTypeFromFieldName(camelFieldName: string): ClassInfo | null {
-    const snakeName = camelToSnake(camelFieldName);
-    // Convert to PascalCase
-    const pascal = snakeName.replace(/(^|_)([a-z])/g, (_, __, c) => c.toUpperCase());
-
-    // Try common suffixes and variations
-    const candidates = [
-      `${pascal}Type`,           // InvestorsType
-      `${pascal}`,               // Investors (might be a type itself)
-      // Remove trailing 's' for singular form
-      `${pascal.replace(/s$/, '')}Type`,  // InvestorType
-      `${pascal.replace(/s$/, '')}`,      // Investor
-      // Remove 'List' suffix
-      `${pascal.replace(/List$/, '')}Type`,
-    ];
-
-    for (const name of candidates) {
-      const cls = this.classMap.get(name);
-      if (cls && cls.kind === 'type') return cls;
-    }
-
-    // Fuzzy: find any type class whose name contains the pascal form
-    const singularPascal = pascal.replace(/s$/, '');
-    if (singularPascal.length >= 6) { // avoid matching too-short names
-      for (const [, cls] of this.classMap) {
-        if (cls.kind === 'type' && cls.name.includes(singularPascal) && cls.name.endsWith('Type')) {
-          return cls;
-        }
-      }
-    }
-
-    return null;
-  }
-
-  private findEntry(snakeFieldName: string, parentType: ClassInfo | null): MatchedEntry | undefined {
-    return findEntryShared(this.fieldIndex, this.classMap, snakeFieldName, parentType);
+  private findEntry(
+    snakeFieldName: string,
+    parentType: ClassInfo | null,
+    rootKind: RootOperationKind = 'query',
+  ): MatchedEntry | undefined {
+    return findEntryShared(this.fieldIndex, this.classMap, snakeFieldName, parentType, { rootKind });
   }
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | undefined {
@@ -346,7 +316,8 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const rawBody = text.substring(startOffset, templateEnd);
       const gqlBody = stripTemplateExpressions(rawBody);
       const parsed = parseGqlFields(gqlBody, docFragments);
-      const hover = this.findHoverInFields(parsed, null, startOffset, offset, document);
+      const rootKind = readRootOperationKindFromGql(gqlBody);
+      const hover = this.findHoverInFields(parsed, null, startOffset, offset, document, rootKind);
       if (hover) return hover;
     }
 
@@ -359,20 +330,18 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     baseOffset: number,
     cursorOffset: number,
     document: vscode.TextDocument,
+    rootKind: RootOperationKind,
   ): vscode.Hover | undefined {
     for (const gf of fields) {
       const snakeName = camelToSnake(gf.name);
-      const entry = this.findEntry(snakeName, parentType);
+      const entry = this.findEntry(snakeName, parentType, rootKind);
 
       // Check children first (more specific match). Mirror the CodeLens rule:
       // don't fall back to the parent class when we cannot resolve the child type.
       if (gf.children.length > 0 && entry) {
-        let resolvedCls = entry.field.resolvedType
-          ? (this.classMap.get(entry.field.resolvedType) ?? null)
-          : null;
-        if (!resolvedCls) resolvedCls = this.inferTypeFromFieldName(gf.name);
+        const resolvedCls = resolveChildClass(entry.field, gf.name, this.classMap);
         if (resolvedCls) {
-          const childHover = this.findHoverInFields(gf.children, resolvedCls, baseOffset, cursorOffset, document);
+          const childHover = this.findHoverInFields(gf.children, resolvedCls, baseOffset, cursorOffset, document, rootKind);
           if (childHover) return childHover;
         }
       }

@@ -30,7 +30,7 @@ describe('computeDecorations (phase w)', () => {
     for (const d of decos) expect(d.kind).toBe('exact');
   });
 
-  it('classifies ambiguous root-level field as inferred', () => {
+  it('scopes root-level fields to the operation kind', () => {
     const userType = cls('UserType', [f('id')]);
     const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
     const mut = cls('Mutation', [f('user', 'Field', { resolvedType: 'UserType' })], 'mutation');
@@ -39,7 +39,20 @@ describe('computeDecorations (phase w)', () => {
     const src = 'gql`query { user { id } }`;';
     const decos = computeDecorations(src, ctx);
     const user = decos.find((d) => src.substr(d.offset, d.length) === 'user');
-    expect(user!.kind).toBe('inferred');
+    expect(user!.kind).toBe('exact');
+  });
+
+  it('does not let regular type fields satisfy root-level operation fields', () => {
+    const userType = cls('UserType', [f('profile', 'Field', { resolvedType: 'ProfileType' })]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = 'gql`query { profile { id } }`;';
+    const decos = computeDecorations(src, ctx);
+    const profile = decos.find((d) => src.substr(d.offset, d.length) === 'profile');
+    const id = decos.find((d) => src.substr(d.offset, d.length) === 'id');
+    expect(profile!.kind).toBe('unresolved');
+    expect(id!.kind).toBe('unresolved');
   });
 
   it('classifies typo fields (known parent, unknown name) as unresolved', () => {
@@ -48,6 +61,17 @@ describe('computeDecorations (phase w)', () => {
     const ctx = ctxFromClasses([userType, query]);
 
     const src = 'gql`query { user { bogus } }`;';
+    const decos = computeDecorations(src, ctx);
+    const bogus = decos.find((d) => src.substr(d.offset, d.length) === 'bogus');
+    expect(bogus!.kind).toBe('unresolved');
+  });
+
+  it('follows provider field-name inference before marking nested unresolved fields', () => {
+    const investorType = cls('InvestorType', [f('id')]);
+    const query = cls('Query', [f('investors', 'Field')], 'query');
+    const ctx = ctxFromClasses([investorType, query]);
+
+    const src = 'gql`query { investors { bogus } }`;';
     const decos = computeDecorations(src, ctx);
     const bogus = decos.find((d) => src.substr(d.offset, d.length) === 'bogus');
     expect(bogus!.kind).toBe('unresolved');

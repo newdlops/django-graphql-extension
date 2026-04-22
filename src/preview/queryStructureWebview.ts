@@ -152,7 +152,7 @@ body {
 </style></head><body>
 ${header}
 <div class="tree">${body}</div>
-<div class="legend">Green = queried · Red = available on the backend but missing from your gql · Blue = present only in your gql and not found in the backend schema · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
+<div class="legend">Green = queried · Red = available on the backend but missing from your gql · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
 <script>
 (function () {
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };

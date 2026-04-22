@@ -1,7 +1,16 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake } from './gqlCodeLensProvider';
-import { FieldIndex, findEntry, collectAncestors } from './gqlResolver';
+import {
+  FieldIndex,
+  RootOperationKind,
+  collectAncestors,
+  collectRootFieldNames,
+  findEntry,
+  hasSchemaRootForOperation,
+  readRootOperationKindFromGql,
+  resolveChildClass,
+} from './gqlResolver';
 
 export interface DiagnosticInfo {
   /** Offset of the field name in document text. */
@@ -40,8 +49,9 @@ export function computeDiagnostics(text: string, ctx: ComputeCtx): DiagnosticInf
     const rawBody = text.substring(startOffset, endOffset);
     const gqlBody = stripInterpolations(rawBody);
     const parsed = parseGqlFields(gqlBody);
+    const rootKind = readRootOperationKindFromGql(gqlBody);
 
-    walk(parsed, null, startOffset, ctx, out);
+    walk(parsed, null, startOffset, ctx, out, rootKind);
   }
   return out;
 }
@@ -52,10 +62,11 @@ function walk(
   baseOffset: number,
   ctx: ComputeCtx,
   out: DiagnosticInfo[],
+  rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls);
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
 
     if (!entry && parentCls) {
       // Parent is known but the field doesn't exist on it — user typo or
@@ -71,13 +82,23 @@ function walk(
         message: `No field '${snake}' on ${parentCls.name} (or its ancestors)${suggestText}`,
         suggestions,
       });
+    } else if (!entry && hasSchemaRootForOperation(ctx.classMap, rootKind)) {
+      const candidates = collectRootFieldNames(ctx.classMap, rootKind);
+      const suggestions = suggest(snake, candidates, 3);
+      const suggestText = suggestions.length > 0
+        ? ` — did you mean ${suggestions.map((s) => `\`${s}\``).join(' or ')}?`
+        : '';
+      out.push({
+        offset: baseOffset + gf.nameOffset,
+        length: gf.nameLength,
+        message: `No root ${rootKind} field '${snake}' in the schema${suggestText}`,
+        suggestions,
+      });
     }
 
     if (gf.children.length === 0) continue;
-    const childCls = entry && entry.field.resolvedType
-      ? ctx.classMap.get(entry.field.resolvedType) ?? null
-      : null;
-    if (childCls) walk(gf.children, childCls, baseOffset, ctx, out);
+    const childCls = entry ? resolveChildClass(entry.field, gf.name, ctx.classMap) : null;
+    if (childCls) walk(gf.children, childCls, baseOffset, ctx, out, rootKind);
   }
 }
 

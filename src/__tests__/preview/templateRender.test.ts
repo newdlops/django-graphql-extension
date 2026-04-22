@@ -64,7 +64,7 @@ describe('renderTemplateStructuresHtml (phase δ)', () => {
     expect(html).toContain('no matching root field');
   });
 
-  it('aggregates frontend-only counts across resolved roots', () => {
+  it('does not include gql-only nested fields in the resolved structure summary', () => {
     const userType = cls('UserType', [f('id')]);
     const map = new Map([[userType.name, userType]]);
     const s = buildQueryStructure(parseGqlFields('query { user { id ghostField } }')[0], userType, map);
@@ -75,7 +75,8 @@ describe('renderTemplateStructuresHtml (phase δ)', () => {
       unresolved: [],
     });
 
-    expect(html).toContain('+ 1 frontend-only');
+    expect(html).not.toContain('+ 1 frontend-only');
+    expect(html).not.toContain('ghostField');
   });
 
   it('pluralization: 1 root field is singular, 2+ is plural', () => {

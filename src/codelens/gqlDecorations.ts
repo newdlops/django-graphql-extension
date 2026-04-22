@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake } from './gqlCodeLensProvider';
-import { FieldIndex, findEntry } from './gqlResolver';
+import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
 
 export interface DecorationInfo {
   offset: number;
@@ -37,8 +37,9 @@ export function computeDecorations(text: string, ctx: ComputeCtx): DecorationInf
     const rawBody = text.substring(startOffset, endOffset);
     const gqlBody = stripInterpolations(rawBody);
     const parsed = parseGqlFields(gqlBody);
+    const rootKind = readRootOperationKindFromGql(gqlBody);
 
-    walk(parsed, null, startOffset, ctx, out);
+    walk(parsed, null, startOffset, ctx, out, rootKind);
   }
   return out;
 }
@@ -49,27 +50,38 @@ function walk(
   baseOffset: number,
   ctx: ComputeCtx,
   out: DecorationInfo[],
+  rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls);
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
     const offset = baseOffset + gf.nameOffset;
     const length = gf.nameLength;
 
     if (entry) {
       out.push({ offset, length, kind: entry.confidence });
-    } else if (parentCls) {
-      // Known parent, unknown field — clearly unresolved.
-      out.push({ offset, length, kind: 'unresolved' });
+    } else if (parentCls || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
+      // Known parent/root context, unknown field — clearly outside the query
+      // structure. Paint the whole subtree so gql-only noise stays in the
+      // source view instead of the backend structure view.
+      markUnresolvedSubtree(gf, baseOffset, out);
+      continue;
     }
-    // else: root-level no match — don't paint; avoid noise before scan settles.
+    // else: no schema root context yet — don't paint while scan settles.
 
     if (gf.children.length === 0) continue;
-    const childCls = entry && entry.field.resolvedType
-      ? ctx.classMap.get(entry.field.resolvedType) ?? null
-      : null;
-    if (childCls) walk(gf.children, childCls, baseOffset, ctx, out);
+    const childCls = entry ? resolveChildClass(entry.field, gf.name, ctx.classMap) : null;
+    if (childCls) walk(gf.children, childCls, baseOffset, ctx, out, rootKind);
   }
+}
+
+function markUnresolvedSubtree(gf: GqlField, baseOffset: number, out: DecorationInfo[]): void {
+  out.push({
+    offset: baseOffset + gf.nameOffset,
+    length: gf.nameLength,
+    kind: 'unresolved',
+  });
+  for (const child of gf.children) markUnresolvedSubtree(child, baseOffset, out);
 }
 
 function stripInterpolations(body: string): string {

@@ -79,7 +79,7 @@ Open a **side-by-side** panel that auto-follows the cursor inside any `gql`/`gra
 
 Open via **Django GraphQL: Open Live Query Structure** (Command Palette) or the icon in the Schema Explorer title bar.
 
-### Captain-style Graphene Patterns
+### Typed Graphene Patterns
 
 The parser understands modern graphene codebases that mix `@dataclass` types, `TypedField`, and `TypedDict`-based argument containers:
 
@@ -104,7 +104,7 @@ class RtccEmailEmailListQuery:
 - `list[X]` / `Optional[X]` / `X | None` / `Union[X, None]` unwrap to `X`
 - Python primitives (`str`/`int`/`float`/`bool`/`Decimal`/`UUID`/`datetime.*`) map to GraphQL scalars for leaf display
 - `**ArgsClass.__annotations__` / `**Unpack[ArgsClass]` expands to the class's annotation fields (including inherited TypedDict chains)
-- Mutation args come from `X.Field()` → `X.Arguments` / `X.TypedArguments` / `X.Input` (follows dotted inheritance like `TypedBaseMutation.TypedArguments`)
+- Mutation args come from `X.Field()` → `X.Arguments` / `X.TypedArguments` / `X.Input` (including dotted inheritance across nested typed argument classes)
 
 ## Supported Frameworks
 

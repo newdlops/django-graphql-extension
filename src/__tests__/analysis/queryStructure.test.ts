@@ -37,21 +37,19 @@ describe('buildQueryStructure (phase y)', () => {
     expect(byName.get('created_at')!.queried).toBe(false);
   });
 
-  it('retains gql-only fields as frontend-only nodes without inflating backend totals', () => {
+  it('omits gql-only fields from the backend structure without inflating totals', () => {
     const userType = cls('UserType', [f('id', 'Int'), f('name', 'String')]);
     const gf = firstRoot('query { user { id ghostField { nestedGhost } } }')!;
 
     const s = buildQueryStructure(gf, userType, new Map([[userType.name, userType]]));
     expect(s.totalCount).toBe(2);
     expect(s.queriedCount).toBe(1);
-    expect(s.frontendOnlyCount).toBe(2);
+    expect(s.frontendOnlyCount).toBe(0);
 
     const byName = new Map(s.rootField.children.map((c) => [c.name, c]));
-    const ghost = byName.get('ghost_field')!;
-    expect(ghost.frontendOnly).toBe(true);
-    expect(ghost.queried).toBe(true);
-    expect(ghost.children.map((c) => c.name)).toEqual(['nested_ghost']);
-    expect(ghost.children[0].frontendOnly).toBe(true);
+    expect(byName.has('ghost_field')).toBe(false);
+    expect(byName.has('id')).toBe(true);
+    expect(byName.has('name')).toBe(true);
   });
 
   it('expands nested types recursively up to the depth cap', () => {

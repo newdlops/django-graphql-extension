@@ -44,15 +44,14 @@ describe('renderQueryStructureJsonHtml (phase γ)', () => {
     expect(html).toMatch(/key-missing[^>]*>name</);
   });
 
-  it('renders gql-only fields with frontend-only classes and summary pill', () => {
+  it('omits gql-only fields from the rendered backend structure', () => {
     const user = cls('UserType', [f('id')]);
     const gf = parseGqlFields('query { user { id ghostField } }')[0];
     const s = buildQueryStructure(gf, user, new Map([[user.name, user]]));
     const html = renderQueryStructureJsonHtml(s);
 
-    expect(html).toContain('+ 1 frontend-only');
-    expect(html).toMatch(/key-frontend-only[^>]*>ghostField</);
-    expect(html).toMatch(/mark-f[^>]*>\+/);
+    expect(html).not.toContain('+ 1 frontend-only');
+    expect(html).not.toContain('ghostField');
   });
 
   it('nests <details> blocks for object-valued fields', () => {
@@ -118,7 +117,6 @@ describe('renderQueryStructureJsonHtml (phase γ)', () => {
     expect(QUERY_STRUCTURE_JSON_STYLES).toContain('.json-tree');
     expect(QUERY_STRUCTURE_JSON_STYLES).toContain('.key-queried');
     expect(QUERY_STRUCTURE_JSON_STYLES).toContain('.key-missing');
-    expect(QUERY_STRUCTURE_JSON_STYLES).toContain('.key-frontend-only');
     expect(QUERY_STRUCTURE_JSON_STYLES).toContain('block-lazy');
   });
 

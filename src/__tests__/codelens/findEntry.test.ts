@@ -59,7 +59,7 @@ describe('findEntry — strict parent filtering (phase n)', () => {
     expect(ts.some((t) => t.includes('TimestampMixin.created_at'))).toBe(true);
   });
 
-  it('flags root-level ambiguity with the inferred marker (~)', () => {
+  it('scopes root-level lookup to the operation kind', () => {
     // Both Query and Mutation expose a field named `user`.
     const userType = cls('UserType', [f('id')]);
     const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
@@ -71,11 +71,25 @@ describe('findEntry — strict parent filtering (phase n)', () => {
     const src = 'gql`query { user { id } }`;';
     const lenses = p.provideCodeLenses(new TextDocument(src) as any);
     const ts = titlesOf(lenses);
-    // The picked entry is Query.user (matches the outer `query` operation by kind)
-    // but it's still a guess — the CodeLens must mark it with `~`.
     const userLens = ts.find((t) => t.includes('.user'));
     expect(userLens).toBeDefined();
-    expect(userLens!.includes('~')).toBe(true);
+    expect(userLens).toBe('→ Query.user [Query]');
+    expect(userLens!.includes('~')).toBe(false);
+  });
+
+  it('does not resolve a root-level field from a regular object type', () => {
+    const profileType = cls('ProfileType', [f('id')]);
+    const userType = cls('UserType', [f('profile', 'Field', { resolvedType: 'ProfileType' })]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const p = makeProvider(new Map([
+      [profileType.name, profileType], [userType.name, userType], [query.name, query],
+    ]));
+
+    const src = 'gql`query { profile { id } }`;';
+    const lenses = p.provideCodeLenses(new TextDocument(src) as any);
+    const ts = titlesOf(lenses);
+    expect(ts.some((t) => t.includes('UserType.profile'))).toBe(false);
+    expect(ts.some((t) => t.includes('ProfileType.id'))).toBe(false);
   });
 
   it('does NOT add the ~ marker for unambiguous exact matches', () => {

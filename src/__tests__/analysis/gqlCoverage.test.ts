@@ -84,6 +84,19 @@ describe('computeQueryCoverage (phase q)', () => {
     expect(cov.get('UserType')).toEqual(new Set(['first_name', 'last_name']));
   });
 
+  it('reuses provider field-name inference when child resolvedType is missing', () => {
+    const investorType = cls('InvestorType', [f('id')]);
+    const query = cls('Query', [f('investors', 'Field')], 'query');
+    const classMap = new Map([[investorType.name, investorType], [query.name, query]]);
+
+    const cov = computeQueryCoverage(
+      ['query { investors { id } }'],
+      { classMap, schemaRoots: [query] },
+    );
+    expect(cov.get('Query')).toEqual(new Set(['investors']));
+    expect(cov.get('InvestorType')).toEqual(new Set(['id']));
+  });
+
   it('returns an empty map for gql bodies with no known roots', () => {
     const cov = computeQueryCoverage(
       ['query { unknownField { blah } }'],

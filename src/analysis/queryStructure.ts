@@ -90,6 +90,9 @@ function camelToSnake(s: string): string {
 /**
  * Build the complete expected tree for a given gql field, overlaying the
  * user's gql selection on top of the target class's schema.
+ * Fields that exist only in the user's gql are intentionally not added to
+ * this backend structure; editor diagnostics/decorations mark those source
+ * ranges instead, keeping this tree focused on backend fields.
  *
  * @param userField       the GqlField node the user is looking at (children are the queried subset)
  * @param rootCls         the class whose fields we're expanding (usually `userField`'s resolved type)
@@ -253,13 +256,10 @@ function expandClassFields(
     // Index the user's queried children by their snake_case name.
     const userBySnake = new Map<string, GqlField>();
     for (const gf of userChildren) userBySnake.set(camelToSnake(gf.name), gf);
-    const backendFieldNames = new Set<string>();
-
     const nodes: QueryStructureNode[] = [];
     for (const field of cls.fields) {
       // Hide synthetic markers like __relay_node__.
       if (field.name.startsWith('__') && field.name.endsWith('__')) continue;
-      backendFieldNames.add(field.name);
 
       const userSubfield = userBySnake.get(field.name);
       const queried = !!userSubfield;
@@ -311,10 +311,6 @@ function expandClassFields(
       });
     }
 
-    for (const [snakeName, userSubfield] of userBySnake) {
-      if (backendFieldNames.has(snakeName)) continue;
-      nodes.push(buildFrontendOnlyNode(userSubfield, cls.name, cls.filePath, cls.lineNumber));
-    }
     return nodes;
   } finally {
     ctx.expanding.delete(cls.name);
@@ -368,27 +364,4 @@ function buildArgs(
     });
   }
   return out;
-}
-
-function buildFrontendOnlyNode(
-  gf: GqlField,
-  ownerClass: string,
-  filePath: string,
-  lineNumber: number,
-): QueryStructureNode {
-  return {
-    name: camelToSnake(gf.name),
-    displayName: gf.name,
-    typeLabel: '?',
-    resolvedType: undefined,
-    resolvedTypeKnown: false,
-    queried: true,
-    frontendOnly: true,
-    args: buildArgs(undefined, gf.argNames),
-    children: gf.children.map((child) => buildFrontendOnlyNode(child, ownerClass, filePath, lineNumber)),
-    hasMoreChildren: false,
-    ownerClass,
-    filePath,
-    lineNumber,
-  };
 }

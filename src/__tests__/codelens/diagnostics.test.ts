@@ -50,6 +50,17 @@ describe('computeDiagnostics (phase v)', () => {
     expect(diags).toEqual([]);
   });
 
+  it('reports root fields that only exist on regular types, not schema roots', () => {
+    const userType = cls('UserType', [f('profile', 'Field', { resolvedType: 'ProfileType' })]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = 'gql`query { profile { id } }`;';
+    const diags = computeDiagnostics(src, ctx);
+    expect(diags).toHaveLength(1);
+    expect(diags[0].message).toContain("No root query field 'profile'");
+  });
+
   it('walks into children and reports unresolved there too', () => {
     const userType = cls('UserType', [f('id')]);
     const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
@@ -59,6 +70,18 @@ describe('computeDiagnostics (phase v)', () => {
     const diags = computeDiagnostics(src, ctx);
     expect(diags).toHaveLength(1);
     expect(diags[0].message).toContain('totally_not_real');
+  });
+
+  it('follows provider field-name inference before checking nested unresolved fields', () => {
+    const investorType = cls('InvestorType', [f('id')]);
+    const query = cls('Query', [f('investors', 'Field')], 'query');
+    const ctx = ctxFromClasses([investorType, query]);
+
+    const src = 'gql`query { investors { bogus } }`;';
+    const diags = computeDiagnostics(src, ctx);
+    expect(diags).toHaveLength(1);
+    expect(diags[0].message).toContain('InvestorType');
+    expect(diags[0].message).toContain('bogus');
   });
 
   it('does not flag fields on unknown parent types (no context to check against)', () => {

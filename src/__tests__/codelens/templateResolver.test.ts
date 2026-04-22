@@ -68,8 +68,8 @@ describe('resolveTemplateAtCursor (phase δ)', () => {
 
     const src = 'gql`{ user { id } }`;';
     const tpl = resolveTemplateAtCursor(src, src.indexOf('user'), ctx)!;
-    // With no operation keyword, kind defaults to 'unknown' but roots are still there.
-    expect(tpl.operationKind).toBe('unknown');
+    // GraphQL anonymous operations are queries.
+    expect(tpl.operationKind).toBe('query');
     expect(tpl.operationName).toBeUndefined();
     expect(tpl.roots).toHaveLength(1);
     expect(tpl.roots[0].gqlField.name).toBe('user');
@@ -85,6 +85,16 @@ describe('resolveTemplateAtCursor (phase δ)', () => {
     expect(tpl.operationKind).toBe('mutation');
     expect(tpl.operationName).toBe('CreateUser');
     expect(tpl.roots[0].targetClass?.name).toBe('UserType');
+  });
+
+  it('applies provider field-name inference when a root field has no resolvedType', () => {
+    const investorType = cls('InvestorType', [f('id')]);
+    const query = cls('Query', [f('investors', 'Field')], 'query');
+    const ctx = ctxFor([investorType, query]);
+
+    const src = 'gql`query { investors { id } }`;';
+    const tpl = resolveTemplateAtCursor(src, src.indexOf('investors') + 1, ctx)!;
+    expect(tpl.roots[0].targetClass?.name).toBe('InvestorType');
   });
 
   it('parses operation-level variables (captain pattern with comma-less list)', () => {

@@ -44,7 +44,7 @@ describe('computeInlayHints (phase u)', () => {
     expect(idHint.offset).toBe(idAt + 2);
   });
 
-  it('marks ambiguous root-level matches with the ~ prefix', () => {
+  it('scopes root-level matches by operation kind', () => {
     const userType = cls('UserType', [f('id')]);
     const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
     const mut = cls('Mutation', [f('user', 'Field', { resolvedType: 'UserType' })], 'mutation');
@@ -53,8 +53,20 @@ describe('computeInlayHints (phase u)', () => {
     const src = 'gql`query { user { id } }`;';
     const hints = computeInlayHints(src, ctx);
     const userHint = hints.find((h) => h.tooltip.includes('.user'))!;
-    expect(userHint.label).toContain('~');
-    expect(userHint.confidence).toBe('inferred');
+    expect(userHint.label).not.toContain('~');
+    expect(userHint.confidence).toBe('exact');
+  });
+
+  it('emits `→ ?` for root fields that only exist on regular types', () => {
+    const userType = cls('UserType', [f('profile', 'Field', { resolvedType: 'ProfileType' })]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = 'gql`query { profile { id } }`;';
+    const hints = computeInlayHints(src, ctx);
+    const profileHint = hints.find((h) => h.tooltip.includes('root query field named'))!;
+    expect(profileHint.label).toBe(' → ?');
+    expect(profileHint.confidence).toBe('unresolved');
   });
 
   it('emits `→ ?` when parent is known but field does not belong to it', () => {
@@ -83,6 +95,16 @@ describe('computeInlayHints (phase u)', () => {
     expect(labels).toContain(' → StockType');
     expect(labels).toContain(' → CompanyType');
     expect(labels).not.toContain(' → String'); // `name` wasn't reached
+  });
+
+  it('reuses provider field-name inference for nested child hints', () => {
+    const investorType = cls('InvestorType', [f('id', 'Int')]);
+    const query = cls('Query', [f('investors', 'Field')], 'query');
+    const ctx = ctxFromClasses([investorType, query]);
+
+    const src = 'gql`query { investors { id } }`;';
+    const hints = computeInlayHints(src, ctx);
+    expect(hints.some((h) => h.label === ' → Int')).toBe(true);
   });
 
   it('carries a target location pointing at the resolved class file', () => {

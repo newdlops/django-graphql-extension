@@ -40,15 +40,15 @@ describe('renderQueryStructureHtml (phase y)', () => {
     expect(html).toMatch(/row[^"]*missing[^"]*"[^>]*>[\s\S]*?name\b/);
   });
 
-  it('renders gql-only fields as blue frontend-only rows', () => {
+  it('omits gql-only fields from the backend structure view', () => {
     const user = cls('UserType', [f('id')]);
     const gf = parseGqlFields('query { user { id ghostField } }')[0];
     const struct = buildQueryStructure(gf, user, new Map([[user.name, user]]));
     const html = renderQueryStructureHtml(struct);
 
-    expect(html).toContain('+ 1 frontend-only');
-    expect(html).toMatch(/row[^"]*frontend-only[^"]*"[^>]*>[\s\S]*?ghostField\b/);
-    expect(html).toContain('Blue = present only in your gql');
+    expect(html).not.toContain('+ 1 frontend-only');
+    expect(html).not.toContain('ghostField');
+    expect(html).not.toContain('Blue = present only in your gql');
   });
 
   it('expands nested types recursively so a missing branch still shows its subfields', () => {

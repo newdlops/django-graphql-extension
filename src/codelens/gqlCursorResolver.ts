@@ -1,6 +1,6 @@
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments } from './gqlCodeLensProvider';
-import { FieldIndex, findEntry, MatchedEntry } from './gqlResolver';
+import { FieldIndex, RootOperationKind, findEntry, MatchedEntry, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
 
 export interface CursorContext {
   /** The gql field the cursor is inside (innermost). */
@@ -35,7 +35,7 @@ export interface OperationVariable {
 }
 
 export interface TemplateContext {
-  operationKind: 'query' | 'mutation' | 'subscription' | 'unknown';
+  operationKind: RootOperationKind;
   operationName?: string;
   /** Variables declared in the operation's `(...)` header. Empty when absent. */
   operationVariables: OperationVariable[];
@@ -78,17 +78,17 @@ export function resolveTemplateAtCursor(
     const parsed = parseGqlFields(gqlBody, docFragments);
 
     // Detect the operation keyword and its name.
-    const opMatch = gqlBody.match(/^\s*(query|mutation|subscription)\b\s*(\w+)?/);
-    const operationKind = (opMatch?.[1] as TemplateContext['operationKind']) ?? 'unknown';
-    const operationName = opMatch?.[2];
+    const opMatch = /(^|[^A-Za-z_0-9])(query|mutation|subscription)\b\s*(\w+)?/.exec(gqlBody);
+    const operationKind = readRootOperationKindFromGql(gqlBody);
+    const operationName = opMatch?.[3];
     const operationVariables = parseOperationVariables(gqlBody);
 
     const roots: TemplateRoot[] = parsed.map((gf) => {
       const snake = camelToSnake(gf.name);
-      const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, null);
-      const target = match?.field.resolvedType
-        ? ctx.classMap.get(match.field.resolvedType) ?? undefined
-        : match?.cls;
+      const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, null, { rootKind: operationKind });
+      const target = match
+        ? resolveChildClass(match.field, gf.name, ctx.classMap) ?? (match.field.resolvedType ? undefined : match.cls)
+        : undefined;
       return { gqlField: gf, match, targetClass: target };
     });
 
@@ -216,9 +216,10 @@ export function resolveFieldAtCursor(
     const rawBody = text.substring(bodyStart, bodyEnd);
     const gqlBody = stripInterpolations(rawBody);
     const parsed = parseGqlFields(gqlBody, docFragments);
+    const rootKind = readRootOperationKindFromGql(gqlBody);
 
     const bodyOffset = cursorOffset - bodyStart;
-    const walked = walkForCursor(parsed, null, bodyOffset, ctx);
+    const walked = walkForCursor(parsed, null, bodyOffset, ctx, rootKind);
     if (walked) return { ...walked, bodyStart };
     return null;
   }
@@ -236,6 +237,7 @@ function walkForCursor(
   parentCls: ClassInfo | null,
   cursorInBody: number,
   ctx: ResolveCtx,
+  rootKind: RootOperationKind,
 ): PartialCtx | null {
   let last: PartialCtx | null = null;
   for (const gf of fields) {
@@ -247,14 +249,12 @@ function walkForCursor(
     if (cursorInBody < fieldStart || cursorInBody > fieldEnd) continue;
 
     const snake = camelToSnake(gf.name);
-    const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls);
+    const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
     if (!match) continue;
 
     // The target class to visualize is the field's resolvedType (if known),
     // or the owning class otherwise.
-    const target = match.field.resolvedType
-      ? ctx.classMap.get(match.field.resolvedType) ?? null
-      : null;
+    const target = resolveChildClass(match.field, gf.name, ctx.classMap);
     // Without a resolved type we still want to show SOMETHING — fall back to
     // the match's own owning class so the user sees its fields.
     const targetClass = target ?? match.cls;
@@ -263,7 +263,7 @@ function walkForCursor(
 
     // If children exist and cursor is INSIDE them, descend — inner match wins.
     if (gf.children.length > 0) {
-      const nested = walkForCursor(gf.children, target, cursorInBody, ctx);
+      const nested = walkForCursor(gf.children, target, cursorInBody, ctx, rootKind);
       if (nested) return nested;
     }
   }

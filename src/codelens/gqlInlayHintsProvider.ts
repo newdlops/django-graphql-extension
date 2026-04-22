@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake } from './gqlCodeLensProvider';
-import { FieldIndex, findEntry, MatchedEntry } from './gqlResolver';
+import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, MatchedEntry, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
 
 /** Serializable inlay-hint description — pure output of computeInlayHints. */
 export interface InlayHintInfo {
@@ -42,8 +42,9 @@ export function computeInlayHints(text: string, ctx: ComputeCtx): InlayHintInfo[
     const rawBody = text.substring(startOffset, endOffset);
     const gqlBody = stripInterpolations(rawBody);
     const parsed = parseGqlFields(gqlBody);
+    const rootKind = readRootOperationKindFromGql(gqlBody);
 
-    walkHints(parsed, null, startOffset, ctx, hints);
+    walkHints(parsed, null, startOffset, ctx, hints, rootKind);
   }
   return hints;
 }
@@ -54,10 +55,11 @@ function walkHints(
   baseOffset: number,
   ctx: ComputeCtx,
   out: InlayHintInfo[],
+  rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls);
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
 
     const hintOffset = baseOffset + gf.nameOffset + gf.nameLength;
     if (entry) {
@@ -70,21 +72,21 @@ function walkHints(
         confidence: entry.confidence,
         target: resolveTarget(entry, ctx.classMap),
       });
-    } else if (parentCls) {
-      // Parent was known but field didn't belong to it — visible ? so users know.
+    } else if (parentCls || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
+      // Parent/root was known but field didn't belong to it — visible ? so users know.
       out.push({
         offset: hintOffset,
         label: ' → ?',
-        tooltip: `No field named '${snake}' on ${parentCls.name} (or its ancestors)`,
+        tooltip: parentCls
+          ? `No field named '${snake}' on ${parentCls.name} (or its ancestors)`
+          : `No root ${rootKind} field named '${snake}' in the schema`,
         confidence: 'unresolved',
       });
     }
 
     if (gf.children.length === 0) continue;
-    const childCls = entry && entry.field.resolvedType
-      ? ctx.classMap.get(entry.field.resolvedType) ?? null
-      : null;
-    if (childCls) walkHints(gf.children, childCls, baseOffset, ctx, out);
+    const childCls = entry ? resolveChildClass(entry.field, gf.name, ctx.classMap) : null;
+    if (childCls) walkHints(gf.children, childCls, baseOffset, ctx, out, rootKind);
   }
 }
 

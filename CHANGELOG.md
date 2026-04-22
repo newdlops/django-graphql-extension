@@ -3,10 +3,10 @@
 ## 0.0.2 — 2026-04-18
 
 ### Highlights
-- Full support for the Captain-style `TypedField` + `@dataclass` pattern (annotation-based fields, TypedDict arg unpacking, `list[X]` / `X | None` / `Union[X, None]` type syntax).
+- Full support for annotation-based `TypedField` + `@dataclass` patterns (annotation-based fields, TypedDict arg unpacking, `list[X]` / `X | None` / `Union[X, None]` type syntax).
 - Cross-literal fragment spreads — `${FRAGMENT_VAR}` in one gql template resolves to a `fragment` defined in another literal.
 - Live Query Inspector now shows the operation's variable declarations (`query X($companyId: ID!, …)`), the exact arguments the user passed on each field (not every backend arg), and supports **lazy deeper expansion** — click the blue ▸ on truncated subtrees to load another two levels on demand.
-- Mutation arguments are pulled from the mutation class's nested `Arguments` / `TypedArguments` / `Input` class, including dotted-path inheritance (`TypedBaseMutation.TypedArguments`).
+- Mutation arguments are pulled from the mutation class's nested `Arguments` / `TypedArguments` / `Input` class, including dotted-path inheritance across nested typed argument classes.
 - New Activity Bar / marketplace icons (GraphQL-style pink hexagon).
 - New command **Django GraphQL: Clear Parse Cache** for forcing a fresh re-scan after an upgrade or unusual result.
 
@@ -15,7 +15,7 @@
 - **Python typing syntax** (`list[X]` / `List[X]` / `Optional[X]` / `Sequence[X]` / `Tuple[X]` / `dict[K, V]` / `Annotated[X, …]` / `typing.*` / `X | None` / `Union[X, None]`) — all unwrap to the payload type.
 - **Python primitive → GraphQL scalar mapping** (`str → String`, `int → Int`, `float → Float`, `bool → Boolean`, `Decimal → Decimal`, `UUID → ID`, `datetime.datetime → DateTime`, `datetime.date → Date`, `datetime.time → Time`) so dataclass leaves render a meaningful type instead of `DataclassField`.
 - **TypedDict unpacking**: `TypedField(Ret, **ArgsClass.__annotations__)` / `**Unpack[ArgsClass]` resolves `ArgsClass` (including nested inside a query class) and inlines its annotations as field args. Follows TypedDict inheritance chains.
-- **Mutation args**: `field = X.Field()` pulls its args from `X`'s nested `Arguments` / `TypedArguments` / `Input` class. Handles both graphene-style `name = String(required=True)` assignment fields and captain-style `name: Type` annotation fields. Follows dotted inheritance like `TypedBaseMutation.TypedArguments`.
+- **Mutation args**: `field = X.Field()` pulls its args from `X`'s nested `Arguments` / `TypedArguments` / `Input` class. Handles both graphene-style `name = String(required=True)` assignment fields and annotation-based `name: Type` fields. Follows dotted inheritance across nested typed argument classes.
 - **Nested classes** are now captured in the class index (needed for TypedDict arg containers). Proximity resolution prefers **top-level** classes over nested ones so a test double's `class Query(ObjectType)` no longer shadows the real production `Query`.
 - **Multi-line `Meta.fields = [...]` / `fields = (...)`** lists are collected across line breaks.
 - **List-shape detection** on Pattern 1 fields — `TypedField(list[X])` / `Field(List(X))` / `NonNull(List(X))` / `lambda: List(X)` all report `fieldType: 'List'` so the UI renders `[X]` brackets.

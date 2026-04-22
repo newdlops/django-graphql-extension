@@ -189,7 +189,7 @@ export class LiveQueryInspector {
 <div id="content">
   <div class="empty">No gql field under cursor yet.</div>
 </div>
-<div class="legend">Green ✓ = queried · Red ✗ = available on the backend but missing from your gql · Blue + = present only in your gql and not found in the backend schema · Gray italic = type not in the indexed schema · Click <code>▾</code>/<code>▸</code> to collapse or expand · Blue <code>▸</code> loads deeper fields on first open.</div>
+<div class="legend">Green ✓ = queried · Red ✗ = available on the backend but missing from your gql · Unresolved gql fields are highlighted in the source editor · Gray italic = type not in the indexed schema · Click <code>▾</code>/<code>▸</code> to collapse or expand · Blue <code>▸</code> loads deeper fields on first open.</div>
 <script>
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
   const header = document.getElementById('header');

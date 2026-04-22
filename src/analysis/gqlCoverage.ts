@@ -1,5 +1,6 @@
 import { ClassInfo, FieldInfo } from '../types';
 import { camelToSnake, parseGqlFields, GqlField, FragmentDef, collectDocumentFragments } from '../codelens/gqlCodeLensProvider';
+import { resolveChildClass } from '../codelens/gqlResolver';
 
 /** A multimap: class name → set of field names that at least one active gql query walked through. */
 export type CoverageMap = Map<string, Set<string>>;
@@ -64,9 +65,7 @@ function walk(
     }
 
     if (gf.children.length === 0) continue;
-    const childCls = resolved.field.resolvedType
-      ? opts.classMap.get(resolved.field.resolvedType) ?? null
-      : null;
+    const childCls = resolveChildClass(resolved.field, gf.name, opts.classMap);
     // If the child type is unknown, do NOT recurse into children — mirrors
     // the phase (j) CodeLens rule so we don't mis-record coverage.
     if (childCls) walk(gf.children, childCls, opts, coverage);
