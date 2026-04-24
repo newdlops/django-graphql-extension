@@ -40,6 +40,67 @@ describe('renderQueryStructureHtml (phase y)', () => {
     expect(html).toMatch(/row[^"]*missing[^"]*"[^>]*>[\s\S]*?name\b/);
   });
 
+  it('renders fragment-sourced fields with .fragment class and a fragment badge', () => {
+    // Fields that came in via `...UserFields` should NOT look identical to
+    // directly-queried fields — the user asked for a distinct visual signal
+    // so they can tell at a glance what is contributed by which fragment.
+    const user = cls('UserType', [f('id'), f('name'), f('email')]);
+    const gql = `
+      fragment UserFields on UserType {
+        name
+        email
+      }
+      query Q {
+        user {
+          id
+          ...UserFields
+        }
+      }
+    `;
+    const gf = parseGqlFields(gql)[0];
+    const struct = buildQueryStructure(gf, user, new Map([[user.name, user]]));
+    const html = renderQueryStructureHtml(struct);
+
+    // Scan each row independently so each assertion sees only that row's classes.
+    const rowRe = /<div class="(row[^"]*)"[^>]*>([\s\S]*?)<\/div>/g;
+    const rowByField = new Map<string, string>();
+    let match: RegExpExecArray | null;
+    while ((match = rowRe.exec(html)) !== null) {
+      const classes = match[1];
+      const inner = match[2];
+      const field = /<span class="field-name[^"]*"[^>]*>([^<]+)<\/span>/.exec(inner)?.[1];
+      if (field) rowByField.set(field, classes);
+    }
+
+    expect(rowByField.get('id')?.split(' ')).toContain('queried');
+    const nameClasses = rowByField.get('name')?.split(' ') ?? [];
+    const emailClasses = rowByField.get('email')?.split(' ') ?? [];
+    expect(nameClasses).toContain('fragment');
+    expect(nameClasses).not.toContain('missing');
+    expect(emailClasses).toContain('fragment');
+    expect(emailClasses).not.toContain('missing');
+    // Each fragment row gets a visible "UserFields" badge so the origin is traceable.
+    expect(html).toContain('class="fragment-badge"');
+    expect(html).toContain('>UserFields<');
+  });
+
+  it('round-trips fromFragment through serialize / hydrate for the command channel', () => {
+    // The CodeLens "Show missing fields" command passes a GqlFieldLite over
+    // the VSCode command bus. If serialization dropped the fragment tag the
+    // webview would render fragment fields in generic green and we'd lose
+    // the visual distinction.
+    const gql = `
+      fragment UserFields on T { name }
+      query Q { user { id ...UserFields } }
+    `;
+    const gf = parseGqlFields(gql)[0];
+    const lite = serializeGqlField(gf);
+    const rehydrated = hydrateGqlField(lite);
+    const byName = new Map(rehydrated.children.map((c) => [c.name, c] as const));
+    expect(byName.get('id')!.fromFragment).toBeUndefined();
+    expect(byName.get('name')!.fromFragment).toBe('UserFields');
+  });
+
   it('omits gql-only fields from the backend structure view', () => {
     const user = cls('UserType', [f('id')]);
     const gf = parseGqlFields('query { user { id ghostField } }')[0];

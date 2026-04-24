@@ -44,6 +44,33 @@ describe('renderQueryStructureJsonHtml (phase γ)', () => {
     expect(html).toMatch(/key-missing[^>]*>name</);
   });
 
+  it('distinguishes fragment-sourced fields with a purple class + fragment name badge', () => {
+    // Parity with the Query Structure webview panel: `...UserFields` fields
+    // land on `.key-fragment` rows with a trailing `.frag-badge` showing
+    // which fragment contributed them. The header also picks up a summary
+    // pill counting the fragment-sourced fields.
+    const user = cls('UserType', [f('id'), f('name'), f('email')]);
+    const gql = [
+      'fragment UserFields on UserType { name email }',
+      'query Q { user { id ...UserFields } }',
+    ].join('\n');
+    const gf = parseGqlFields(gql)[0];
+    const s = buildQueryStructure(gf, user, new Map([[user.name, user]]));
+    const html = renderQueryStructureJsonHtml(s);
+
+    // Direct `id` stays on the generic queried class, not fragment.
+    expect(html).toMatch(/key-queried[^"]*"[^>]*>id</);
+    // Fragment-sourced fields use the distinct `key-fragment` class.
+    expect(html).toMatch(/key-fragment[^"]*"[^>]*>name</);
+    expect(html).toMatch(/key-fragment[^"]*"[^>]*>email</);
+    // And each carries a visible badge naming its origin fragment.
+    expect(html).toContain('class="frag-badge"');
+    expect(html).toContain('>UserFields</span>');
+    // Header pill summarizes fragment contribution so the user notices at a glance.
+    expect(html).toContain('pill-frag');
+    expect(html).toMatch(/2 via 1 fragment/);
+  });
+
   it('omits gql-only fields from the rendered backend structure', () => {
     const user = cls('UserType', [f('id')]);
     const gf = parseGqlFields('query { user { id ghostField } }')[0];

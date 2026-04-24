@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
-import { parseGqlFields, GqlField, camelToSnake } from './gqlCodeLensProvider';
+import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, mergeFragments, expandGqlBody, FragmentDef } from './gqlCodeLensProvider';
 import {
   FieldIndex,
   RootOperationKind,
@@ -8,6 +8,7 @@ import {
   collectRootFieldNames,
   findEntry,
   hasSchemaRootForOperation,
+  readFragmentContextFromGql,
   readRootOperationKindFromGql,
   resolveChildClass,
 } from './gqlResolver';
@@ -25,6 +26,8 @@ export interface DiagnosticInfo {
 interface ComputeCtx {
   classMap: Map<string, ClassInfo>;
   fieldIndex: FieldIndex;
+  workspaceFragments?: Map<string, FragmentDef>;
+  workspaceConstBodies?: Map<string, string>;
 }
 
 /**
@@ -36,6 +39,7 @@ interface ComputeCtx {
 export function computeDiagnostics(text: string, ctx: ComputeCtx): DiagnosticInfo[] {
   if (ctx.fieldIndex.size === 0) return [];
   const out: DiagnosticInfo[] = [];
+  const docFragments = mergeFragments(ctx.workspaceFragments, collectDocumentFragments(text));
   const gqlRegex = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
   let m: RegExpExecArray | null;
 
@@ -47,10 +51,20 @@ export function computeDiagnostics(text: string, ctx: ComputeCtx): DiagnosticInf
     if (endOffset === -1) continue;
 
     const rawBody = text.substring(startOffset, endOffset);
-    const gqlBody = stripInterpolations(rawBody);
-    const parsed = parseGqlFields(gqlBody);
+    const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
+    const parsed = parseGqlFields(gqlBody, docFragments);
+    const fragCtx = readFragmentContextFromGql(gqlBody);
+    // For fragment-only literals, walk the selection set as children of the
+    // `on Type` class. If the target type isn't in the schema index yet,
+    // skip this literal instead of falling through to root-level matching —
+    // otherwise we'd flag legitimate fields as "no root query field …".
+    if (fragCtx) {
+      const fragCls = ctx.classMap.get(fragCtx.onType);
+      if (!fragCls) continue;
+      walk(parsed, fragCls, startOffset, ctx, out, 'unknown');
+      continue;
+    }
     const rootKind = readRootOperationKindFromGql(gqlBody);
-
     walk(parsed, null, startOffset, ctx, out, rootKind);
   }
   return out;

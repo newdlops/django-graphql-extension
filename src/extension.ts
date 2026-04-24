@@ -13,7 +13,7 @@ import { ClassInfo } from './types';
 import { log, info } from './logger';
 import { prepareDocumentGql } from './analysis/gqlCoverage';
 import { buildQueryStructure, buildLazySubtree } from './analysis/queryStructure';
-import { scanFrontendGqlUsages } from './analysis/frontendGqlUsage';
+import { scanFrontendGqlUsages, scanWorkspaceFragments } from './analysis/frontendGqlUsage';
 import { renderQueryStructureHtml, renderSubtreeNodesHtml } from './preview/queryStructureWebview';
 import { hydrateGqlField, GqlFieldLite } from './codelens/gqlCodeLensProvider';
 import { LiveQueryInspector } from './preview/liveQueryInspector';
@@ -142,7 +142,10 @@ export function activate(context: vscode.ExtensionContext) {
     const __tScan = performance.now() - __tScanStart;
 
     const __tFrontendStart = performance.now();
-    const frontendUsages = await scanFrontendGqlUsages();
+    const [frontendUsages, workspaceFragments] = await Promise.all([
+      scanFrontendGqlUsages(),
+      scanWorkspaceFragments(),
+    ]);
     const __tFrontend = performance.now() - __tFrontendStart;
 
     log(`[refresh] === SCHEMAS (${allSchemas.length}) ===`);
@@ -150,7 +153,7 @@ export function activate(context: vscode.ExtensionContext) {
       log(`[refresh]   ${schema.name}: Q=${schema.queries.length} M=${schema.mutations.length} T=${schema.types.length}`);
     }
 
-    log(`[refresh] Frontend gql files: ${frontendUsages.length}`);
+    log(`[refresh] Frontend gql files: ${frontendUsages.length}, workspace fragments: ${workspaceFragments.fragments.size}, gql consts: ${workspaceFragments.constBodies.size}`);
     viewProvider.updateSchemas(allSchemas, frontendUsages);
 
     // Build classMap for CodeLens
@@ -164,6 +167,7 @@ export function activate(context: vscode.ExtensionContext) {
     const __tClassMap = performance.now() - __tClassMapStart;
 
     codeLensProvider.updateIndex(classMap);
+    codeLensProvider.updateWorkspaceFragments(workspaceFragments);
     // After the CodeLens index's debounced rebuild, poke the InlayHints
     // provider so it re-queries getSharedState() and repaints.
     setTimeout(() => inlayHintsProvider.refresh(), 250);
@@ -172,7 +176,7 @@ export function activate(context: vscode.ExtensionContext) {
     info(
       `[timing] doRefresh total=${r(performance.now() - __tTotalStart)}ms ` +
       `detect=${r(__tDetect)}ms scan=${r(__tScan)}ms frontend=${r(__tFrontend)}ms ` +
-      `classMap=${r(__tClassMap)}ms(n=${classMap.size}) ` +
+      `classMap=${r(__tClassMap)}ms(n=${classMap.size}) fragments=${workspaceFragments.fragments.size} constBodies=${workspaceFragments.constBodies.size} ` +
       `(codeLens index build runs async after 200ms debounce)`,
     );
   }
@@ -180,6 +184,32 @@ export function activate(context: vscode.ExtensionContext) {
   const refreshCommand = vscode.commands.registerCommand(
     'djangoGraphqlExplorer.refresh',
     () => refresh(),
+  );
+
+  // Diagnostic: opens an editor with the current workspace fragment index so
+  // users can see which fragment names were picked up (and whether a specific
+  // fragment they expect is missing, which usually points at a glob / workspace
+  // folder mismatch rather than a parser bug).
+  const dumpFragmentsCommand = vscode.commands.registerCommand(
+    'djangoGraphqlExplorer.dumpFragmentIndex',
+    async () => {
+      const { workspaceFragments, workspaceConstBodies } = codeLensProvider.getSharedState();
+      const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+      const fragNames = [...workspaceFragments.keys()].sort();
+      const constNames = [...workspaceConstBodies.keys()].sort();
+      const body = [
+        `Workspace folders (${folders.length}):`,
+        ...folders.map((f) => `  ${f}`),
+        '',
+        `Fragment names (${fragNames.length}):`,
+        ...fragNames.map((n) => `  ${n}`),
+        '',
+        `gql const identifiers (${constNames.length}):`,
+        ...constNames.map((n) => `  ${n}`),
+      ].join('\n');
+      const doc = await vscode.workspace.openTextDocument({ content: body, language: 'plaintext' });
+      await vscode.window.showTextDocument(doc, { preview: false });
+    },
   );
 
   // Drops every cached file entry from globalState and re-runs a full scan.
@@ -332,7 +362,15 @@ export function activate(context: vscode.ExtensionContext) {
       viewProvider.setActiveGqlBodies([]);
       return;
     }
-    const { bodies, fragments } = prepareDocumentGql(editor.document.getText());
+    // Pass the workspace-wide fragment + const index so the Schema Explorer
+    // sidebar resolves cross-file `...FragName` spreads the same way the
+    // CodeLens path does. Without this, fragment-inlined fields would show
+    // as "missing" in the sidebar even though the query clearly uses them.
+    const { workspaceFragments, workspaceConstBodies } = codeLensProvider.getSharedState();
+    const { bodies, fragments } = prepareDocumentGql(editor.document.getText(), {
+      fragments: workspaceFragments,
+      constBodies: workspaceConstBodies,
+    });
     viewProvider.setActiveGqlBodies(bodies, fragments);
     diagnosticsManager.scheduleRefresh(editor.document);
     decorationManager.scheduleRefresh(editor);
@@ -359,6 +397,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     refreshCommand,
+    dumpFragmentsCommand,
     clearCacheCommand,
     inspectTypeCommand,
     openLiveInspectorCommand,

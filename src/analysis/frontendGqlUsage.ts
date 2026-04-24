@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { parseGqlFields } from '../codelens/gqlCodeLensProvider';
+import { parseGqlFields, collectDocumentFragments, FragmentDef } from '../codelens/gqlCodeLensProvider';
+import { log } from '../logger';
 
 export interface FrontendGqlOperation {
   kind: 'query' | 'mutation' | 'subscription' | 'fragment' | 'anonymous';
@@ -62,6 +63,104 @@ export async function scanFrontendGqlUsages(): Promise<FrontendGqlFileUsage[]> {
   return results
     .filter((usage): usage is FrontendGqlFileUsage => !!usage)
     .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+/**
+ * Result of a workspace-wide frontend fragment scan.
+ *
+ * Two complementary indexes are built in the same pass:
+ * - `fragments` — fragment NAME → FragmentDef, for spread resolution when
+ *   the query body's parser encounters `...FragName` and wants to inline it.
+ * - `constBodies` — JS const NAME → raw gql template body text, so providers
+ *   can expand `${MY_FRAGMENT}` interpolations into their fragment text at
+ *   parse time (what graphql-tag does at runtime). This makes fragment
+ *   resolution robust even when by-name lookup misses: the inlined text
+ *   becomes local to the expanded body, and `collectFragmentDefsFromSource`
+ *   picks up the fragment directly.
+ */
+export interface WorkspaceFragmentIndex {
+  fragments: Map<string, FragmentDef>;
+  constBodies: Map<string, string>;
+}
+
+/**
+ * Harvest every `fragment Name on Type { ... }` definition AND every
+ * `const NAME = gql\`...\`` template body from every gql literal in every
+ * frontend file in the workspace. Supports both the `...FragName` spread
+ * path (`fragments`) and the `${CONST}` interpolation path (`constBodies`).
+ *
+ * Each `FragmentDef`'s `source` is the originating file's gql body and
+ * `bodyStart` points at the opening brace within that body. First occurrence
+ * (by sorted path) wins on duplicates, both for fragment names and const
+ * names, so builds are deterministic.
+ */
+export async function scanWorkspaceFragments(): Promise<WorkspaceFragmentIndex> {
+  const uris = await vscode.workspace.findFiles(FRONTEND_GQL_GLOB, FRONTEND_GQL_EXCLUDE);
+  const candidates = uris
+    .filter((uri) => isFrontendCandidate(uri.fsPath))
+    .sort((a, b) => a.fsPath.localeCompare(b.fsPath));
+  log(`[fragments] findFiles returned ${uris.length} URIs, ${candidates.length} pass the candidate filter`);
+  if (candidates.length === 0) {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    log(`[fragments] NO candidates. Workspace folders: ${JSON.stringify(folders)}`);
+  }
+
+  let readFailures = 0;
+  const perFile = await Promise.all(candidates.map(async (uri) => {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString('utf-8');
+      return {
+        fragments: collectDocumentFragments(text),
+        constBodies: collectConstGqlBodies(text),
+      };
+    } catch {
+      readFailures++;
+      return { fragments: new Map<string, FragmentDef>(), constBodies: new Map<string, string>() };
+    }
+  }));
+  if (readFailures > 0) log(`[fragments] read failed for ${readFailures}/${candidates.length} files`);
+
+  // Merge in deterministic order so duplicate names resolve consistently.
+  const mergedFragments = new Map<string, FragmentDef>();
+  const mergedConstBodies = new Map<string, string>();
+  for (const { fragments, constBodies } of perFile) {
+    for (const [name, def] of fragments) {
+      if (!mergedFragments.has(name)) mergedFragments.set(name, def);
+    }
+    for (const [name, body] of constBodies) {
+      if (!mergedConstBodies.has(name)) mergedConstBodies.set(name, body);
+    }
+  }
+  log(`[fragments] merged ${mergedFragments.size} unique fragment name(s), ${mergedConstBodies.size} gql const body(ies) across workspace`);
+  return { fragments: mergedFragments, constBodies: mergedConstBodies };
+}
+
+/**
+ * Scan a TS/JS file for `const NAME = gql\`...\`` assignments (with optional
+ * `export` and optional `: TypeAnnotation`). Returns a map from the JS
+ * identifier to the gql template body text (everything between the
+ * backticks, unmodified — callers strip / expand as needed).
+ *
+ * First assignment wins on duplicate const names, matching the "first
+ * definition wins" rule used elsewhere in the scanner.
+ */
+function collectConstGqlBodies(docText: string): Map<string, string> {
+  const out = new Map<string, string>();
+  // `export const NAME[: typeof FOO_DOC] = gql\`` — capture NAME, then walk
+  // from the opening backtick to the matching close to get the body.
+  const re = /(?:export\s+)?const\s+([A-Za-z_][\w$]*)\s*(?::[^=]*?)?\s*=\s*(?:gql|graphql)\s*`/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(docText)) !== null) {
+    const constName = m[1];
+    const bodyStart = m.index + m[0].length;
+    const bodyEnd = findTemplateEnd(docText, bodyStart);
+    if (bodyEnd === -1) continue;
+    if (!out.has(constName)) {
+      out.set(constName, docText.substring(bodyStart, bodyEnd));
+    }
+  }
+  return out;
 }
 
 export function extractFrontendGqlUsageFromText(

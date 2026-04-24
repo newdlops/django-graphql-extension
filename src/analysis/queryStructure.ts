@@ -29,6 +29,13 @@ export interface QueryStructureNode {
   queried: boolean;
   /** True iff this field exists only in the user's gql, not in the backend schema. */
   frontendOnly: boolean;
+  /**
+   * When the user got this field by spreading a named fragment (e.g.
+   * `...UserFields`), holds the fragment name. The UI can then render the
+   * row with a "from fragment" style instead of treating it the same as
+   * fields written directly in the selection set.
+   */
+  fromFragment?: string;
   /** Arguments declared on the backend side. */
   args: QueryStructureArg[];
   /** Children — only populated when the resolved type is known and max depth isn't reached. */
@@ -302,6 +309,7 @@ function expandClassFields(
         resolvedTypeKnown: !!resolvedCls || isScalarLeaf,
         queried,
         frontendOnly: false,
+        fromFragment: userSubfield?.fromFragment,
         args,
         children,
         hasMoreChildren,

@@ -12,5 +12,6 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node", "mocha"]
   },
-  "include": ["test-e2e/**/*"]
+  "include": ["test-e2e/**/*"],
+  "exclude": ["test-e2e/fixtures/**/*"]
 }

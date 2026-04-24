@@ -23,11 +23,13 @@ export function renderQueryStructureJsonHtml(structure: QueryStructure): string 
   const frontendOnlyPill = structure.frontendOnlyCount > 0
     ? `<span class="pill pill-f">+ ${structure.frontendOnlyCount} frontend-only</span>`
     : '';
+  const fragmentPill = buildFragmentSummaryPill(structure.rootField);
   const summary = `
     <div class="summary">
       <span class="pill pill-q">✓ ${structure.queriedCount} queried</span>
       <span class="pill pill-m">✗ ${structure.totalCount - structure.queriedCount} missing</span>
       ${frontendOnlyPill}
+      ${fragmentPill}
       <span class="muted">of ${structure.totalCount} total fields</span>
     </div>`;
 
@@ -66,6 +68,25 @@ export function renderTemplateStructuresHtml(params: {
   const frontendOnlyPill = aggFrontendOnly > 0
     ? `<span class="pill pill-f">+ ${aggFrontendOnly} frontend-only</span>`
     : '';
+  // Aggregate fragment usage across all root fields so the Live Inspector
+  // header surfaces one consolidated "N via K fragments" pill.
+  const aggFragments = new Set<string>();
+  let aggFragmentCount = 0;
+  for (const { structure } of params.structures) {
+    const walk = (n: QueryStructureNode) => {
+      for (const c of n.children) {
+        if (c.fromFragment && c.queried && !c.frontendOnly) {
+          aggFragments.add(c.fromFragment);
+          aggFragmentCount++;
+        }
+        walk(c);
+      }
+    };
+    walk(structure.rootField);
+  }
+  const fragmentPill = aggFragmentCount > 0
+    ? `<span class="pill pill-frag" title="${[...aggFragments].join(', ')}">◇ ${aggFragmentCount} via ${aggFragments.size} fragment${aggFragments.size === 1 ? '' : 's'}</span>`
+    : '';
 
   const summary = `
     <div class="summary">
@@ -73,6 +94,7 @@ export function renderTemplateStructuresHtml(params: {
       <span class="pill pill-q">✓ ${aggQueried} queried</span>
       <span class="pill pill-m">✗ ${aggTotal - aggQueried} missing</span>
       ${frontendOnlyPill}
+      ${fragmentPill}
       <span class="muted">across ${params.structures.length} root field${params.structures.length === 1 ? '' : 's'}</span>
     </div>${renderOperationVariables(params.operationVariables ?? [])}`;
 
@@ -100,6 +122,28 @@ export function renderTemplateStructuresHtml(params: {
   return summary + blocks.join('\n');
 }
 
+/**
+ * Walk a structure tree and summarize how many distinct fragments contributed
+ * fields, so the header can surface a `◇ N via 2 fragment(s)` hint next to
+ * the usual queried/missing pills.
+ */
+function buildFragmentSummaryPill(root: QueryStructureNode): string {
+  const fragments = new Set<string>();
+  let fieldCount = 0;
+  const walk = (n: QueryStructureNode) => {
+    for (const c of n.children) {
+      if (c.fromFragment && c.queried && !c.frontendOnly) {
+        fragments.add(c.fromFragment);
+        fieldCount++;
+      }
+      walk(c);
+    }
+  };
+  walk(root);
+  if (fieldCount === 0) return '';
+  return `<span class="pill pill-frag" title="${[...fragments].join(', ')}">◇ ${fieldCount} via ${fragments.size} fragment${fragments.size === 1 ? '' : 's'}</span>`;
+}
+
 function renderRoot(node: QueryStructureNode, state: RenderState): string {
   // Root: `displayName: TypeLabel { ... }`
   const hasChildren = node.children.length > 0;
@@ -119,14 +163,22 @@ function renderRoot(node: QueryStructureNode, state: RenderState): string {
 }
 
 function renderField(node: QueryStructureNode, depth: number, state: RenderState): string {
+  // Fields queried via a named `...FragName` spread get their own marker +
+  // color + badge so the user can tell at a glance which part of the
+  // selection came from a fragment vs was written directly in the gql body.
+  const viaFragment = !!node.fromFragment && node.queried && !node.frontendOnly;
   const marker = node.frontendOnly
     ? '<span class="mark mark-f">+</span>'
-    : node.queried
-      ? '<span class="mark mark-q">✓</span>'
-      : '<span class="mark mark-m">✗</span>';
+    : viaFragment
+      ? '<span class="mark mark-frag">◇</span>'
+      : node.queried
+        ? '<span class="mark mark-q">✓</span>'
+        : '<span class="mark mark-m">✗</span>';
   const keyClass = node.frontendOnly
     ? 'key key-frontend-only'
-    : node.queried ? 'key key-queried' : 'key key-missing';
+    : viaFragment
+      ? 'key key-fragment'
+      : node.queried ? 'key key-queried' : 'key key-missing';
   const isUnknownType =
     (node.resolvedType && !node.resolvedTypeKnown) ||
     node.typeLabel === '?' ||
@@ -137,6 +189,12 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
   const indent = indentSpan(depth);
   const argBlock = renderArgs(node.args);
 
+  // Small trailing badge showing which fragment introduced this field. Only
+  // emitted for fragment-sourced rows so direct fields stay clean.
+  const fragmentBadge = viaFragment
+    ? ` <span class="frag-badge" title="via \`...${escape(node.fromFragment!)}\`">${escape(node.fromFragment!)}</span>`
+    : '';
+
   const keyLine = `${indent}${marker}<span class="${keyClass}">${escape(node.displayName)}</span>${argBlock}: `;
   const isList = /^\[/.test(node.typeLabel);
   const hasChildren = node.children.length > 0;
@@ -144,8 +202,10 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
 
   // Leaf field: no children to expand AND no lazy handle.
   if (!hasChildren && !isLazy) {
-    const lineClass = node.frontendOnly ? 'line-f' : node.queried ? 'line-q' : 'line-m';
-    return `<span class="line ${lineClass}">${keyLine}<span class="${typeClass}">${escape(node.typeLabel)}</span></span>`;
+    const lineClass = node.frontendOnly
+      ? 'line-f'
+      : viaFragment ? 'line-frag' : node.queried ? 'line-q' : 'line-m';
+    return `<span class="line ${lineClass}">${keyLine}<span class="${typeClass}">${escape(node.typeLabel)}</span>${fragmentBadge}</span>`;
   }
 
   // Object/list field — collapsible. List types are surfaced with [] brackets.
@@ -161,12 +221,16 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
   // listener uses to fetch the inner subtree on first open. Keeping the
   // structure identical to the expanded case is what makes the lazy-loaded
   // content align (indent + line spacing) with the surrounding tree.
+  const blockClass = node.frontendOnly
+    ? 'block-f'
+    : viaFragment ? 'block-frag' : node.queried ? 'block-q' : 'block-m';
+
   if (isLazy) {
     const nodeId = state.nextId++;
     const ancestryAttr = escape(state.ancestry.join(','));
     return [
-      `<details class="block block-lazy ${node.queried ? 'block-q' : 'block-m'}" data-node-id="${nodeId}" data-lazy-type="${escape(node.resolvedType!)}" data-ancestry="${ancestryAttr}" data-depth="${depth}">`,
-      `<summary><span class="line">${keyLine}${typeTag} ${open}</span></summary>`,
+      `<details class="block block-lazy ${blockClass}" data-node-id="${nodeId}" data-lazy-type="${escape(node.resolvedType!)}" data-ancestry="${ancestryAttr}" data-depth="${depth}">`,
+      `<summary><span class="line">${keyLine}${typeTag} ${open}${fragmentBadge}</span></summary>`,
       `<div class="lazy-content"></div>`,
       `<span class="line">${indentSpan(depth)}${close}</span>`,
       `</details>`,
@@ -180,8 +244,8 @@ function renderField(node: QueryStructureNode, depth: number, state: RenderState
   if (node.resolvedType) state.ancestry.pop();
 
   return [
-    `<details open class="block ${node.frontendOnly ? 'block-f' : node.queried ? 'block-q' : 'block-m'}">`,
-    `<summary><span class="line">${keyLine}${typeTag} ${open}</span></summary>`,
+    `<details open class="block ${blockClass}">`,
+    `<summary><span class="line">${keyLine}${typeTag} ${open}${fragmentBadge}</span></summary>`,
     inner,
     `<span class="line">${indentSpan(depth)}${close}</span>`,
     `</details>`,
@@ -273,7 +337,27 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 .pill-q { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
 .pill-m { background: rgba(244, 67, 54, 0.18); color: #f44747; }
 .pill-f { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
+.pill-frag { background: rgba(198, 120, 221, 0.18); color: #c678dd; }
 .muted { color: var(--vscode-descriptionForeground); }
+
+/* Fragment-sourced rows get their own hue + a small "which fragment?"
+   badge so the user can tell at a glance what came via a spread versus
+   what they wrote directly in the gql body. Matches the webview panel. */
+.mark-frag { color: #c678dd; }
+.key-fragment { color: #c678dd; }
+.line-frag { }
+.frag-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(198, 120, 221, 0.18);
+  color: #c678dd;
+  font-size: 0.75em;
+  font-weight: 500;
+  vertical-align: middle;
+  line-height: 1.5;
+}
 
 .json-tree { margin: 0; padding: 12px 18px 22px; white-space: pre; line-height: 1.55; overflow: auto; }
 .line { display: block; white-space: pre; }

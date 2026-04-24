@@ -37,6 +37,27 @@ describe('buildQueryStructure (phase y)', () => {
     expect(byName.get('created_at')!.queried).toBe(false);
   });
 
+  it('propagates fromFragment onto nodes whose value was introduced via a named spread', () => {
+    const userType = cls('UserType', [f('id'), f('name'), f('email')]);
+    const gql = `
+      fragment UserFields on UserType { name email }
+      query Q { user { id ...UserFields } }
+    `;
+    const gf = firstRoot(gql)!;
+    const s = buildQueryStructure(gf, userType, new Map([[userType.name, userType]]));
+
+    const byName = new Map(s.rootField.children.map((c) => [c.name, c]));
+    // All three fields are queried. id directly, name/email via the spread.
+    expect(byName.get('id')!.queried).toBe(true);
+    expect(byName.get('id')!.fromFragment).toBeUndefined();
+    expect(byName.get('name')!.queried).toBe(true);
+    expect(byName.get('name')!.fromFragment).toBe('UserFields');
+    expect(byName.get('email')!.queried).toBe(true);
+    expect(byName.get('email')!.fromFragment).toBe('UserFields');
+    // Queried count includes fragment fields — they ARE in the user's query.
+    expect(s.queriedCount).toBe(3);
+  });
+
   it('omits gql-only fields from the backend structure without inflating totals', () => {
     const userType = cls('UserType', [f('id', 'Int'), f('name', 'String')]);
     const gf = firstRoot('query { user { id ghostField { nestedGhost } } }')!;

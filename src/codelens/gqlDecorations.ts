@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
-import { parseGqlFields, GqlField, camelToSnake } from './gqlCodeLensProvider';
-import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
+import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, mergeFragments, expandGqlBody, FragmentDef } from './gqlCodeLensProvider';
+import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
 
 export interface DecorationInfo {
   offset: number;
@@ -12,6 +12,8 @@ export interface DecorationInfo {
 interface ComputeCtx {
   classMap: Map<string, ClassInfo>;
   fieldIndex: FieldIndex;
+  workspaceFragments?: Map<string, FragmentDef>;
+  workspaceConstBodies?: Map<string, string>;
 }
 
 /**
@@ -24,6 +26,7 @@ interface ComputeCtx {
 export function computeDecorations(text: string, ctx: ComputeCtx): DecorationInfo[] {
   if (ctx.fieldIndex.size === 0) return [];
   const out: DecorationInfo[] = [];
+  const docFragments = mergeFragments(ctx.workspaceFragments, collectDocumentFragments(text));
   const gqlRegex = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
   let m: RegExpExecArray | null;
 
@@ -35,10 +38,16 @@ export function computeDecorations(text: string, ctx: ComputeCtx): DecorationInf
     if (endOffset === -1) continue;
 
     const rawBody = text.substring(startOffset, endOffset);
-    const gqlBody = stripInterpolations(rawBody);
-    const parsed = parseGqlFields(gqlBody);
+    const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
+    const parsed = parseGqlFields(gqlBody, docFragments);
+    const fragCtx = readFragmentContextFromGql(gqlBody);
+    if (fragCtx) {
+      const fragCls = ctx.classMap.get(fragCtx.onType);
+      if (!fragCls) continue;
+      walk(parsed, fragCls, startOffset, ctx, out, 'unknown');
+      continue;
+    }
     const rootKind = readRootOperationKindFromGql(gqlBody);
-
     walk(parsed, null, startOffset, ctx, out, rootKind);
   }
   return out;

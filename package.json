@@ -2,7 +2,7 @@
   "name": "django-graphql-explorer",
   "displayName": "Django GraphQL Explorer",
   "description": "Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace",
-  "version": "0.0.7",
+  "version": "0.0.9",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -83,6 +83,10 @@
         "command": "djangoGraphqlExplorer.openLiveInspector",
         "title": "Django GraphQL: Open Live Query Structure",
         "icon": "$(json)"
+      },
+      {
+        "command": "djangoGraphqlExplorer.dumpFragmentIndex",
+        "title": "Django GraphQL: Dump Fragment Index"
       }
     ],
     "menus": {

@@ -20,10 +20,10 @@ Automatically maps frontend `gql` queries to backend Python classes.
 
 ```typescript
 // CodeLens appears above each field:
-// → StockQuery.stock [Query]
+// → ProductQuery.product [Query]
 gql`
-  query {
-    stock(companyId: $companyId) {
+  query ProductById($productId: ID!) {
+    product(productId: $productId) {
       id
       name
     }
@@ -51,14 +51,14 @@ Hover over any field inside a `gql` template to see:
 Click any class in the tree to preview its GraphQL schema in frontend query style:
 
 ```graphql
-query StockQuery($companyId: ID!) {
-  stock(companyId: $companyId) {
+query ProductQuery($productId: ID!) {
+  product(productId: $productId) {
     id
     name
-    company {
+    category {
       id
       name
-      address
+      slug
     }
   }
 }
@@ -85,19 +85,19 @@ The parser understands modern graphene codebases that mix `@dataclass` types, `T
 
 ```python
 @dataclass
-class RtccEmailEmailListItemSummary:
-    totalCount: int
-    deliveringCount: int
+class ItemListSummary:
+    total_count: int
+    active_count: int
     ...
 
-class RtccEmailEmailListQuery:
-    class RtccEmailEmailListQueryArguments(TypedDict):
-        company_id: IDStr
+class ItemListQuery:
+    class ItemListArguments(TypedDict):
+        account_id: IDStr
         page: NotRequired[int]
 
-    rtcc_email_list = TypedField(
-        RtccEmailEmailList,
-        **RtccEmailEmailListQueryArguments.__annotations__,
+    item_list = TypedField(
+        ItemList,
+        **ItemListArguments.__annotations__,
     )
 ```
 

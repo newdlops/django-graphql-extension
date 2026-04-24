@@ -5,6 +5,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { TextDocument, Uri, __getDiagnosticsFor, __clearDiagnostics } from 'vscode';
 import { computeDiagnostics, GqlDiagnosticsManager } from '../../codelens/gqlDiagnostics';
 import { buildFieldIndex } from '../../codelens/gqlResolver';
+import { collectDocumentFragments } from '../../codelens/gqlCodeLensProvider';
 import { ClassInfo, FieldInfo } from '../../types';
 
 function f(name: string, fieldType = 'String', extras: Partial<FieldInfo> = {}): FieldInfo {
@@ -107,6 +108,161 @@ describe('computeDiagnostics (phase v)', () => {
     expect(diags).toHaveLength(1);
     expect(diags[0].message).toContain('created_ad');
     expect(diags[0].suggestions).toContain('created_at');
+  });
+
+  it('does not flag fields inlined from a same-file fragment spread', () => {
+    // Regression: diagnostics used to ignore fragment definitions entirely,
+    // so `...UserFields` was dropped and nothing was flagged. Now the
+    // fragment inlines and legitimate fields stay silent while typos still
+    // surface.
+    const userType = cls('UserType', [f('id'), f('name'), f('email')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = [
+      'const USER = gql`fragment UserFields on UserType { id name }`;',
+      'const Q = gql`query { user { ...UserFields email } }`;',
+    ].join('\n');
+
+    const diags = computeDiagnostics(src, ctx);
+    expect(diags).toEqual([]);
+  });
+
+  it('does not flag fields inlined from a cross-file fragment when workspaceFragments is supplied', () => {
+    // Mirrors the real-world pattern where fragments live in fragments.ts
+    // and are imported into query.ts via `${CONST}` interpolation.
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const base = ctxFromClasses([userType, query]);
+
+    // Workspace-wide fragment definitions harvested from a sibling file.
+    const fragmentsSource = 'export const F = gql`fragment UserFields on UserType { id email }`;';
+    const workspaceFragments = collectDocumentFragments(fragmentsSource);
+
+    // The query file itself only references the spread — no local definition.
+    const querySource = [
+      "import { F } from './fragments';",
+      'const Q = gql`${F} query GetUser { user { ...UserFields } }`;',
+    ].join('\n');
+
+    const diagsWithFragments = computeDiagnostics(querySource, { ...base, workspaceFragments });
+    expect(diagsWithFragments).toEqual([]);
+
+    // Without the workspace fragment map, the spread is dropped and the
+    // query looks empty — nothing to flag, but also nothing resolved. This
+    // documents the fallback behavior so the delta between the two modes
+    // is obvious.
+    const diagsWithout = computeDiagnostics(querySource, base);
+    expect(diagsWithout).toEqual([]);
+  });
+
+  it('analyzes bare fragment literals against the `on Type` class', () => {
+    // Regression: fragment-only gql literals (common in `fragments.ts` files)
+    // used to be skipped entirely. Now the body is walked against the type
+    // named after `on`, so typos and wrong fields get flagged.
+    const userType = cls('UserType', [f('id'), f('full_name'), f('email')]);
+    const query = cls('Query', [f('me', 'Field', { resolvedType: 'UserType' })], 'query');
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = 'const U = gql`fragment UserFields on UserType { id full_name nope }`;';
+    const diags = computeDiagnostics(src, ctx);
+    expect(diags).toHaveLength(1);
+    expect(diags[0].message).toContain('nope');
+    expect(diags[0].message).toContain('UserType');
+  });
+
+  it('silently skips fragment bodies when the `on Type` is not in the schema', () => {
+    // Schema drift: the user references a type the scanner hasn't indexed
+    // yet. We can't resolve its fields, so we also can't judge typos — stay
+    // silent rather than flagging every field as unresolved.
+    const query = cls('Query', [f('me', 'Field')], 'query');
+    const ctx = ctxFromClasses([query]);
+
+    const src = 'const U = gql`fragment UserFields on UnknownType { id nope }`;';
+    const diags = computeDiagnostics(src, ctx);
+    expect(diags).toEqual([]);
+  });
+
+  it('resolves nested fragment spreads inside a fragment body via workspaceFragments', () => {
+    // fragment A spreads fragment B; the field list of B is inlined into A
+    // before diagnostics run. Typos that originated in B's body surface at
+    // their original location (which is A's body in this case because B's
+    // fields flatten into A's selection).
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const outerType = cls('OuterType', [f('owner', 'Field', { resolvedType: 'UserType' })]);
+    const query = cls('Query', [f('outer', 'Field', { resolvedType: 'OuterType' })], 'query');
+    const base = ctxFromClasses([userType, outerType, query]);
+
+    const fragmentsSource = 'const B = gql`fragment UserFields on UserType { id email }`;';
+    const workspaceFragments = collectDocumentFragments(fragmentsSource);
+
+    // Outer fragment references UserFields — which only exists in another file.
+    const querySource = [
+      "import { B } from './fragments';",
+      'const A = gql`${B} fragment OuterFields on OuterType { owner { ...UserFields } } `;',
+    ].join('\n');
+
+    const diags = computeDiagnostics(querySource, { ...base, workspaceFragments });
+    expect(diags).toEqual([]);
+  });
+
+  it('resolves cross-file fragments via `${CONST}` expansion even when workspaceFragments is empty', () => {
+    // This mirrors the runtime failure mode: for any reason the by-name
+    // fragment map fails to populate (timing, findFiles glob mismatch, …),
+    // the query should still be analysable as long as the `${CONST}`
+    // interpolation was seen and the const body is known. Matches what
+    // graphql-tag actually does at runtime.
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const base = ctxFromClasses([userType, query]);
+
+    // Simulate the workspace's JS-const index populated by scanWorkspaceFragments.
+    const workspaceConstBodies = new Map<string, string>([
+      ['USER_FRAGMENT', '\n  fragment UserFields on UserType { id email }\n'],
+    ]);
+
+    const querySource = [
+      "import { USER_FRAGMENT } from './fragments';",
+      'const Q = gql`${USER_FRAGMENT} query GetUser { user { ...UserFields } }`;',
+    ].join('\n');
+
+    // workspaceFragments INTENTIONALLY omitted — only constBodies are provided.
+    const diags = computeDiagnostics(querySource, { ...base, workspaceConstBodies });
+    expect(diags).toEqual([]);
+  });
+
+  it('follows `${CONST}` interpolations transitively (fragment body referencing another const)', () => {
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const outerType = cls('OuterType', [f('owner', 'Field', { resolvedType: 'UserType' })]);
+    const query = cls('Query', [f('outer', 'Field', { resolvedType: 'OuterType' })], 'query');
+    const base = ctxFromClasses([userType, outerType, query]);
+
+    const workspaceConstBodies = new Map<string, string>([
+      ['USER_FRAGMENT', '\n  fragment UserFields on UserType { id email }\n'],
+      // OUTER_FRAGMENT's body references ${USER_FRAGMENT} — expansion must
+      // walk transitively so both fragments end up appended.
+      ['OUTER_FRAGMENT', '\n  ${USER_FRAGMENT}\n  fragment OuterFields on OuterType { owner { ...UserFields } }\n'],
+    ]);
+
+    // Query only mentions ${OUTER_FRAGMENT} at the top. Transitive expansion
+    // should pull in USER_FRAGMENT as well.
+    const querySource = 'const Q = gql`${OUTER_FRAGMENT} query Q { outer { ...OuterFields } }`;';
+    const diags = computeDiagnostics(querySource, { ...base, workspaceConstBodies });
+    expect(diags).toEqual([]);
+  });
+
+  it('still flags typos that appear alongside a valid fragment spread', () => {
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const base = ctxFromClasses([userType, query]);
+
+    const fragmentsSource = 'const F = gql`fragment UserFields on UserType { id email }`;';
+    const workspaceFragments = collectDocumentFragments(fragmentsSource);
+
+    const querySource = 'const Q = gql`${F} query GetUser { user { ...UserFields bogus } }`;';
+    const diags = computeDiagnostics(querySource, { ...base, workspaceFragments });
+    expect(diags).toHaveLength(1);
+    expect(diags[0].message).toContain('bogus');
   });
 
   it('spans the squiggle exactly across the frontend field name', () => {

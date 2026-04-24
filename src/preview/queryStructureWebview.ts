@@ -23,6 +23,24 @@ export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: s
   const frontendOnlyPill = structure.frontendOnlyCount > 0
     ? `<span class="pill pill-frontend-only">+ ${structure.frontendOnlyCount} frontend-only</span>`
     : '';
+  // Walk the tree once to figure out how many distinct fragments fed the
+  // selection — shown as a summary pill so the user immediately sees that
+  // "this much of my query came via fragments".
+  const fragNames = new Set<string>();
+  let fragCount = 0;
+  const walk = (n: QueryStructureNode) => {
+    for (const c of n.children) {
+      if (c.fromFragment && c.queried && !c.frontendOnly) {
+        fragNames.add(c.fromFragment);
+        fragCount++;
+      }
+      walk(c);
+    }
+  };
+  walk(structure.rootField);
+  const fragmentPill = fragCount > 0
+    ? `<span class="pill pill-fragment" title="${[...fragNames].join(', ')}">◇ ${fragCount} via ${fragNames.size} fragment${fragNames.size === 1 ? '' : 's'}</span>`
+    : '';
   const header = `
     <div class="header">
       <div class="title">${escape(structure.rootField.displayName)}${rootArgsHtml}
@@ -33,6 +51,7 @@ export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: s
         <span class="pill pill-queried">✓ ${structure.queriedCount} queried</span>
         <span class="pill pill-missing">✗ ${structure.totalCount - structure.queriedCount} missing</span>
         ${frontendOnlyPill}
+        ${fragmentPill}
         <span class="muted">of ${structure.totalCount} total fields</span>
       </div>
     </div>`;
@@ -86,6 +105,7 @@ body {
 .pill-queried { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
 .pill-missing { background: rgba(244, 67, 54, 0.18); color: #f44747; }
 .pill-frontend-only { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
+.pill-fragment { background: rgba(198, 120, 221, 0.18); color: #c678dd; }
 .muted { color: var(--vscode-descriptionForeground); }
 
 .tree { padding: 8px 12px 24px; }
@@ -99,6 +119,7 @@ body {
 .row.queried { border-left-color: #4caf50; background: rgba(76, 175, 80, 0.06); }
 .row.missing { border-left-color: #f44747; background: rgba(244, 67, 54, 0.07); }
 .row.frontend-only { border-left-color: #3794ff; background: rgba(55, 148, 255, 0.08); }
+.row.fragment { border-left-color: #c678dd; background: rgba(198, 120, 221, 0.08); }
 .row.unknown-type { opacity: 0.7; font-style: italic; }
 .row.frontend-only.unknown-type { opacity: 1; font-style: normal; }
 .row:hover { background: var(--vscode-list-hoverBackground); }
@@ -111,11 +132,25 @@ body {
 .marker.queried { color: #4caf50; }
 .marker.missing { color: #f44747; }
 .marker.frontend-only { color: #3794ff; }
+.marker.fragment { color: #c678dd; }
 .marker.unknown { color: var(--vscode-descriptionForeground); }
 
 .field-name { font-weight: 500; }
 .field-name.missing { color: #f44747; }
 .field-name.frontend-only { color: #3794ff; }
+.field-name.fragment { color: #c678dd; }
+.fragment-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(198, 120, 221, 0.18);
+  color: #c678dd;
+  font-size: 0.72em;
+  font-weight: 500;
+  vertical-align: middle;
+  line-height: 1.5;
+}
 .snake { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
 .type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .type.clickable { cursor: pointer; text-decoration: underline dashed; }
@@ -152,7 +187,7 @@ body {
 </style></head><body>
 ${header}
 <div class="tree">${body}</div>
-<div class="legend">Green = queried · Red = available on the backend but missing from your gql · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
+<div class="legend">Green = queried directly · <span style="color:#c678dd">Purple</span> = queried via a named fragment · Red = available on the backend but missing from your gql · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
 <script>
 (function () {
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
@@ -239,17 +274,21 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
 
   const hasChildren = node.children.length > 0;
   const isLazy = !hasChildren && node.hasMoreChildren;
+  const viaFragment = !!node.fromFragment && node.queried && !node.frontendOnly;
   const rowClasses = ['row'];
   if (node.frontendOnly) rowClasses.push('frontend-only');
+  else if (viaFragment) rowClasses.push('fragment');
   else if (node.queried) rowClasses.push('queried');
   else rowClasses.push('missing');
   if (node.resolvedType && !node.resolvedTypeKnown) rowClasses.push('unknown-type');
 
   const marker = node.frontendOnly
     ? '<span class="marker frontend-only">+</span>'
-    : node.queried
-      ? '<span class="marker queried">✓</span>'
-      : '<span class="marker missing">✗</span>';
+    : viaFragment
+      ? '<span class="marker fragment">◇</span>'
+      : node.queried
+        ? '<span class="marker queried">✓</span>'
+        : '<span class="marker missing">✗</span>';
   let twistie: string;
   if (hasChildren) {
     twistie = '<span class="twistie">▾</span>';
@@ -290,11 +329,17 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
 
   const fieldClass = node.frontendOnly
     ? 'field-name frontend-only'
-    : node.queried ? 'field-name' : 'field-name missing';
+    : viaFragment
+      ? 'field-name fragment'
+      : node.queried ? 'field-name' : 'field-name missing';
+
+  const fragmentBadge = viaFragment
+    ? ` <span class="fragment-badge" title="Queried via \`...${escape(node.fromFragment!)}\` spread">${escape(node.fromFragment!)}</span>`
+    : '';
 
   return `<div class="${rowClasses.join(' ')}" data-node-id="${nodeId}"${lazyAttrs}>
     ${twistie}${marker}<span class="${fieldClass}">${escape(node.displayName)}</span>${displaySnake}:
-    <span class="${typeClass}">${typeLabel}</span>${args}${lazyHint}
+    <span class="${typeClass}">${typeLabel}</span>${fragmentBadge}${args}${lazyHint}
   </div>${children}`;
 }
 

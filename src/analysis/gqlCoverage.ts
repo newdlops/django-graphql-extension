@@ -1,5 +1,5 @@
 import { ClassInfo, FieldInfo } from '../types';
-import { camelToSnake, parseGqlFields, GqlField, FragmentDef, collectDocumentFragments } from '../codelens/gqlCodeLensProvider';
+import { camelToSnake, parseGqlFields, GqlField, FragmentDef, collectDocumentFragments, expandGqlBody, mergeFragments } from '../codelens/gqlCodeLensProvider';
 import { resolveChildClass } from '../codelens/gqlResolver';
 
 /** A multimap: class name → set of field names that at least one active gql query walked through. */
@@ -43,9 +43,39 @@ export function computeQueryCoverage(
   return coverage;
 }
 
-/** Convenience: extract bodies AND collect fragments from a document text in one call. */
-export function prepareDocumentGql(text: string): { bodies: string[]; fragments: Map<string, FragmentDef> } {
-  return { bodies: extractGqlBodies(text), fragments: collectDocumentFragments(text) };
+/**
+ * Convenience: extract bodies AND collect fragments from a document text in
+ * one call, applying the same `${CONST}` → fragment-body expansion that the
+ * CodeLens provider does. When a workspace index is supplied the resulting
+ * bodies include appended fragment bodies (so `collectFragmentDefsFromSource`
+ * inside `parseGqlFields` can resolve cross-file spreads LOCALLY) and the
+ * fragment map is overlaid on the workspace-wide map so `...FragName`
+ * lookups also have a fallback.
+ *
+ * Without the workspace index this reduces to the old same-file-only
+ * behavior (used by tests and any caller that doesn't have a populated
+ * workspace scan yet).
+ */
+export function prepareDocumentGql(
+  text: string,
+  workspace?: { fragments: Map<string, FragmentDef>; constBodies: Map<string, string> },
+): { bodies: string[]; fragments: Map<string, FragmentDef> } {
+  const rawBodies = extractRawGqlBodies(text);
+  const bodies = rawBodies.map((raw) =>
+    workspace?.constBodies ? expandGqlBody(raw, workspace.constBodies) : stripInterpolations(raw),
+  );
+  const docFragments = collectDocumentFragments(text);
+  const fragments = workspace?.fragments
+    ? mergeFragments(workspace.fragments, docFragments)
+    : docFragments;
+  return { bodies, fragments };
+}
+
+function stripInterpolations(body: string): string {
+  // Preserves offsets (spaces) the way extractGqlBodies did before expansion
+  // was available — still the right thing to do when no workspace const map
+  // is provided.
+  return body.replace(/\$\{[^}]*\}/g, (match) => ' '.repeat(match.length));
 }
 
 function walk(
@@ -139,6 +169,15 @@ function record(coverage: CoverageMap, className: string, fieldName: string): vo
  * gqlCodeLensProvider so the coverage and CodeLens see the same templates.
  */
 export function extractGqlBodies(text: string): string[] {
+  return extractRawGqlBodies(text).map((b) => b.replace(/\$\{[^}]*\}/g, (m) => ' '.repeat(m.length)));
+}
+
+/**
+ * Same template detection as `extractGqlBodies`, but preserves `${CONST}`
+ * interpolations verbatim — callers that want to follow those references
+ * (e.g. via `expandGqlBody`) need the un-stripped source.
+ */
+export function extractRawGqlBodies(text: string): string[] {
   const out: string[] = [];
   const re = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
   let m: RegExpExecArray | null;
@@ -163,10 +202,7 @@ export function extractGqlBodies(text: string): string[] {
       end++;
     }
     if (end <= start) continue;
-    // Replace ${...} interpolations with spaces so the parser doesn't get confused.
-    let body = text.substring(start, end);
-    body = body.replace(/\$\{[^}]*\}/g, (match) => ' '.repeat(match.length));
-    out.push(body);
+    out.push(text.substring(start, end));
   }
   return out;
 }

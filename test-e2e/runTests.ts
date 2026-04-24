@@ -6,7 +6,10 @@ import { runTests } from '@vscode/test-electron';
 async function main(): Promise<void> {
   const extensionDevelopmentPath = path.resolve(__dirname, '..', '..');
   const extensionTestsPath = path.resolve(__dirname, 'suite', 'index.js');
-  const workspacePath = path.resolve(__dirname, '..', 'fixtures', 'django-basic');
+  // Fixture lives in the SOURCE tree, not under out-e2e (tsc doesn't copy
+  // non-TS files and the .py schema + .ts fragments must be in their
+  // original spot for scanners to find them).
+  const workspacePath = path.resolve(__dirname, '..', 'test-e2e', 'fixtures', 'django-basic');
 
   try {
     await runTests({

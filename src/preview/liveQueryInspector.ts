@@ -4,9 +4,15 @@ import { FieldIndex } from '../codelens/gqlResolver';
 import { resolveTemplateAtCursor, TemplateContext } from '../codelens/gqlCursorResolver';
 import { buildQueryStructure, buildPartialStructureFromGql, buildLazySubtree, QueryStructure } from '../analysis/queryStructure';
 import { renderTemplateStructuresHtml, renderJsonSubtreeHtml, QUERY_STRUCTURE_JSON_STYLES } from './queryStructureJson';
+import { FragmentDef } from '../codelens/gqlCodeLensProvider';
 
 interface StateSource {
-  (): { classMap: Map<string, ClassInfo>; fieldIndex: FieldIndex };
+  (): {
+    classMap: Map<string, ClassInfo>;
+    fieldIndex: FieldIndex;
+    workspaceFragments?: Map<string, FragmentDef>;
+    workspaceConstBodies?: Map<string, string>;
+  };
 }
 
 /**

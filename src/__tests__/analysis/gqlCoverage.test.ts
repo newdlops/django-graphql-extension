@@ -2,7 +2,7 @@
 // queried by active gql templates.
 
 import { describe, it, expect } from 'vitest';
-import { computeQueryCoverage, extractGqlBodies } from '../../analysis/gqlCoverage';
+import { computeQueryCoverage, extractGqlBodies, prepareDocumentGql } from '../../analysis/gqlCoverage';
 import { ClassInfo, FieldInfo } from '../../types';
 
 function f(name: string, fieldType = 'String', extras: Partial<FieldInfo> = {}): FieldInfo {
@@ -119,6 +119,59 @@ describe('computeQueryCoverage (phase q)', () => {
     );
     // Only the query contributes coverage.
     expect(cov.get('UserType')).toEqual(new Set(['id']));
+  });
+});
+
+describe('prepareDocumentGql workspace expansion', () => {
+  it('expands `${CONST}` interpolations using the workspace const-body map', () => {
+    // Regression: the Schema Explorer sidebar went through this path (via
+    // `setActiveGqlBodies`) without any workspace context, so fragments
+    // imported from another file were dropped and their fields appeared as
+    // "missing" in the sidebar even though the query explicitly spread them.
+    const queryFile = [
+      "import { USER_FRAGMENT } from './fragments';",
+      "const Q = gql`",
+      "  ${USER_FRAGMENT}",
+      "  query GetUser { user { ...UserFields } }",
+      "`;",
+    ].join('\n');
+
+    const workspaceConstBodies = new Map<string, string>([
+      ['USER_FRAGMENT', '\n  fragment UserFields on UserType { id email }\n'],
+    ]);
+    const workspaceFragments = new Map(); // not required — the expansion appends the fragment text locally
+
+    const { bodies, fragments } = prepareDocumentGql(queryFile, {
+      fragments: workspaceFragments,
+      constBodies: workspaceConstBodies,
+    });
+
+    expect(bodies).toHaveLength(1);
+    // After expansion the fragment body is appended — `collectFragmentDefsFromSource`
+    // can now find `UserFields` locally in the expanded body.
+    expect(bodies[0]).toContain('fragment UserFields on UserType');
+
+    // Coverage path: `user.id` and `user.email` should register as queried
+    // against UserType even though the fragment lives in a different file.
+    const userType = cls('UserType', [f('id'), f('email'), f('not_queried')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    const classMap = new Map([[userType.name, userType], [query.name, query]]);
+
+    const cov = computeQueryCoverage(bodies, {
+      classMap,
+      schemaRoots: [query],
+      documentFragments: fragments,
+    });
+
+    expect(cov.get('UserType')).toEqual(new Set(['id', 'email']));
+  });
+
+  it('falls back to same-file-only behavior when no workspace index is given', () => {
+    const queryFile = 'const Q = gql`query { user { id } }`;';
+    const { bodies, fragments } = prepareDocumentGql(queryFile);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('user { id }');
+    expect(fragments.size).toBe(0);
   });
 });
 

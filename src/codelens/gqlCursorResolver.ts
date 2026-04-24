@@ -1,5 +1,5 @@
 import { ClassInfo } from '../types';
-import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments } from './gqlCodeLensProvider';
+import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, expandGqlBody, mergeFragments, FragmentDef } from './gqlCodeLensProvider';
 import { FieldIndex, RootOperationKind, findEntry, MatchedEntry, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
 
 export interface CursorContext {
@@ -48,6 +48,8 @@ export interface TemplateContext {
 interface ResolveCtx {
   classMap: Map<string, ClassInfo>;
   fieldIndex: FieldIndex;
+  workspaceFragments?: Map<string, FragmentDef>;
+  workspaceConstBodies?: Map<string, string>;
 }
 
 /**
@@ -61,7 +63,7 @@ export function resolveTemplateAtCursor(
   cursorOffset: number,
   ctx: ResolveCtx,
 ): TemplateContext | null {
-  const docFragments = collectDocumentFragments(text);
+  const docFragments = mergeFragments(ctx.workspaceFragments, collectDocumentFragments(text));
   const gqlRegex = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
   let m: RegExpExecArray | null;
 
@@ -74,7 +76,7 @@ export function resolveTemplateAtCursor(
     if (cursorOffset < bodyStart || cursorOffset > bodyEnd) continue;
 
     const rawBody = text.substring(bodyStart, bodyEnd);
-    const gqlBody = stripInterpolations(rawBody);
+    const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
 
     // Detect the operation keyword and its name.
@@ -201,7 +203,7 @@ export function resolveFieldAtCursor(
   cursorOffset: number,
   ctx: ResolveCtx,
 ): CursorContext | null {
-  const docFragments = collectDocumentFragments(text);
+  const docFragments = mergeFragments(ctx.workspaceFragments, collectDocumentFragments(text));
   const gqlRegex = /(?:gql|graphql)\s*(?:`|(\()[\s\S]*?`)|\/\*\s*GraphQL\s*\*\/\s*`/g;
   let m: RegExpExecArray | null;
 
@@ -214,7 +216,7 @@ export function resolveFieldAtCursor(
     if (cursorOffset < bodyStart || cursorOffset > bodyEnd) continue;
 
     const rawBody = text.substring(bodyStart, bodyEnd);
-    const gqlBody = stripInterpolations(rawBody);
+    const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
     const rootKind = readRootOperationKindFromGql(gqlBody);
 

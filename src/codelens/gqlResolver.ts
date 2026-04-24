@@ -108,6 +108,24 @@ export function readRootOperationKindFromGql(gqlBody: string): RootOperationKind
 }
 
 /**
+ * When a gql literal has NO query/mutation/subscription and DOES declare a
+ * fragment, returns the fragment's target type (the identifier after `on`).
+ * Providers use this to walk the fragment body as children of that type,
+ * so typos inside stand-alone fragment modules (e.g. `fragments.ts`) get
+ * the same diagnostics and inlay hints that query bodies do.
+ *
+ * Literals that also contain a real operation return null — those are
+ * walked from the operation's selection set, and same-literal fragments
+ * are inlined at spread sites instead of being analyzed directly.
+ */
+export function readFragmentContextFromGql(gqlBody: string): { onType: string } | null {
+  if (/(^|[^A-Za-z_0-9])(query|mutation|subscription)\b/.test(gqlBody)) return null;
+  const m = /\bfragment\s+[A-Za-z_]\w*\s+on\s+([A-Za-z_]\w*)\s*\{/.exec(gqlBody);
+  if (!m) return null;
+  return { onType: m[1] };
+}
+
+/**
  * Infer the backend type class from a frontend field name.
  * Mirrors the fallback used by the CodeLens provider for fields whose
  * `resolvedType` is absent or points at a class not present in `classMap`.
