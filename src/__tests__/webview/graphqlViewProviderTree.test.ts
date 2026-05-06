@@ -115,12 +115,38 @@ describe('GraphqlViewProvider tree sections', () => {
     expect(findNodeByLabel(frontend.children, 'pages')).toBeDefined();
   });
 
+  it('filters backend field children without sending resolved child payloads during search', () => {
+    const provider = new GraphqlViewProvider();
+    const userType = cls('UserType', [f('id'), f('name')]);
+    const query = cls('Query', [
+      f('user', 'Field', { resolvedType: 'UserType' }),
+      f('team'),
+    ], 'query');
+    provider.updateSchemas([schema({ queries: [query], types: [userType] })]);
+
+    (provider as any).applyFilter({ query: 'user', caseSensitive: false, wholeWord: false, useRegex: false });
+    const sections = (provider as any).buildSections();
+
+    const backend = sections.find((section: any) => section.id === 'backend');
+    const schemaNode = findNodeByLabel(backend.children, 'test');
+    const queries = findChildByLabel(schemaNode, 'Queries');
+    const queryNode = findPath(queries, ['p', 'schema.py', 'Query']);
+    const userField = findChildByLabel(queryNode, 'user');
+
+    expect((queryNode.children ?? []).map((child: any) => child.label)).toEqual(['user']);
+    expect(userField.desc).toContain('UserType');
+    expect(userField.children).toBeUndefined();
+  });
+
   it('renders expand-all control and horizontal scrolling in the webview shell', () => {
     const provider = new GraphqlViewProvider();
     const html = (provider as any).getHtml();
 
     expect(html).toContain('id="expand"');
     expect(html).toContain('overflow-x: auto;');
+    expect(html).toContain('SEARCH_DEBOUNCE_MS');
+    expect(html).toContain('search-match');
+    expect(html).toContain('highlightedHtml(node.label');
     expect(html).toContain("node.kind === 'file' || node.kind === 'operation'");
   });
 

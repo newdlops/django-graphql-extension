@@ -25,3 +25,6 @@ native/build.rs
 native/package.json
 native/package-lock.json
 native/.gitignore
+.zoek-rs/**
+.lh/**
+.codeidx/**

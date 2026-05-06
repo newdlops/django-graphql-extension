@@ -27,8 +27,29 @@ interface TreeSection {
   children: TreeNode[];
 }
 
+interface SearchFilter {
+  key: string;
+  query: string;
+  caseSensitive: boolean;
+  wholeWord: boolean;
+  useRegex: boolean;
+  queryLower: string;
+  pattern?: RegExp;
+}
+
+interface CachedSearchText {
+  raw: string;
+  lower: string;
+}
+
+type SortMode = 'none' | 'asc' | 'desc';
+
 function classIdFor(cls: ClassInfo): string {
   return `${cls.filePath}:${cls.lineNumber}:${cls.kind}:${cls.name}`;
+}
+
+function escapeRegex(source: string): string {
+  return source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export class GraphqlViewProvider implements vscode.WebviewViewProvider {
@@ -41,8 +62,11 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   private classMap = new Map<string, ClassInfo>();
   private coverage: CoverageMap = new Map();
   private frontendUsages: FrontendGqlFileUsage[] = [];
-  private filterPattern: RegExp | null = null;
-  private sortMode: 'none' | 'asc' | 'desc' = 'none';
+  private searchFilter: SearchFilter | null = null;
+  private sortMode: SortMode = 'none';
+  private unfilteredSectionsCache = new Map<SortMode, TreeSection[]>();
+  private classSearchText = new WeakMap<ClassInfo, CachedSearchText>();
+  private relativePathCache = new Map<string, string>();
 
   /**
    * List of class names the inspector can jump to (fed into the quick pick).
@@ -105,8 +129,10 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       } else if (msg.type === 'preview' && (msg.classId || msg.className)) {
         this.showPreview(msg.classId ?? msg.className);
       } else if (msg.type === 'sort') {
-        this.sortMode = msg.mode;
-        this.sendTree();
+        if (msg.mode !== this.sortMode) {
+          this.sortMode = msg.mode;
+          this.sendTree();
+        }
       }
     });
   }
@@ -117,6 +143,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     this.classContexts.clear();
     this.classIdsByName.clear();
     this.classMap.clear();
+    this.clearTreeCaches();
     for (const schema of schemas) {
       const schemaClassMap = new Map<string, ClassInfo>();
       const classes = [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types];
@@ -140,24 +167,17 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   }
 
   private applyFilter(msg: { query: string; caseSensitive: boolean; wholeWord: boolean; useRegex: boolean }): void {
-    if (!msg.query) {
-      this.filterPattern = null;
-    } else {
-      const flags = msg.caseSensitive ? '' : 'i';
-      let source = msg.useRegex ? msg.query : msg.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (msg.wholeWord) source = `\\b${source}\\b`;
-      try {
-        this.filterPattern = new RegExp(source, flags);
-      } catch {
-        this.filterPattern = new RegExp(msg.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
-      }
+    const nextFilter = this.createSearchFilter(msg);
+    if (this.searchFilter?.key === nextFilter?.key) {
+      return;
     }
+    this.searchFilter = nextFilter;
     this.sendTree();
   }
 
   private filterAndSortClasses(classes: ClassInfo[]): ClassInfo[] {
-    let result = this.filterPattern
-      ? classes.filter((cls) => this.filterPattern!.test(cls.name) || cls.fields.some((f) => this.filterPattern!.test(f.name)))
+    const result = this.searchFilter
+      ? classes.filter((cls) => this.matchesClass(cls))
       : [...classes];
     if (this.sortMode === 'asc') {
       result.sort((a, b) => a.name.localeCompare(b.name));
@@ -169,6 +189,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
 
   private buildBackendTree(): TreeNode[] {
     const roots: TreeNode[] = [];
+    const searchMode = !!this.searchFilter;
     for (const schema of this.schemas) {
       const schemaClassMap = new Map<string, ClassInfo>();
       for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
@@ -176,15 +197,15 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       }
       const categories: TreeNode[] = [];
       const fq = this.filterAndSortClasses(schema.queries);
-      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fq, schemaClassMap) });
+      if (fq.length > 0) categories.push({ label: 'Queries', desc: `${fq.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fq, schemaClassMap, searchMode) });
       const fm = this.filterAndSortClasses(schema.mutations);
-      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fm, schemaClassMap) });
+      if (fm.length > 0) categories.push({ label: 'Mutations', desc: `${fm.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fm, schemaClassMap, searchMode) });
       const fs = this.filterAndSortClasses(schema.subscriptions);
-      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fs, schemaClassMap) });
+      if (fs.length > 0) categories.push({ label: 'Subscriptions', desc: `${fs.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(fs, schemaClassMap, searchMode) });
       const ft = this.filterAndSortClasses(schema.types);
-      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(ft, schemaClassMap) });
+      if (ft.length > 0) categories.push({ label: 'Types', desc: `${ft.length}`, kind: 'category', icon: 'symbol-namespace', children: this.buildClassPathTree(ft, schemaClassMap, searchMode) });
 
-      if (this.filterPattern && categories.length === 0) continue;
+      if (this.searchFilter && categories.length === 0) continue;
       roots.push({ label: schema.name, kind: 'schema', icon: 'symbol-package', file: schema.filePath, children: categories });
     }
     return roots;
@@ -198,18 +219,28 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       usages.sort((a, b) => b.relativePath.localeCompare(a.relativePath));
     }
 
+    const roots = this.searchFilter
+      ? this.buildFilteredFrontendPathTree(usages)
+      : this.buildFrontendPathTree(usages);
+    this.decorateFrontendFolderCounts(roots);
+    return roots;
+  }
+
+  private buildFrontendPathTree(usages: FrontendGqlFileUsage[]): TreeNode[] {
     const roots: TreeNode[] = [];
+    const nodeIndexes = new WeakMap<TreeNode[], Map<string, TreeNode>>();
     for (const usage of usages) {
       const segments = usage.relativePath.split('/').filter(Boolean);
       if (segments.length === 0) continue;
 
       let cursor = roots;
       for (const segment of segments.slice(0, -1)) {
-        let folder = cursor.find((node) => node.icon === 'folder' && node.label === segment);
-        if (!folder) {
-          folder = { label: segment, kind: 'folder', icon: 'folder', children: [] };
-          cursor.push(folder);
-        }
+        const folder = this.findOrCreatePathNode(nodeIndexes, cursor, `folder:${segment}`, () => ({
+          label: segment,
+          kind: 'folder',
+          icon: 'folder',
+          children: [],
+        }));
         if (!folder.children) folder.children = [];
         cursor = folder.children;
       }
@@ -235,23 +266,77 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    const visible = this.filterPattern ? this.filterTreeNodes(roots) : roots;
-    this.decorateFrontendFolderCounts(visible);
-    return visible;
+    return roots;
+  }
+
+  private buildFilteredFrontendPathTree(usages: FrontendGqlFileUsage[]): TreeNode[] {
+    const roots: TreeNode[] = [];
+    const nodeIndexes = new WeakMap<TreeNode[], Map<string, TreeNode>>();
+    for (const usage of usages) {
+      const segments = usage.relativePath.split('/').filter(Boolean);
+      if (segments.length === 0) continue;
+
+      const pathMatches = segments.some((segment) => this.matchesValue(segment)) || this.matchesValue(usage.relativePath);
+      const operations = pathMatches
+        ? usage.operations
+        : usage.operations.filter((operation) =>
+          this.matchesValue(operation.label) || this.matchesValue(operation.rootFields.join(', ')),
+        );
+      if (!pathMatches && operations.length === 0) continue;
+
+      let cursor = roots;
+      for (const segment of segments.slice(0, -1)) {
+        const folder = this.findOrCreatePathNode(nodeIndexes, cursor, `folder:${segment}`, () => ({
+          label: segment,
+          kind: 'folder',
+          icon: 'folder',
+          children: [],
+        }));
+        if (!folder.children) folder.children = [];
+        cursor = folder.children;
+      }
+
+      const fileLabel = segments[segments.length - 1];
+      const operationNodes: TreeNode[] = operations.map((operation) => ({
+        label: operation.label,
+        desc: operation.rootFields.length > 0 ? operation.rootFields.join(', ') : undefined,
+        kind: 'operation',
+        icon: 'symbol-event',
+        file: usage.filePath,
+        line: operation.lineNumber,
+      }));
+
+      cursor.push({
+        label: fileLabel,
+        desc: usage.operationCount === 1 ? usage.operations[0].label : `${usage.operationCount} gql blocks`,
+        kind: 'file',
+        icon: 'file-code',
+        file: usage.filePath,
+        line: usage.operations[0]?.lineNumber ?? 0,
+        children: operationNodes.length > 0 ? operationNodes : undefined,
+      });
+    }
+
+    return roots;
   }
 
   private buildSections(): TreeSection[] {
+    if (!this.searchFilter) {
+      const cached = this.unfilteredSectionsCache.get(this.sortMode);
+      if (cached) return cached;
+    }
+
     const backendTree = this.buildBackendTree();
     const frontendTree = this.buildFrontendTree();
     const backendCount = this.countNodesByIcon(backendTree, 'symbol-class');
     const frontendCount = this.countNodesByIcon(frontendTree, 'file-code');
 
-    return [
+    const sections: TreeSection[] = [
       {
         id: 'backend',
         label: 'Backend',
         desc: `${backendCount} ${backendCount === 1 ? 'class' : 'classes'}`,
-        emptyMessage: this.filterPattern
+        emptyMessage: this.searchFilter
           ? 'No backend schema items matched the current filter.'
           : 'No backend schemas loaded yet.',
         openByDefault: true,
@@ -261,19 +346,24 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
         id: 'frontend',
         label: 'Frontend',
         desc: `${frontendCount} ${frontendCount === 1 ? 'file' : 'files'}`,
-        emptyMessage: this.filterPattern
+        emptyMessage: this.searchFilter
           ? 'No frontend gql files matched the current filter.'
           : 'No frontend gql templates found.',
         openByDefault: true,
         children: frontendTree,
       },
     ];
+    if (!this.searchFilter) {
+      this.unfilteredSectionsCache.set(this.sortMode, sections);
+    }
+    return sections;
   }
 
-  private buildClassNode(cls: ClassInfo, schemaClassMap: Map<string, ClassInfo>): TreeNode {
-    const children: TreeNode[] = cls.fields.map((f) => {
+  private buildClassNode(cls: ClassInfo, schemaClassMap: Map<string, ClassInfo>, searchMode = false): TreeNode {
+    const visibleFields = searchMode ? cls.fields.filter((field) => this.matchesValue(field.name)) : cls.fields;
+    const children: TreeNode[] = visibleFields.map((f) => {
       const resolvedClass = f.resolvedType ? schemaClassMap.get(f.resolvedType) : undefined;
-      const resolvedChildren = resolvedClass ? this.buildResolvedChildren(resolvedClass) : undefined;
+      const resolvedChildren = !searchMode && resolvedClass ? this.buildResolvedChildren(resolvedClass) : undefined;
       return {
         label: f.name,
         desc: f.fieldType + (f.resolvedType ? ` → ${f.resolvedType}` : ''),
@@ -296,10 +386,11 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private buildClassPathTree(classes: ClassInfo[], schemaClassMap: Map<string, ClassInfo>): TreeNode[] {
+  private buildClassPathTree(classes: ClassInfo[], schemaClassMap: Map<string, ClassInfo>, searchMode = false): TreeNode[] {
     const roots: TreeNode[] = [];
+    const nodeIndexes = new WeakMap<TreeNode[], Map<string, TreeNode>>();
     for (const cls of classes) {
-      const classNode = this.buildClassNode(cls, schemaClassMap);
+      const classNode = this.buildClassNode(cls, schemaClassMap, searchMode);
       const relativeFilePath = this.relativeFilePath(cls.filePath);
       const segments = relativeFilePath.split(/[\\/]/).filter(Boolean);
       if (segments.length === 0) {
@@ -311,18 +402,15 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         const isFile = i === segments.length - 1;
-        let node = cursor.find((child) => child.label === segment && child.kind === (isFile ? 'file' : 'folder'));
-        if (!node) {
-          node = {
-            label: segment,
-            kind: isFile ? 'file' : 'folder',
-            icon: isFile ? 'file-code' : 'folder',
-            file: isFile ? cls.filePath : undefined,
-            line: isFile ? cls.lineNumber : undefined,
-            children: [],
-          };
-          cursor.push(node);
-        }
+        const kind = isFile ? 'file' : 'folder';
+        const node = this.findOrCreatePathNode(nodeIndexes, cursor, `${kind}:${segment}`, () => ({
+          label: segment,
+          kind,
+          icon: isFile ? 'file-code' : 'folder',
+          file: isFile ? cls.filePath : undefined,
+          line: isFile ? cls.lineNumber : undefined,
+          children: [],
+        }));
         if (!node.children) node.children = [];
         if (isFile) {
           node.children.push(classNode);
@@ -336,10 +424,17 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
 
   private relativeFilePath(filePath: string): string {
     if (!filePath) return '';
+    const cached = this.relativePathCache.get(filePath);
+    if (cached !== undefined) return cached;
     const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
-    if (!folder) return filePath;
+    if (!folder) {
+      this.relativePathCache.set(filePath, filePath);
+      return filePath;
+    }
     const relative = path.relative(folder.uri.fsPath, filePath);
-    return relative || path.basename(filePath);
+    const out = relative || path.basename(filePath);
+    this.relativePathCache.set(filePath, out);
+    return out;
   }
 
   private buildResolvedChildren(cls: ClassInfo): TreeNode[] | undefined {
@@ -354,28 +449,6 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     }));
   }
 
-  private filterTreeNodes(nodes: TreeNode[]): TreeNode[] {
-    if (!this.filterPattern) return nodes;
-    const out: TreeNode[] = [];
-    for (const node of nodes) {
-      const ownMatch = this.matchesFilter(node.label) || this.matchesFilter(node.desc);
-      if (ownMatch) {
-        out.push({ ...node });
-        continue;
-      }
-
-      const children = node.children ? this.filterTreeNodes(node.children) : undefined;
-      if (children && children.length > 0) {
-        out.push({ ...node, children });
-      }
-    }
-    return out;
-  }
-
-  private matchesFilter(value?: string): boolean {
-    return !!(value && this.filterPattern && this.filterPattern.test(value));
-  }
-
   private decorateFrontendFolderCounts(nodes: TreeNode[]): number {
     let fileCount = 0;
     for (const node of nodes) {
@@ -388,6 +461,96 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       }
     }
     return fileCount;
+  }
+
+  private findOrCreatePathNode(
+    nodeIndexes: WeakMap<TreeNode[], Map<string, TreeNode>>,
+    cursor: TreeNode[],
+    key: string,
+    create: () => TreeNode,
+  ): TreeNode {
+    let index = nodeIndexes.get(cursor);
+    if (!index) {
+      index = new Map();
+      for (const node of cursor) index.set(`${node.kind}:${node.label}`, node);
+      nodeIndexes.set(cursor, index);
+    }
+
+    let node = index.get(key);
+    if (!node) {
+      node = create();
+      cursor.push(node);
+      index.set(key, node);
+    }
+    return node;
+  }
+
+  private createSearchFilter(msg: { query: string; caseSensitive: boolean; wholeWord: boolean; useRegex: boolean }): SearchFilter | null {
+    const query = msg.query.trim();
+    if (!query) return null;
+
+    const flags = msg.caseSensitive ? '' : 'i';
+    let pattern: RegExp | undefined;
+    if (msg.useRegex || msg.wholeWord) {
+      const literalSource = escapeRegex(query);
+      let source = msg.useRegex ? query : literalSource;
+      if (msg.wholeWord) source = `\\b${source}\\b`;
+      try {
+        pattern = new RegExp(source, flags);
+      } catch {
+        pattern = new RegExp(literalSource, flags);
+      }
+    }
+
+    return {
+      key: [query, msg.caseSensitive ? '1' : '0', msg.wholeWord ? '1' : '0', msg.useRegex ? '1' : '0'].join('\u0000'),
+      query,
+      caseSensitive: msg.caseSensitive,
+      wholeWord: msg.wholeWord,
+      useRegex: msg.useRegex,
+      queryLower: query.toLowerCase(),
+      pattern,
+    };
+  }
+
+  private matchesClass(cls: ClassInfo): boolean {
+    const filter = this.searchFilter;
+    if (!filter) return true;
+    if (filter.pattern) {
+      return this.matchesValue(cls.name) || cls.fields.some((field) => this.matchesValue(field.name));
+    }
+
+    const cached = this.getClassSearchText(cls);
+    const haystack = filter.caseSensitive ? cached.raw : cached.lower;
+    const needle = filter.caseSensitive ? filter.query : filter.queryLower;
+    return haystack.includes(needle);
+  }
+
+  private matchesValue(value?: string): boolean {
+    const filter = this.searchFilter;
+    if (!value || !filter) return false;
+    if (filter.pattern) {
+      filter.pattern.lastIndex = 0;
+      return filter.pattern.test(value);
+    }
+    const haystack = filter.caseSensitive ? value : value.toLowerCase();
+    const needle = filter.caseSensitive ? filter.query : filter.queryLower;
+    return haystack.includes(needle);
+  }
+
+  private getClassSearchText(cls: ClassInfo): CachedSearchText {
+    const cached = this.classSearchText.get(cls);
+    if (cached) return cached;
+    const raw = [cls.name, ...cls.fields.map((field) => field.name)].join('\n');
+    const next = { raw, lower: raw.toLowerCase() };
+    this.classSearchText.set(cls, next);
+    return next;
+  }
+
+  private clearTreeCaches(): void {
+    this.unfilteredSectionsCache.clear();
+    this.classSearchText = new WeakMap();
+    this.relativePathCache.clear();
   }
 
   private countNodesByIcon(nodes: TreeNode[], icon: string): number {
@@ -651,7 +814,7 @@ window.addEventListener('message', (e) => {
   private sendTree(): void {
     if (!this.view) return;
     const sections = this.buildSections();
-    this.view.webview.postMessage({ type: 'tree', sections, hasFilter: !!this.filterPattern, sortMode: this.sortMode });
+    this.view.webview.postMessage({ type: 'tree', sections, hasFilter: !!this.searchFilter, sortMode: this.sortMode });
   }
 
   private getHtml(): string {
@@ -839,6 +1002,11 @@ body {
   overflow: visible;
   text-overflow: clip;
 }
+.search-match {
+  border-radius: 2px;
+  background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.35));
+  color: var(--vscode-editor-findMatchForeground, inherit);
+}
 .children { display: none; }
 .children.open { display: block; }
 
@@ -884,14 +1052,30 @@ const sectionState = { backend: true, frontend: true };
 let expandMode = 'default';
 let lastSections = [];
 let lastHasFilter = false;
+let searchTimer = 0;
+const SEARCH_DEBOUNCE_MS = 180;
 
-function emitSearch() {
+function emitSearchNow() {
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = 0;
+  }
   vscode.postMessage({ type: 'search', query: input.value, ...searchState });
 }
+
+function scheduleSearch() {
+  if (input.value.length === 0) {
+    emitSearchNow();
+    return;
+  }
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(emitSearchNow, SEARCH_DEBOUNCE_MS);
+}
+
 function toggleBtn(btn, key) {
   searchState[key] = !searchState[key];
   btn.classList.toggle('active', searchState[key]);
-  emitSearch();
+  emitSearchNow();
 }
 
 function syncExpandButton() {
@@ -911,7 +1095,7 @@ function rerenderTree() {
   renderSections(lastSections, lastHasFilter);
 }
 
-input.addEventListener('input', emitSearch);
+input.addEventListener('input', scheduleSearch);
 caseBtn.addEventListener('click', () => toggleBtn(caseBtn, 'caseSensitive'));
 wordBtn.addEventListener('click', () => toggleBtn(wordBtn, 'wholeWord'));
 regexBtn.addEventListener('click', () => toggleBtn(regexBtn, 'useRegex'));
@@ -944,20 +1128,67 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
+}
+
+function buildHighlightPattern() {
+  const query = input.value.trim();
+  if (!query) return null;
+
+  let source = searchState.useRegex ? query : escapeRegExp(query);
+  if (searchState.wholeWord) source = '\\b' + source + '\\b';
+
+  try {
+    return new RegExp(source, searchState.caseSensitive ? 'g' : 'gi');
+  } catch {
+    return new RegExp(escapeRegExp(query), searchState.caseSensitive ? 'g' : 'gi');
+  }
+}
+
+function highlightedHtml(value, pattern) {
+  const text = String(value || '');
+  if (!pattern) return escapeHtml(text);
+
+  let out = '';
+  let lastIndex = 0;
+  let matched = false;
+  let match;
+  pattern.lastIndex = 0;
+
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (start === end) {
+      pattern.lastIndex = start + 1;
+      if (pattern.lastIndex > text.length) break;
+      continue;
+    }
+
+    out += escapeHtml(text.slice(lastIndex, start)) +
+      '<span class="search-match">' + escapeHtml(text.slice(start, end)) + '</span>';
+    lastIndex = end;
+    matched = true;
+  }
+
+  return matched ? out + escapeHtml(text.slice(lastIndex)) : escapeHtml(text);
+}
+
 function renderSections(sections, hasFilter) {
   sectionsEl.innerHTML = '';
   if (!sections || sections.length === 0) {
     sectionsEl.innerHTML = '<div class="tree-empty">No items found</div>';
     return;
   }
+  const highlightPattern = hasFilter ? buildHighlightPattern() : null;
   const frag = document.createDocumentFragment();
   for (const section of sections) {
-    frag.appendChild(buildSection(section, hasFilter));
+    frag.appendChild(buildSection(section, hasFilter, highlightPattern));
   }
   sectionsEl.appendChild(frag);
 }
 
-function buildSection(section, hasFilter) {
+function buildSection(section, hasFilter, highlightPattern) {
   const details = document.createElement('details');
   details.className = 'accordion';
   const remembered = Object.prototype.hasOwnProperty.call(sectionState, section.id)
@@ -983,7 +1214,7 @@ function buildSection(section, hasFilter) {
     const tree = document.createElement('div');
     tree.className = 'tree';
     for (const node of section.children) {
-      tree.appendChild(buildNode(node, 0, hasFilter, section.id));
+      tree.appendChild(buildNode(node, 0, hasFilter, section.id, highlightPattern));
     }
     body.appendChild(tree);
   }
@@ -996,7 +1227,7 @@ function buildSection(section, hasFilter) {
   return details;
 }
 
-function buildNode(node, depth, autoExpand, sectionId) {
+function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
   const wrapper = document.createElement('div');
   const hasChildren = node.children && node.children.length > 0;
 
@@ -1020,13 +1251,13 @@ function buildNode(node, depth, autoExpand, sectionId) {
 
   const label = document.createElement('span');
   label.className = 'label';
-  label.textContent = node.label;
+  label.innerHTML = highlightedHtml(node.label, highlightPattern);
   row.appendChild(label);
 
   if (node.desc) {
     const desc = document.createElement('span');
     desc.className = 'desc';
-    desc.textContent = node.desc;
+    desc.innerHTML = highlightedHtml(node.desc, highlightPattern);
     row.appendChild(desc);
   }
 
@@ -1042,7 +1273,7 @@ function buildNode(node, depth, autoExpand, sectionId) {
       childrenEl.classList.add('open');
       twistie.textContent = '▾';
       for (const child of node.children) {
-        childrenEl.appendChild(buildNode(child, depth + 1, autoExpand, sectionId));
+        childrenEl.appendChild(buildNode(child, depth + 1, autoExpand, sectionId, highlightPattern));
       }
     }
 
@@ -1055,7 +1286,7 @@ function buildNode(node, depth, autoExpand, sectionId) {
     twistie.textContent = isOpen ? '▾' : '▸';
     if (isOpen && childrenEl.children.length === 0) {
       for (const child of node.children) {
-        childrenEl.appendChild(buildNode(child, depth + 1, false, sectionId));
+        childrenEl.appendChild(buildNode(child, depth + 1, false, sectionId, highlightPattern));
       }
     }
   }
