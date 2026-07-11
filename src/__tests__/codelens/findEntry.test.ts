@@ -121,4 +121,91 @@ describe('findEntry — strict parent filtering (phase n)', () => {
     expect(ts.some((t) => t.includes('AccountType.name'))).toBe(false);
     expect(ts.some((t) => t.includes('CompanyType.name'))).toBe(false);
   });
+
+  it('only treats explicitly marked schema containers as operation roots', () => {
+    // Scanner output intentionally groups reachable return types and mixins as
+    // `query`, and mutation payloads as `mutation`, for the explorer UI.  They
+    // are not valid top-level operation containers.
+    const userType = cls('UserType', [f('name')], 'query');
+    const createUser = cls('CreateUser', [f('ok')], 'mutation');
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    query.isSchemaRoot = true;
+    const mutation = cls('Mutation', [f('create_user', 'Field', { resolvedType: 'CreateUser' })], 'mutation');
+    mutation.isSchemaRoot = true;
+    const p = makeProvider(new Map([
+      [userType.name, userType], [createUser.name, createUser],
+      [query.name, query], [mutation.name, mutation],
+    ]));
+
+    const src = [
+      'gql`query { name }`;',
+      'gql`mutation { ok }`;',
+    ].join('\n');
+    const ts = titlesOf(p.provideCodeLenses(new TextDocument(src) as any));
+    expect(ts.some((t) => t.includes('UserType.name'))).toBe(false);
+    expect(ts.some((t) => t.includes('CreateUser.ok'))).toBe(false);
+  });
+
+  it('keeps fields from marked root mixins eligible without admitting return types', () => {
+    const mixin = cls('AccountQueries', [f('account')], 'query');
+    mixin.isSchemaRootContributor = true;
+    const query = cls('Query', [], 'query', ['AccountQueries']);
+    query.isSchemaRoot = true;
+    const returned = cls('AccountType', [f('display_name')], 'query');
+    const p = makeProvider(new Map([
+      [mixin.name, mixin], [query.name, query], [returned.name, returned],
+    ]));
+
+    const valid = titlesOf(p.provideCodeLenses(new TextDocument('gql`query { account }`;') as any));
+    expect(valid).toContain('→ AccountQueries.account [Query]');
+
+    const invalid = titlesOf(p.provideCodeLenses(new TextDocument('gql`query { displayName }`;') as any));
+    expect(invalid.some((t) => t.includes('AccountType.display_name'))).toBe(false);
+  });
+
+  it('matches an exact SDL/Ariadne wire name before snake_case fallback', () => {
+    const userType = cls('UserType', [f('displayName', 'String', { graphqlName: 'displayName' })]);
+    const query = cls('Query', [
+      f('userById', 'UserType', { graphqlName: 'userById', resolvedType: 'UserType' }),
+    ], 'query');
+    query.isSchemaRoot = true;
+    const p = makeProvider(new Map([[userType.name, userType], [query.name, query]]));
+
+    const ts = titlesOf(p.provideCodeLenses(
+      new TextDocument('gql`query { userById { displayName } }`;') as any,
+    ));
+    expect(ts).toContain('→ Query.userById [Query]');
+    expect(ts).toContain('→ UserType.displayName [Type]');
+  });
+
+  it('does not expose a Python source name replaced by a GraphQL name override', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [
+      f('user_by_pk', 'Field', { graphqlName: 'user', resolvedType: 'UserType' }),
+    ], 'query');
+    query.isSchemaRoot = true;
+    const p = makeProvider(new Map([[userType.name, userType], [query.name, query]]));
+
+    const valid = titlesOf(p.provideCodeLenses(new TextDocument('gql`query { user { id } }`;') as any));
+    expect(valid).toContain('→ Query.user_by_pk [Query]');
+
+    const invalid = titlesOf(p.provideCodeLenses(new TextDocument('gql`query { userByPk { id } }`;') as any));
+    expect(invalid.some((t) => t.includes('Query.user_by_pk'))).toBe(false);
+  });
+
+  it('routes fields inside fragment conditions to the conditioned backend type', () => {
+    const nodeType = cls('NodeType', [f('id')]);
+    const userType = cls('UserType', [f('email')]);
+    const query = cls('Query', [f('node', 'Field', { resolvedType: 'NodeType' })], 'query');
+    query.isSchemaRoot = true;
+    const p = makeProvider(new Map([
+      [nodeType.name, nodeType], [userType.name, userType], [query.name, query],
+    ]));
+
+    const ts = titlesOf(p.provideCodeLenses(
+      new TextDocument('gql`query { node { id ... on UserType { email } } }`;') as any,
+    ));
+    expect(ts).toContain('→ UserType.email [Type]');
+    expect(ts.some((t) => t.includes('NodeType.email'))).toBe(false);
+  });
 });

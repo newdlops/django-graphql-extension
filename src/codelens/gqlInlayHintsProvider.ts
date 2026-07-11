@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, mergeFragments, expandGqlBody, FragmentDef } from './gqlCodeLensProvider';
-import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, MatchedEntry, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
+import { FieldIndex, ResolutionContext, RootOperationKind, findClassByGraphqlName, findEntry, hasSchemaRootForOperation, isGraphqlMetaField, MatchedEntry, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass, selectResolutionContext } from './gqlResolver';
 
 /** Serializable inlay-hint description — pure output of computeInlayHints. */
 export interface InlayHintInfo {
@@ -22,6 +22,8 @@ interface ComputeCtx {
   fieldIndex: FieldIndex;
   workspaceFragments?: Map<string, FragmentDef>;
   workspaceConstBodies?: Map<string, string>;
+  resolutionContexts?: ResolutionContext[];
+  documentPath?: string;
 }
 
 /**
@@ -46,14 +48,21 @@ export function computeInlayHints(text: string, ctx: ComputeCtx): InlayHintInfo[
     const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
     const fragCtx = readFragmentContextFromGql(gqlBody);
+    const rootKind = fragCtx ? 'unknown' : readRootOperationKindFromGql(gqlBody);
+    const selected = selectResolutionContext(ctx.resolutionContexts, parsed, rootKind, {
+      fragmentType: fragCtx?.onType,
+      documentPath: ctx.documentPath,
+    })?.context;
+    const activeCtx: ComputeCtx = selected
+      ? { ...ctx, classMap: selected.classMap, fieldIndex: selected.fieldIndex }
+      : ctx;
     if (fragCtx) {
-      const fragCls = ctx.classMap.get(fragCtx.onType);
+      const fragCls = findClassByGraphqlName(activeCtx.classMap, fragCtx.onType);
       if (!fragCls) continue;
-      walkHints(parsed, fragCls, startOffset, ctx, hints, 'unknown');
+      walkHints(parsed, fragCls, startOffset, activeCtx, hints, 'unknown');
       continue;
     }
-    const rootKind = readRootOperationKindFromGql(gqlBody);
-    walkHints(parsed, null, startOffset, ctx, hints, rootKind);
+    walkHints(parsed, null, startOffset, activeCtx, hints, rootKind);
   }
   return hints;
 }
@@ -67,8 +76,16 @@ function walkHints(
   rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
+    const conditionedParent = gf.typeCondition
+      ? findClassByGraphqlName(ctx.classMap, gf.typeCondition)
+      : parentCls;
+    if (gf.typeCondition && !conditionedParent) continue;
+    if (isGraphqlMetaField(gf.name, conditionedParent, rootKind)) continue;
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, conditionedParent, {
+      rootKind,
+      graphqlFieldName: gf.name,
+    });
 
     const hintOffset = baseOffset + gf.nameOffset + gf.nameLength;
     if (entry) {
@@ -81,13 +98,13 @@ function walkHints(
         confidence: entry.confidence,
         target: resolveTarget(entry, ctx.classMap),
       });
-    } else if (parentCls || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
+    } else if (conditionedParent || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
       // Parent/root was known but field didn't belong to it — visible ? so users know.
       out.push({
         offset: hintOffset,
         label: ' → ?',
-        tooltip: parentCls
-          ? `No field named '${snake}' on ${parentCls.name} (or its ancestors)`
+      tooltip: conditionedParent
+          ? `No field named '${snake}' on ${conditionedParent.name} (or its ancestors)`
           : `No root ${rootKind} field named '${snake}' in the schema`,
         confidence: 'unresolved',
       });
@@ -104,7 +121,7 @@ function resolveTarget(entry: MatchedEntry, classMap: Map<string, ClassInfo>) {
   // if it's a scalar, fall back to the owning class of the field.
   const resolvedType = entry.field.resolvedType;
   if (resolvedType) {
-    const target = classMap.get(resolvedType);
+    const target = findClassByGraphqlName(classMap, resolvedType);
     if (target) return { filePath: target.filePath, line: target.lineNumber };
   }
   return { filePath: entry.cls.filePath, line: entry.cls.lineNumber };
@@ -174,7 +191,7 @@ export class GqlInlayHintsProvider implements vscode.InlayHintsProvider {
 
     const ctx = this.readState();
     if (ctx.fieldIndex.size === 0) return [];
-    const infos = computeInlayHints(document.getText(), ctx);
+    const infos = computeInlayHints(document.getText(), { ...ctx, documentPath: document.fileName });
     const rangeStart = document.offsetAt(range.start);
     const rangeEnd = document.offsetAt(range.end);
 

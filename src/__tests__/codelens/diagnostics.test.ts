@@ -97,6 +97,84 @@ describe('computeDiagnostics (phase v)', () => {
     expect(diags).toEqual([]);
   });
 
+  it('does not replace an explicit unknown resolvedType with a name-based guess', () => {
+    const companyType = cls('CompanyType', [f('address')]);
+    const stockType = cls('StockType', [
+      f('company', 'Field', { resolvedType: 'ExternalCompanyPayload' }),
+    ]);
+    const query = cls('Query', [f('stock', 'Field', { resolvedType: 'StockType' })], 'query');
+    const ctx = ctxFromClasses([companyType, stockType, query]);
+
+    // `company` happens to infer CompanyType by name, but the scanner already
+    // told us its actual type is ExternalCompanyPayload.  Descendants must be
+    // left unjudged instead of being validated against the wrong class.
+    const diags = computeDiagnostics('gql`query { stock { company { bogus } } }`;', ctx);
+    expect(diags).toEqual([]);
+  });
+
+  it('does not infer an object type for a scalar field with the same name', () => {
+    const companyType = cls('CompanyType', [f('bogus')]);
+    const stockType = cls('StockType', [f('company', 'String')]);
+    const query = cls('Query', [f('stock', 'Field', { resolvedType: 'StockType' })], 'query');
+    const ctx = ctxFromClasses([companyType, stockType, query]);
+
+    expect(computeDiagnostics('gql`query { stock { company { bogus } } }`;', ctx)).toEqual([]);
+  });
+
+  it('does not guess when field-name type inference has multiple candidates', () => {
+    const company = cls('Company', [f('legal_name')]);
+    const companyType = cls('CompanyType', [f('display_name')]);
+    const query = cls('Query', [f('company', 'Field')], 'query');
+    const ctx = ctxFromClasses([company, companyType, query]);
+
+    expect(computeDiagnostics('gql`query { company { bogus } }`;', ctx)).toEqual([]);
+  });
+
+  it('accepts exact camelCase wire names from SDL/Ariadne fields', () => {
+    const userType = cls('UserType', [f('displayName', 'String', { graphqlName: 'displayName' })]);
+    const query = cls('Query', [
+      f('userById', 'UserType', { graphqlName: 'userById', resolvedType: 'UserType' }),
+    ], 'query');
+    query.isSchemaRoot = true;
+    const ctx = ctxFromClasses([userType, query]);
+
+    expect(computeDiagnostics('gql`query { userById { displayName } }`;', ctx)).toEqual([]);
+  });
+
+  it('accepts built-in GraphQL meta fields without backend declarations', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    query.isSchemaRoot = true;
+    const ctx = ctxFromClasses([userType, query]);
+
+    const src = 'gql`query { __typename __schema { queryType { name } } user { __typename id } }`;';
+    expect(computeDiagnostics(src, ctx)).toEqual([]);
+  });
+
+  it('resolves fragment type conditions by an overridden GraphQL type name', () => {
+    const userType = cls('UserType', [f('id'), f('display_name')]);
+    userType.graphqlName = 'User';
+    const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');
+    query.isSchemaRoot = true;
+    const ctx = ctxFromClasses([userType, query]);
+
+    expect(computeDiagnostics('gql`fragment UserFields on User { id displayName }`;', ctx)).toEqual([]);
+  });
+
+  it('switches parent type for inline and named fragment conditions', () => {
+    const nodeType = cls('NodeType', [f('id')]);
+    const userType = cls('UserType', [f('id'), f('email')]);
+    const query = cls('Query', [f('node', 'Field', { resolvedType: 'NodeType' })], 'query');
+    query.isSchemaRoot = true;
+    const ctx = ctxFromClasses([nodeType, userType, query]);
+
+    const inline = 'gql`query { node { id ... on UserType { email } } }`;';
+    expect(computeDiagnostics(inline, ctx)).toEqual([]);
+
+    const named = 'gql`fragment UserFields on UserType { email } query { node { id ...UserFields } }`;';
+    expect(computeDiagnostics(named, ctx)).toEqual([]);
+  });
+
   it('respects the snake↔camel conversion in the message', () => {
     const userType = cls('UserType', [f('created_at', 'DateTime')]);
     const query = cls('Query', [f('user', 'Field', { resolvedType: 'UserType' })], 'query');

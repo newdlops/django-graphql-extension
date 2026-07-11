@@ -177,6 +177,10 @@ export const workspace = {
   findFiles: async (_include: unknown, _exclude?: unknown) => {
     return [...__mockFiles.keys()].map((p) => Uri.file(p));
   },
+  openTextDocument: async (uri: Uri) => new TextDocument(
+    __mockFiles.get(uri.fsPath) ?? '',
+    uri.fsPath,
+  ),
   fs: {
     readFile: async (uri: Uri): Promise<Uint8Array> => {
       const content = __mockFiles.get(uri.fsPath) ?? '';

@@ -9,7 +9,6 @@ import { ParseCache } from './scanner/parseCache';
 import { detectProjects, invalidateDetectCache } from './scanner/djangoDetector';
 import { scanProjects } from './scanner/scanAll';
 import { parseFileNative, hashTextNative, isNativeAvailable } from './scanner/nativeScanner';
-import { ClassInfo } from './types';
 import { log, info } from './logger';
 import { prepareDocumentGql } from './analysis/gqlCoverage';
 import { buildQueryStructure, buildLazySubtree } from './analysis/queryStructure';
@@ -18,7 +17,10 @@ import { renderQueryStructureHtml, renderSubtreeNodesHtml } from './preview/quer
 import { hydrateGqlField, GqlFieldLite } from './codelens/gqlCodeLensProvider';
 import { LiveQueryInspector } from './preview/liveQueryInspector';
 
-const GQL_LANGUAGES = new Set(['typescript', 'typescriptreact', 'javascript', 'javascriptreact']);
+const GQL_LANGUAGES = new Set([
+  'typescript', 'typescriptreact', 'javascript', 'javascriptreact',
+  'vue', 'svelte', 'astro',
+]);
 
 export function activate(context: vscode.ExtensionContext) {
   const parseCache = new ParseCache(context.globalState);
@@ -36,6 +38,9 @@ export function activate(context: vscode.ExtensionContext) {
     { language: 'typescriptreact', scheme: 'file' },
     { language: 'javascript', scheme: 'file' },
     { language: 'javascriptreact', scheme: 'file' },
+    { language: 'vue', scheme: 'file' },
+    { language: 'svelte', scheme: 'file' },
+    { language: 'astro', scheme: 'file' },
   ];
 
   context.subscriptions.push(
@@ -60,8 +65,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   const showMissingFieldsCommand = vscode.commands.registerCommand(
     'djangoGraphqlExplorer.showMissingFields',
-    (typeName: string, gqlFieldLite: GqlFieldLite, ownerClsName?: string, ownerFieldName?: string) => {
-      const { classMap } = codeLensProvider.getSharedState();
+    (typeName: string, gqlFieldLite: GqlFieldLite, ownerClsName?: string, ownerFieldName?: string, resolutionContextId?: string) => {
+      const state = codeLensProvider.getSharedState();
+      const classMap = state.resolutionContexts.find((ctx) => ctx.id === resolutionContextId)?.classMap
+        ?? state.classMap;
       const cls = classMap.get(typeName);
       if (!cls) {
         vscode.window.showInformationMessage(`Django GraphQL: class '${typeName}' not in the current schema index.`);
@@ -156,28 +163,27 @@ export function activate(context: vscode.ExtensionContext) {
     log(`[refresh] Frontend gql files: ${frontendUsages.length}, workspace fragments: ${workspaceFragments.fragments.size}, gql consts: ${workspaceFragments.constBodies.size}`);
     viewProvider.updateSchemas(allSchemas, frontendUsages);
 
-    // Build classMap for CodeLens
+    // Build independent schema-local resolver contexts for CodeLens and all
+    // shared diagnostics providers. Class names are not globally unique.
     const __tClassMapStart = performance.now();
-    const classMap = new Map<string, ClassInfo>();
-    for (const schema of allSchemas) {
-      for (const cls of [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types]) {
-        classMap.set(cls.name, cls);
-      }
-    }
+    codeLensProvider.updateSchemas(allSchemas);
     const __tClassMap = performance.now() - __tClassMapStart;
+    const indexedClassCount = codeLensProvider.getSharedState().resolutionContexts
+      .reduce((sum, ctx) => sum + ctx.classMap.size, 0);
 
-    codeLensProvider.updateIndex(classMap);
     codeLensProvider.updateWorkspaceFragments(workspaceFragments);
-    // After the CodeLens index's debounced rebuild, poke the InlayHints
-    // provider so it re-queries getSharedState() and repaints.
-    setTimeout(() => inlayHintsProvider.refresh(), 250);
+    inlayHintsProvider.refresh();
+    // A scan can finish long after the editor first opened.  Re-run every
+    // active-document consumer now so diagnostics/decorations don't remain
+    // stuck on the empty pre-scan state until the user types or changes tabs.
+    pushCoverage();
 
     const r = (n: number) => Math.round(n);
     info(
       `[timing] doRefresh total=${r(performance.now() - __tTotalStart)}ms ` +
       `detect=${r(__tDetect)}ms scan=${r(__tScan)}ms frontend=${r(__tFrontend)}ms ` +
-      `classMap=${r(__tClassMap)}ms(n=${classMap.size}) fragments=${workspaceFragments.fragments.size} constBodies=${workspaceFragments.constBodies.size} ` +
-      `(codeLens index build runs async after 200ms debounce)`,
+      `schemaContexts=${r(__tClassMap)}ms(n=${allSchemas.length}, classes=${indexedClassCount}) fragments=${workspaceFragments.fragments.size} constBodies=${workspaceFragments.constBodies.size} ` +
+      `(codeLens index built atomically)`,
     );
   }
 
@@ -356,7 +362,7 @@ export function activate(context: vscode.ExtensionContext) {
   // --- Active editor watcher — feeds gql coverage to the Inspector panel
   //     AND schedules diagnostic refresh for the focused document.
   let coverageTimeout: NodeJS.Timeout | undefined;
-  const pushCoverage = () => {
+  function pushCoverage(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor || !GQL_LANGUAGES.has(editor.document.languageId)) {
       viewProvider.setActiveGqlBodies([]);
@@ -375,7 +381,7 @@ export function activate(context: vscode.ExtensionContext) {
     diagnosticsManager.scheduleRefresh(editor.document);
     decorationManager.scheduleRefresh(editor);
     liveInspector.scheduleRefresh();
-  };
+  }
   const debouncedCoverage = () => {
     if (coverageTimeout) clearTimeout(coverageTimeout);
     coverageTimeout = setTimeout(pushCoverage, 250);

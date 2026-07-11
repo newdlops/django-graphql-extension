@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 6,
+            "activePatchIndex": 8,
             "patches": [
                 {
                     "date": 1776598965430,
@@ -32,6 +32,14 @@
                 {
                     "date": 1776963587862,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-graphql-explorer\",\n   \"displayName\": \"Django GraphQL Explorer\",\n   \"description\": \"Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace\",\n-  \"version\": \"0.0.8\",\n+  \"version\": \"0.0.9\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1778085683765,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-graphql-explorer\",\n   \"displayName\": \"Django GraphQL Explorer\",\n   \"description\": \"Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace\",\n-  \"version\": \"0.0.9\",\n+  \"version\": \"0.1.0\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -82,8 +82,12 @@\n       {\n         \"command\": \"djangoGraphqlExplorer.openLiveInspector\",\n         \"title\": \"Django GraphQL: Open Live Query Structure\",\n         \"icon\": \"$(json)\"\n+      },\n+      {\n+        \"command\": \"djangoGraphqlExplorer.dumpFragmentIndex\",\n+        \"title\": \"Django GraphQL: Dump Fragment Index\"\n       }\n     ],\n     \"menus\": {\n       \"view/title\": [\n"
+                },
+                {
+                    "date": 1783755243783,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-graphql-explorer\",\n   \"displayName\": \"Django GraphQL Explorer\",\n   \"description\": \"Discover and navigate GraphQL schemas (Graphene, Strawberry, Ariadne, .graphql files) in your Django workspace\",\n-  \"version\": \"0.1.0\",\n+  \"version\": \"0.1.1\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
                 }
             ],
             "date": 1776598965430,

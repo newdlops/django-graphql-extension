@@ -84,6 +84,40 @@ describe('computeQueryCoverage (phase q)', () => {
     expect(cov.get('UserType')).toEqual(new Set(['first_name', 'last_name']));
   });
 
+  it('records an overridden wire name against the source field identity', () => {
+    const userType = cls('UserType', [f('id')]);
+    const query = cls('Query', [
+      f('user_by_pk', 'Field', { graphqlName: 'user', resolvedType: 'UserType' }),
+    ], 'query');
+    query.isSchemaRoot = true;
+    const classMap = new Map([[userType.name, userType], [query.name, query]]);
+
+    const cov = computeQueryCoverage(['query { user { id } }'], { classMap, schemaRoots: [query] });
+    expect(cov.get('Query')).toEqual(new Set(['user_by_pk']));
+  });
+
+  it('scopes equal root field names to the operation kind', () => {
+    const queryPayload = cls('QueryPayload', [f('value')]);
+    const mutationPayload = cls('MutationPayload', [f('ok')]);
+    const query = cls('Query', [f('status', 'Field', { resolvedType: 'QueryPayload' })], 'query');
+    query.isSchemaRoot = true;
+    const mutation = cls('Mutation', [f('status', 'Field', { resolvedType: 'MutationPayload' })], 'mutation');
+    mutation.isSchemaRoot = true;
+    const classMap = new Map([
+      [queryPayload.name, queryPayload], [mutationPayload.name, mutationPayload],
+      [query.name, query], [mutation.name, mutation],
+    ]);
+
+    const cov = computeQueryCoverage(
+      ['mutation Update { status { ok } }'],
+      { classMap, schemaRoots: [query, mutation] },
+    );
+    expect(cov.get('Mutation')).toEqual(new Set(['status']));
+    expect(cov.get('MutationPayload')).toEqual(new Set(['ok']));
+    expect(cov.has('Query')).toBe(false);
+    expect(cov.has('QueryPayload')).toBe(false);
+  });
+
   it('reuses provider field-name inference when child resolvedType is missing', () => {
     const investorType = cls('InvestorType', [f('id')]);
     const query = cls('Query', [f('investors', 'Field')], 'query');

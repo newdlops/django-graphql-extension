@@ -1,6 +1,13 @@
 import { ClassInfo, FieldInfo } from '../types';
-import { camelToSnake, parseGqlFields, GqlField, FragmentDef, collectDocumentFragments, expandGqlBody, mergeFragments } from '../codelens/gqlCodeLensProvider';
-import { resolveChildClass } from '../codelens/gqlResolver';
+import { parseGqlFields, GqlField, FragmentDef, collectDocumentFragments, expandGqlBody, mergeFragments } from '../codelens/gqlCodeLensProvider';
+import {
+  RootOperationKind,
+  fieldMatchesGraphqlName,
+  findClassByGraphqlName,
+  readRootOperationKindFromGql,
+  resolveChildClass,
+  rootKindsForOperation,
+} from '../codelens/gqlResolver';
 
 /** A multimap: class name → set of field names that at least one active gql query walked through. */
 export type CoverageMap = Map<string, Set<string>>;
@@ -38,7 +45,7 @@ export function computeQueryCoverage(
   for (const body of gqlBodies) {
     const parsed = parseGqlFields(body, opts.documentFragments);
     if (parsed.length === 0) continue;
-    walk(parsed, null, opts, coverage);
+    walk(parsed, null, opts, coverage, readRootOperationKindFromGql(body));
   }
   return coverage;
 }
@@ -83,22 +90,26 @@ function walk(
   parentCls: ClassInfo | null,
   opts: CoverageOptions,
   coverage: CoverageMap,
+  rootKind: RootOperationKind,
 ): void {
   for (const gf of nodes) {
-    const snakeName = camelToSnake(gf.name);
-    const resolved = resolveField(parentCls, snakeName, opts);
+    const conditionedParent = gf.typeCondition
+      ? findClassByGraphqlName(opts.classMap, gf.typeCondition)
+      : parentCls;
+    if (gf.typeCondition && !conditionedParent) continue;
+    const resolved = resolveField(conditionedParent, gf.name, opts, rootKind);
     if (!resolved) continue;
 
-    record(coverage, resolved.matchedOn.name, snakeName);
+    record(coverage, resolved.matchedOn.name, resolved.field.name);
     if (resolved.owner !== resolved.matchedOn) {
-      record(coverage, resolved.owner.name, snakeName);
+      record(coverage, resolved.owner.name, resolved.field.name);
     }
 
     if (gf.children.length === 0) continue;
     const childCls = resolveChildClass(resolved.field, gf.name, opts.classMap);
     // If the child type is unknown, do NOT recurse into children — mirrors
     // the phase (j) CodeLens rule so we don't mis-record coverage.
-    if (childCls) walk(gf.children, childCls, opts, coverage);
+    if (childCls) walk(gf.children, childCls, opts, coverage, rootKind);
   }
 }
 
@@ -115,25 +126,32 @@ interface ResolvedField {
 
 function resolveField(
   parentCls: ClassInfo | null,
-  snakeName: string,
+  graphqlName: string,
   opts: CoverageOptions,
+  rootKind: RootOperationKind,
 ): ResolvedField | undefined {
   if (parentCls) {
-    const direct = parentCls.fields.find((f) => f.name === snakeName);
+    const direct = parentCls.fields.find((f) => fieldMatchesGraphqlName(f, graphqlName));
     if (direct) return { matchedOn: parentCls, owner: parentCls, field: direct };
 
     for (const ancestorName of collectAncestors(parentCls, opts.classMap)) {
       const ancestor = opts.classMap.get(ancestorName);
       if (!ancestor) continue;
-      const field = ancestor.fields.find((f) => f.name === snakeName);
+      const field = ancestor.fields.find((f) => fieldMatchesGraphqlName(f, graphqlName));
       if (field) return { matchedOn: parentCls, owner: ancestor, field };
     }
     return undefined;
   }
 
   // Root-level lookup: scan schema roots.
-  for (const root of opts.schemaRoots) {
-    const direct = root.fields.find((f) => f.name === snakeName);
+  const allowedKinds = rootKindsForOperation(rootKind);
+  const sameKind = opts.schemaRoots.filter((root) => allowedKinds.has(root.kind));
+  const hasRootMetadata = opts.schemaRoots.some((root) => root.isSchemaRoot === true);
+  const eligibleRoots = hasRootMetadata
+    ? sameKind.filter((root) => root.isSchemaRoot || root.isSchemaRootContributor)
+    : sameKind;
+  for (const root of eligibleRoots) {
+    const direct = root.fields.find((f) => fieldMatchesGraphqlName(f, graphqlName));
     if (direct) return { matchedOn: root, owner: root, field: direct };
   }
   return undefined;

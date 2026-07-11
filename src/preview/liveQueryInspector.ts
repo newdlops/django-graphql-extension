@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
-import { FieldIndex } from '../codelens/gqlResolver';
+import { FieldIndex, ResolutionContext } from '../codelens/gqlResolver';
 import { resolveTemplateAtCursor, TemplateContext } from '../codelens/gqlCursorResolver';
 import { buildQueryStructure, buildPartialStructureFromGql, buildLazySubtree, QueryStructure } from '../analysis/queryStructure';
 import { renderTemplateStructuresHtml, renderJsonSubtreeHtml, QUERY_STRUCTURE_JSON_STYLES } from './queryStructureJson';
@@ -12,6 +12,7 @@ interface StateSource {
     fieldIndex: FieldIndex;
     workspaceFragments?: Map<string, FragmentDef>;
     workspaceConstBodies?: Map<string, string>;
+    resolutionContexts?: ResolutionContext[];
   };
 }
 
@@ -25,6 +26,7 @@ export class LiveQueryInspector {
   private panel: vscode.WebviewPanel | undefined;
   private timer: NodeJS.Timeout | undefined;
   private lastContextKey: string | undefined;
+  private lastResolutionContextId: string | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -44,6 +46,7 @@ export class LiveQueryInspector {
       this.panel.onDidDispose(() => {
         this.panel = undefined;
         this.lastContextKey = undefined;
+        this.lastResolutionContextId = undefined;
       });
       // Lazy expansion: the webview asks for a class's fields when the user
       // clicks the ▸ marker on a truncated subtree. We resolve against the
@@ -51,7 +54,10 @@ export class LiveQueryInspector {
       // since the panel was opened.
       this.panel.webview.onDidReceiveMessage((msg) => {
         if (!msg || msg.type !== 'expandType') return;
-        const { classMap } = this.readState();
+        const state = this.readState();
+        const classMap = state.resolutionContexts?.find(
+          (ctx) => ctx.id === this.lastResolutionContextId,
+        )?.classMap ?? state.classMap;
         const target = classMap.get(msg.typeName);
         if (!target) {
           this.postMessage({
@@ -102,16 +108,21 @@ export class LiveQueryInspector {
     const doc = editor.document;
     const cursorOffset = doc.offsetAt(editor.selection.active);
     const state = this.readState();
-    const tpl = resolveTemplateAtCursor(doc.getText(), cursorOffset, state);
+    const tpl = resolveTemplateAtCursor(doc.getText(), cursorOffset, {
+      ...state,
+      documentPath: doc.fileName,
+    });
     if (!tpl) {
       this.postMessage({ type: 'empty', reason: 'Cursor is not inside a gql template.' });
       this.lastContextKey = undefined;
+      this.lastResolutionContextId = undefined;
       return;
     }
 
     const key = templateKey(tpl);
     if (!force && key === this.lastContextKey) return;
     this.lastContextKey = key;
+    this.lastResolutionContextId = tpl.resolutionContextId;
 
     const structures: Array<{ structure: QueryStructure; note?: string }> = [];
     const unresolved: Array<{ name: string; reason: string }> = [];
@@ -130,7 +141,7 @@ export class LiveQueryInspector {
       if (root.targetClass) {
         // Best case: backend type is indexed — full expansion with missing fields.
         // Pass match.field so the root node carries its backend args.
-        const structure = buildQueryStructure(root.gqlField, root.targetClass, state.classMap, undefined, root.match.field);
+        const structure = buildQueryStructure(root.gqlField, root.targetClass, tpl.classMap, undefined, root.match.field);
         const note = `${root.match.cls.name}.${root.match.field.name} → ${root.targetClass.name}`;
         structures.push({ structure, note });
       } else {
@@ -265,5 +276,5 @@ export class LiveQueryInspector {
 
 function templateKey(tpl: TemplateContext): string {
   const names = tpl.roots.map((r) => `${r.gqlField.name}:${r.targetClass?.name ?? '?'}`).join(',');
-  return `${tpl.operationKind}:${tpl.operationName ?? ''}@${tpl.bodyStart}[${names}]`;
+  return `${tpl.resolutionContextId ?? '?'}:${tpl.operationKind}:${tpl.operationName ?? ''}@${tpl.bodyStart}[${names}]`;
 }

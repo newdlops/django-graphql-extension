@@ -41,6 +41,23 @@ describe('parseClassFields — scenario 1 (basic ObjectType)', () => {
     expect(fields[1]).toMatchObject({ name: 'profile', fieldType: 'Field', resolvedType: 'ProfileType' });
   });
 
+  it('preserves an explicit GraphQL wire name separately from the Python attribute', () => {
+    const source = [
+      'class Query(ObjectType):',
+      '    user_by_pk = graphene.Field(',
+      '        UserType,',
+      '        name="user",',
+      '    )',
+    ];
+    const fields = parseClassFields(source, 0, 'schema.py', makeImports(['ObjectType', 'Field']));
+    expect(fields).toHaveLength(1);
+    expect(fields[0]).toMatchObject({
+      name: 'user_by_pk',
+      graphqlName: 'user',
+      resolvedType: 'UserType',
+    });
+  });
+
   it('handles graphene.List(Type) and unwraps inner type', () => {
     const source = [
       'class UserType(ObjectType):',

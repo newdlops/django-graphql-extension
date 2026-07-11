@@ -1,6 +1,6 @@
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, expandGqlBody, mergeFragments, FragmentDef } from './gqlCodeLensProvider';
-import { FieldIndex, RootOperationKind, findEntry, MatchedEntry, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
+import { FieldIndex, ResolutionContext, RootOperationKind, findClassByGraphqlName, findEntry, MatchedEntry, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass, selectResolutionContext } from './gqlResolver';
 
 export interface CursorContext {
   /** The gql field the cursor is inside (innermost). */
@@ -43,6 +43,9 @@ export interface TemplateContext {
   roots: TemplateRoot[];
   bodyStart: number;
   bodyEnd: number;
+  /** Schema-local type map selected for this operation. */
+  classMap: Map<string, ClassInfo>;
+  resolutionContextId?: string;
 }
 
 interface ResolveCtx {
@@ -50,6 +53,8 @@ interface ResolveCtx {
   fieldIndex: FieldIndex;
   workspaceFragments?: Map<string, FragmentDef>;
   workspaceConstBodies?: Map<string, string>;
+  resolutionContexts?: ResolutionContext[];
+  documentPath?: string;
 }
 
 /**
@@ -81,20 +86,46 @@ export function resolveTemplateAtCursor(
 
     // Detect the operation keyword and its name.
     const opMatch = /(^|[^A-Za-z_0-9])(query|mutation|subscription)\b\s*(\w+)?/.exec(gqlBody);
-    const operationKind = readRootOperationKindFromGql(gqlBody);
+    const fragmentContext = readFragmentContextFromGql(gqlBody);
+    const operationKind = fragmentContext ? 'unknown' : readRootOperationKindFromGql(gqlBody);
     const operationName = opMatch?.[3];
     const operationVariables = parseOperationVariables(gqlBody);
+    const selected = selectResolutionContext(ctx.resolutionContexts, parsed, operationKind, {
+      fragmentType: fragmentContext?.onType,
+      documentPath: ctx.documentPath,
+    })?.context;
+    const activeCtx: ResolveCtx = selected
+      ? { ...ctx, classMap: selected.classMap, fieldIndex: selected.fieldIndex }
+      : ctx;
 
     const roots: TemplateRoot[] = parsed.map((gf) => {
       const snake = camelToSnake(gf.name);
-      const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, null, { rootKind: operationKind });
+      const conditionedParent = gf.typeCondition
+        ? findClassByGraphqlName(activeCtx.classMap, gf.typeCondition)
+        : fragmentContext
+          ? findClassByGraphqlName(activeCtx.classMap, fragmentContext.onType)
+          : null;
+      const match = gf.typeCondition && !conditionedParent ? undefined : findEntry(
+        activeCtx.fieldIndex, activeCtx.classMap, snake, conditionedParent, {
+        rootKind: operationKind,
+        graphqlFieldName: gf.name,
+      });
       const target = match
-        ? resolveChildClass(match.field, gf.name, ctx.classMap) ?? (match.field.resolvedType ? undefined : match.cls)
+        ? resolveChildClass(match.field, gf.name, activeCtx.classMap) ?? (match.field.resolvedType ? undefined : match.cls)
         : undefined;
       return { gqlField: gf, match, targetClass: target };
     });
 
-    return { operationKind, operationName, operationVariables, roots, bodyStart, bodyEnd };
+    return {
+      operationKind,
+      operationName,
+      operationVariables,
+      roots,
+      bodyStart,
+      bodyEnd,
+      classMap: activeCtx.classMap,
+      resolutionContextId: selected?.id,
+    };
   }
   return null;
 }
@@ -218,10 +249,21 @@ export function resolveFieldAtCursor(
     const rawBody = text.substring(bodyStart, bodyEnd);
     const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
-    const rootKind = readRootOperationKindFromGql(gqlBody);
+    const fragmentContext = readFragmentContextFromGql(gqlBody);
+    const rootKind = fragmentContext ? 'unknown' : readRootOperationKindFromGql(gqlBody);
+    const selected = selectResolutionContext(ctx.resolutionContexts, parsed, rootKind, {
+      fragmentType: fragmentContext?.onType,
+      documentPath: ctx.documentPath,
+    })?.context;
+    const activeCtx: ResolveCtx = selected
+      ? { ...ctx, classMap: selected.classMap, fieldIndex: selected.fieldIndex }
+      : ctx;
 
     const bodyOffset = cursorOffset - bodyStart;
-    const walked = walkForCursor(parsed, null, bodyOffset, ctx, rootKind);
+    const initialParent = fragmentContext
+      ? findClassByGraphqlName(activeCtx.classMap, fragmentContext.onType)
+      : null;
+    const walked = walkForCursor(parsed, initialParent, bodyOffset, activeCtx, rootKind);
     if (walked) return { ...walked, bodyStart };
     return null;
   }
@@ -250,8 +292,15 @@ function walkForCursor(
     const fieldEnd = rangeEnd(gf);
     if (cursorInBody < fieldStart || cursorInBody > fieldEnd) continue;
 
+    const conditionedParent = gf.typeCondition
+      ? findClassByGraphqlName(ctx.classMap, gf.typeCondition)
+      : parentCls;
+    if (gf.typeCondition && !conditionedParent) continue;
     const snake = camelToSnake(gf.name);
-    const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
+    const match = findEntry(ctx.fieldIndex, ctx.classMap, snake, conditionedParent, {
+      rootKind,
+      graphqlFieldName: gf.name,
+    });
     if (!match) continue;
 
     // The target class to visualize is the field's resolvedType (if known),

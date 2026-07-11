@@ -67,6 +67,8 @@ describe('findEntry owner routing (phase α)', () => {
     // CodeLens must open the mixin's file, not the user's.
     mixin.filePath = '/backend/mixins/timestamp.py';
     mixin.lineNumber = 7;
+    mixin.fields[0].filePath = mixin.filePath;
+    mixin.fields[0].lineNumber = mixin.lineNumber;
 
     const userType = cls('UserType', [
       f('name'),

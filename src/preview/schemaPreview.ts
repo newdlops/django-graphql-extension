@@ -108,7 +108,7 @@ function renderField(
   lines: string[],
 ): void {
   const indent = '  '.repeat(depth);
-  const camelName = snakeToCamel(field.name);
+  const camelName = field.graphqlName ?? snakeToCamel(field.name);
   const argValues = formatArgValues(field);
 
   // Resolve the type: try resolvedType first, then fieldType itself

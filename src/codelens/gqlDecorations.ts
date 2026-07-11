@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, mergeFragments, expandGqlBody, FragmentDef } from './gqlCodeLensProvider';
-import { FieldIndex, RootOperationKind, findEntry, hasSchemaRootForOperation, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass } from './gqlResolver';
+import { FieldIndex, ResolutionContext, RootOperationKind, findClassByGraphqlName, findEntry, hasSchemaRootForOperation, isGraphqlMetaField, readFragmentContextFromGql, readRootOperationKindFromGql, resolveChildClass, selectResolutionContext } from './gqlResolver';
 
 export interface DecorationInfo {
   offset: number;
@@ -14,6 +14,8 @@ interface ComputeCtx {
   fieldIndex: FieldIndex;
   workspaceFragments?: Map<string, FragmentDef>;
   workspaceConstBodies?: Map<string, string>;
+  resolutionContexts?: ResolutionContext[];
+  documentPath?: string;
 }
 
 /**
@@ -41,14 +43,21 @@ export function computeDecorations(text: string, ctx: ComputeCtx): DecorationInf
     const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
     const fragCtx = readFragmentContextFromGql(gqlBody);
+    const rootKind = fragCtx ? 'unknown' : readRootOperationKindFromGql(gqlBody);
+    const selected = selectResolutionContext(ctx.resolutionContexts, parsed, rootKind, {
+      fragmentType: fragCtx?.onType,
+      documentPath: ctx.documentPath,
+    })?.context;
+    const activeCtx: ComputeCtx = selected
+      ? { ...ctx, classMap: selected.classMap, fieldIndex: selected.fieldIndex }
+      : ctx;
     if (fragCtx) {
-      const fragCls = ctx.classMap.get(fragCtx.onType);
+      const fragCls = findClassByGraphqlName(activeCtx.classMap, fragCtx.onType);
       if (!fragCls) continue;
-      walk(parsed, fragCls, startOffset, ctx, out, 'unknown');
+      walk(parsed, fragCls, startOffset, activeCtx, out, 'unknown');
       continue;
     }
-    const rootKind = readRootOperationKindFromGql(gqlBody);
-    walk(parsed, null, startOffset, ctx, out, rootKind);
+    walk(parsed, null, startOffset, activeCtx, out, rootKind);
   }
   return out;
 }
@@ -62,14 +71,22 @@ function walk(
   rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
+    const conditionedParent = gf.typeCondition
+      ? findClassByGraphqlName(ctx.classMap, gf.typeCondition)
+      : parentCls;
+    if (gf.typeCondition && !conditionedParent) continue;
+    if (isGraphqlMetaField(gf.name, conditionedParent, rootKind)) continue;
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, conditionedParent, {
+      rootKind,
+      graphqlFieldName: gf.name,
+    });
     const offset = baseOffset + gf.nameOffset;
     const length = gf.nameLength;
 
     if (entry) {
       out.push({ offset, length, kind: entry.confidence });
-    } else if (parentCls || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
+    } else if (conditionedParent || hasSchemaRootForOperation(ctx.classMap, rootKind)) {
       // Known parent/root context, unknown field — clearly outside the query
       // structure. Paint the whole subtree so gql-only noise stays in the
       // source view instead of the backend structure view.
@@ -180,7 +197,10 @@ export class GqlDecorationManager {
   }
 
   refresh(editor: vscode.TextEditor): void {
-    const infos = computeDecorations(editor.document.getText(), this.readState());
+    const infos = computeDecorations(editor.document.getText(), {
+      ...this.readState(),
+      documentPath: editor.document.fileName,
+    });
     const buckets: Record<DecorationInfo['kind'], vscode.Range[]> = {
       exact: [], inferred: [], unresolved: [],
     };

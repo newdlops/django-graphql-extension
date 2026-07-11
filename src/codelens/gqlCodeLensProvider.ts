@@ -1,17 +1,22 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { ClassInfo, FieldInfo } from '../types';
+import { ClassInfo, FieldInfo, SchemaInfo } from '../types';
 import { log } from '../logger';
 import {
   FieldIndex,
   IndexEntry,
   MatchedEntry,
   buildFieldIndex,
+  fieldMatchesGraphqlName,
+  findClassByGraphqlName,
+  findGraphqlOperation,
   findEntry as findEntryShared,
   readFragmentContextFromGql,
   readRootOperationKindFromGql,
   resolveChildClass,
   RootOperationKind,
+  ResolutionContext,
+  selectResolutionContext,
 } from './gqlResolver';
 
 export function camelToSnake(str: string): string {
@@ -39,8 +44,9 @@ export function computeMissingFields(
   classMap: Map<string, ClassInfo>,
 ): FieldInfo[] {
   const available = getAllTypeFields(backendCls, classMap);
-  const usedSnakeNames = new Set(frontendChildren.map((gf) => camelToSnake(gf.name)));
-  return available.filter((f) => !usedSnakeNames.has(f.name));
+  return available.filter((field) =>
+    !frontendChildren.some((frontend) => fieldMatchesGraphqlName(field, frontend.name)),
+  );
 }
 
 function getAllTypeFields(cls: ClassInfo, classMap: Map<string, ClassInfo>): FieldInfo[] {
@@ -82,11 +88,14 @@ export interface GqlFieldLite {
   /** Preserved across serialize/hydrate so the webview can style rows
    *  introduced via `...FragmentName` differently from directly-written fields. */
   fromFragment?: string;
+  /** Type condition introduced by an inline or named fragment spread. */
+  typeCondition?: string;
 }
 
 export function serializeGqlField(gf: GqlField): GqlFieldLite {
   const out: GqlFieldLite = { name: gf.name, children: gf.children.map(serializeGqlField) };
   if (gf.fromFragment) out.fromFragment = gf.fromFragment;
+  if (gf.typeCondition) out.typeCondition = gf.typeCondition;
   return out;
 }
 
@@ -97,6 +106,7 @@ export function hydrateGqlField(lite: GqlFieldLite): GqlField {
     offset: 0, nameOffset: 0, nameLength: lite.name.length,
     children: lite.children.map(hydrateGqlField),
     fromFragment: lite.fromFragment,
+    typeCondition: lite.typeCondition,
   };
 }
 
@@ -107,6 +117,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
   // snake_case field name → all classes that define it
   private fieldIndex: FieldIndex = new Map();
   private classMap = new Map<string, ClassInfo>();
+  private resolutionContexts: ResolutionContext[] = [];
   // Fragments defined anywhere in the workspace's frontend files. Populated
   // by the activation refresh so fragments imported across modules (the
   // `fragments.ts` → `query.ts` pattern) still resolve at spread sites.
@@ -116,17 +127,50 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
   // runtime. Robust against any workspace-fragments-by-name races since
   // the expanded body carries the fragment text locally.
   private workspaceConstBodies: Map<string, string> = new Map();
-  private updateTimer?: NodeJS.Timeout;
 
   updateIndex(classMap: Map<string, ClassInfo>): void {
     this.classMap = classMap;
+    // Build the paired field index before exposing the refresh event.  A
+    // delayed rebuild used to publish a mixed snapshot (new classMap + old
+    // fieldIndex), which made matching depend on whether a provider happened
+    // to run during the 200 ms window after a scan.
+    this.buildIndex();
+    this.resolutionContexts = [{
+      id: 'legacy',
+      schemaFilePath: '',
+      classMap: this.classMap,
+      fieldIndex: this.fieldIndex,
+    }];
+    this._onDidChangeCodeLenses.fire();
+  }
 
-    // Debounce index rebuild + CodeLens refresh
-    if (this.updateTimer) clearTimeout(this.updateTimer);
-    this.updateTimer = setTimeout(() => {
-      this.buildIndex();
-      this._onDidChangeCodeLenses.fire();
-    }, 200);
+  /** Preserve each scanned schema as an independent name-resolution scope. */
+  updateSchemas(schemas: SchemaInfo[]): void {
+    this.resolutionContexts = schemas.map((schema) => {
+      const classMap = new Map<string, ClassInfo>();
+      const classes = [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types];
+      for (const cls of classes) {
+        classMap.set(cls.name, cls);
+      }
+      const roots = classes
+        .filter((cls) => cls.isSchemaRoot)
+        .map((cls) => `${cls.kind}:${cls.filePath}:${cls.lineNumber}:${cls.name}`)
+        .sort()
+        .join('|');
+      return {
+        id: `${schema.filePath}::${schema.name}::${roots}`,
+        schemaFilePath: schema.filePath,
+        classMap,
+        fieldIndex: buildFieldIndex(classMap),
+        completeness: classes.reduce((sum, cls) => sum + cls.fields.length, 0) * 1000
+          + classMap.size,
+      };
+    });
+
+    const primary = selectResolutionContext(this.resolutionContexts, [], 'unknown')?.context;
+    this.classMap = primary?.classMap ?? new Map();
+    this.fieldIndex = primary?.fieldIndex ?? new Map();
+    this._onDidChangeCodeLenses.fire();
   }
 
   /**
@@ -149,8 +193,14 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
    * timer) and by any future caller that needs the index up-to-date right now.
    */
   rebuildIndexNow(): void {
-    if (this.updateTimer) { clearTimeout(this.updateTimer); this.updateTimer = undefined; }
     this.buildIndex();
+    if (this.resolutionContexts.length === 1 && this.resolutionContexts[0].id === 'legacy') {
+      this.resolutionContexts[0] = {
+        ...this.resolutionContexts[0],
+        classMap: this.classMap,
+        fieldIndex: this.fieldIndex,
+      };
+    }
   }
 
   private buildIndex(): void {
@@ -172,12 +222,14 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     fieldIndex: FieldIndex;
     workspaceFragments: Map<string, FragmentDef>;
     workspaceConstBodies: Map<string, string>;
+    resolutionContexts: ResolutionContext[];
   } {
     return {
       classMap: this.classMap,
       fieldIndex: this.fieldIndex,
       workspaceFragments: this.workspaceFragments,
       workspaceConstBodies: this.workspaceConstBodies,
+      resolutionContexts: this.resolutionContexts,
     };
   }
 
@@ -223,14 +275,14 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       // walk from the schema root for that kind.
       const fragCtx = readFragmentContextFromGql(gqlBody);
       let initialParent: ClassInfo | null = null;
-      let rootKind: RootOperationKind;
+      const rootKind: RootOperationKind = fragCtx
+        ? 'unknown'
+        : readRootOperationKindFromGql(gqlBody);
+      const resolution = this.selectContext(parsed, rootKind, fragCtx?.onType, document.fileName);
       if (fragCtx) {
-        const fragCls = this.classMap.get(fragCtx.onType);
+        const fragCls = findClassByGraphqlName(resolution.classMap, fragCtx.onType);
         if (!fragCls) continue;
         initialParent = fragCls;
-        rootKind = 'unknown';
-      } else {
-        rootKind = readRootOperationKindFromGql(gqlBody);
       }
 
       // Log the operation type and parsed root fields
@@ -247,15 +299,19 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
       const logFields = (fields: GqlField[], depth: number, parent: ClassInfo | null): void => {
         for (const gf of fields) {
+          const conditionedParent = gf.typeCondition
+            ? findClassByGraphqlName(resolution.classMap, gf.typeCondition)
+            : parent;
+          if (gf.typeCondition && !conditionedParent) continue;
           const indent = '  '.repeat(depth + 1);
           const snakeName = camelToSnake(gf.name);
-          const entry = this.findEntry(snakeName, parent, rootKind);
+          const entry = this.findEntry(snakeName, conditionedParent, rootKind, gf.name, resolution);
           if (entry) {
             const conf = entry.confidence === 'inferred' ? ' [inferred]' : '';
             log(`[codeLens] ${indent}✓ ${gf.name} → ${snakeName} → ${entry.cls.name}.${entry.field.name} (${entry.cls.kind})${conf}`);
             if (gf.children.length > 0) {
               const resolvedTypeName = entry.field.resolvedType;
-              const resolved = resolveChildClass(entry.field, gf.name, this.classMap);
+              const resolved = resolveChildClass(entry.field, gf.name, resolution.classMap);
               if (resolved) {
                 logFields(gf.children, depth + 1, resolved);
               } else {
@@ -269,14 +325,14 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
               }
             }
           } else {
-            const parentLabel = parent ? parent.name : 'root';
+            const parentLabel = conditionedParent ? conditionedParent.name : 'root';
             log(`[codeLens] ${indent}✗ ${gf.name} → ${snakeName} — no such field on ${parentLabel}`);
           }
         }
       };
       logFields(parsed, 0, initialParent);
 
-      this.resolveFields(parsed, initialParent, startOffset, document, lenses, rootKind);
+      this.resolveFields(parsed, initialParent, startOffset, document, lenses, rootKind, resolution);
     }
 
     return lenses;
@@ -289,10 +345,15 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     document: vscode.TextDocument,
     lenses: vscode.CodeLens[],
     rootKind: RootOperationKind,
+    resolution: ResolutionContext,
   ): void {
     for (const gf of fields) {
+      const conditionedParent = gf.typeCondition
+        ? findClassByGraphqlName(resolution.classMap, gf.typeCondition)
+        : parentType;
+      if (gf.typeCondition && !conditionedParent) continue;
       const snakeName = camelToSnake(gf.name);
-      const entry = this.findEntry(snakeName, parentType, rootKind);
+      const entry = this.findEntry(snakeName, conditionedParent, rootKind, gf.name, resolution);
       if (!entry) continue;
 
       const linePos = document.positionAt(baseOffset + gf.offset);
@@ -309,29 +370,31 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const tooltipSuffix = entry.confidence === 'inferred'
         ? '\n\n(~ means inferred — multiple candidates existed; verify that this is the intended class.)'
         : '';
+      const targetFile = entry.field.filePath || entry.cls.filePath;
+      const targetLine = entry.field.filePath ? entry.field.lineNumber : entry.cls.lineNumber;
 
       lenses.push(new vscode.CodeLens(range, {
         title: `→ ${marker}${entry.cls.name}.${entry.field.name} [${kindLabel}]`,
-        tooltip: `${gf.name} → ${entry.field.name} in ${entry.cls.name}\n${entry.cls.filePath}:${entry.cls.lineNumber + 1}${tooltipSuffix}`,
+        tooltip: `${gf.name} → ${entry.field.name} in ${entry.cls.name}\n${targetFile}:${targetLine + 1}${tooltipSuffix}`,
         command: 'djangoGraphqlExplorer.openClass',
-        arguments: [entry.cls.filePath, entry.cls.lineNumber],
+        arguments: [targetFile, targetLine],
       }));
 
       // Recurse into children with the resolved type as parent context.
       // If we don't know the child type, DO NOT fall back to the current
       // class — that would falsely attribute descendants to the parent.
       if (gf.children.length > 0) {
-        const resolvedCls = resolveChildClass(entry.field, gf.name, this.classMap);
+        const resolvedCls = resolveChildClass(entry.field, gf.name, resolution.classMap);
 
         if (resolvedCls) {
-          this.resolveFields(gf.children, resolvedCls, baseOffset, document, lenses, rootKind);
+          this.resolveFields(gf.children, resolvedCls, baseOffset, document, lenses, rootKind, resolution);
 
           // Show missing fields from the resolved type
-          const missing = this.getMissingFields(gf.children, resolvedCls);
+          const missing = this.getMissingFields(gf.children, resolvedCls, resolution.classMap);
           if (missing.length > 0) {
             const used = gf.children.length;
             const total = used + missing.length;
-            const preview = missing.slice(0, 5).map((f) => snakeToCamel(f.name)).join(', ');
+            const preview = missing.slice(0, 5).map((f) => f.graphqlName ?? snakeToCamel(f.name)).join(', ');
             const more = missing.length > 5 ? `, +${missing.length - 5}` : '';
             // Pass enough info for the full-tree webview: target class + the
             // user's gql subtree under this field. Also pass owner
@@ -341,7 +404,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
               title: `⚠ ${used}/${total} fields — click to see full structure`,
               tooltip: `Expand ${resolvedCls.name}: ${preview}${more}`,
               command: 'djangoGraphqlExplorer.showMissingFields',
-              arguments: [resolvedCls.name, serializeGqlField(gf), entry.cls.name, entry.field.name],
+              arguments: [resolvedCls.name, serializeGqlField(gf), entry.cls.name, entry.field.name, resolution.id],
             }));
           }
         }
@@ -349,16 +412,51 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     }
   }
 
-  private getMissingFields(frontendFields: GqlField[], backendCls: ClassInfo): FieldInfo[] {
-    return computeMissingFields(frontendFields, backendCls, this.classMap);
+  private getMissingFields(
+    frontendFields: GqlField[],
+    backendCls: ClassInfo,
+    classMap: Map<string, ClassInfo> = this.classMap,
+  ): FieldInfo[] {
+    return computeMissingFields(frontendFields, backendCls, classMap);
   }
 
   private findEntry(
     snakeFieldName: string,
     parentType: ClassInfo | null,
     rootKind: RootOperationKind = 'query',
+    graphqlFieldName?: string,
+    resolution: ResolutionContext = this.defaultContext(),
   ): MatchedEntry | undefined {
-    return findEntryShared(this.fieldIndex, this.classMap, snakeFieldName, parentType, { rootKind });
+    const entry = findEntryShared(resolution.fieldIndex, resolution.classMap, snakeFieldName, parentType, {
+      rootKind,
+      graphqlFieldName,
+    });
+    return entry && parentType === null && resolution.selectionAmbiguous
+      ? { ...entry, confidence: 'inferred' }
+      : entry;
+  }
+
+  private defaultContext(): ResolutionContext {
+    return this.resolutionContexts.find((context) => context.classMap === this.classMap)
+      ?? this.resolutionContexts[0]
+      ?? {
+      id: 'default', schemaFilePath: '', classMap: this.classMap, fieldIndex: this.fieldIndex,
+      };
+  }
+
+  private selectContext(
+    fields: GqlField[],
+    rootKind: RootOperationKind,
+    fragmentType?: string,
+    documentPath?: string,
+  ): ResolutionContext {
+    const selected = selectResolutionContext(this.resolutionContexts, fields, rootKind, {
+      fragmentType,
+      documentPath,
+    });
+    return selected
+      ? { ...selected.context, selectionAmbiguous: selected.ambiguous }
+      : this.defaultContext();
   }
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | undefined {
@@ -383,16 +481,18 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const parsed = parseGqlFields(gqlBody, docFragments);
       const fragCtx = readFragmentContextFromGql(gqlBody);
       let initialParent: ClassInfo | null = null;
-      let rootKind: RootOperationKind;
+      const rootKind: RootOperationKind = fragCtx
+        ? 'unknown'
+        : readRootOperationKindFromGql(gqlBody);
+      const resolution = this.selectContext(parsed, rootKind, fragCtx?.onType, document.fileName);
       if (fragCtx) {
-        const fragCls = this.classMap.get(fragCtx.onType);
+        const fragCls = findClassByGraphqlName(resolution.classMap, fragCtx.onType);
         if (!fragCls) continue;
         initialParent = fragCls;
-        rootKind = 'unknown';
-      } else {
-        rootKind = readRootOperationKindFromGql(gqlBody);
       }
-      const hover = this.findHoverInFields(parsed, initialParent, startOffset, offset, document, rootKind);
+      const hover = this.findHoverInFields(
+        parsed, initialParent, startOffset, offset, document, rootKind, resolution,
+      );
       if (hover) return hover;
     }
 
@@ -406,17 +506,24 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
     cursorOffset: number,
     document: vscode.TextDocument,
     rootKind: RootOperationKind,
+    resolution: ResolutionContext,
   ): vscode.Hover | undefined {
     for (const gf of fields) {
+      const conditionedParent = gf.typeCondition
+        ? findClassByGraphqlName(resolution.classMap, gf.typeCondition)
+        : parentType;
+      if (gf.typeCondition && !conditionedParent) continue;
       const snakeName = camelToSnake(gf.name);
-      const entry = this.findEntry(snakeName, parentType, rootKind);
+      const entry = this.findEntry(snakeName, conditionedParent, rootKind, gf.name, resolution);
 
       // Check children first (more specific match). Mirror the CodeLens rule:
       // don't fall back to the parent class when we cannot resolve the child type.
       if (gf.children.length > 0 && entry) {
-        const resolvedCls = resolveChildClass(entry.field, gf.name, this.classMap);
+        const resolvedCls = resolveChildClass(entry.field, gf.name, resolution.classMap);
         if (resolvedCls) {
-          const childHover = this.findHoverInFields(gf.children, resolvedCls, baseOffset, cursorOffset, document, rootKind);
+          const childHover = this.findHoverInFields(
+            gf.children, resolvedCls, baseOffset, cursorOffset, document, rootKind, resolution,
+          );
           if (childHover) return childHover;
         }
       }
@@ -435,6 +542,8 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
       const fieldEnd = nameEnd;
 
       const { cls, field } = entry;
+      const sourceFile = field.filePath || cls.filePath;
+      const sourceLine = field.filePath ? field.lineNumber : cls.lineNumber;
       const lines: string[] = [
         `**${gf.name}** → \`${cls.name}.${field.name}\` (${cls.kind})`,
         '',
@@ -444,7 +553,7 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
         `| **Backend field** | \`${field.name}: ${field.fieldType}\` |`,
         `| **Resolved type** | \`${field.resolvedType ?? '—'}\` |`,
         `| **Class** | \`${cls.name}\` (${cls.kind}) |`,
-        `| **File** | \`${cls.filePath}:${cls.lineNumber + 1}\` |`,
+        `| **File** | \`${sourceFile}:${sourceLine + 1}\` |`,
       ];
 
       if (field.args && field.args.length > 0) {
@@ -456,21 +565,21 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
 
       // Show missing sub-fields if this field has a selection set
       if (gf.children.length > 0 && field.resolvedType) {
-        const resolvedCls = this.classMap.get(field.resolvedType);
+        const resolvedCls = findClassByGraphqlName(resolution.classMap, field.resolvedType);
         if (resolvedCls) {
-          const missing = this.getMissingFields(gf.children, resolvedCls);
+          const missing = this.getMissingFields(gf.children, resolvedCls, resolution.classMap);
           const used = gf.children.length;
           const total = used + missing.length;
           if (missing.length > 0) {
             lines.push('', `**Missing fields** (${used}/${total} queried from \`${resolvedCls.name}\`):`);
             for (const f of missing.slice(0, 8)) {
-              lines.push(`- \`${snakeToCamel(f.name)}\`: ${f.fieldType}${f.resolvedType ? ` → ${f.resolvedType}` : ''}`);
+              lines.push(`- \`${f.graphqlName ?? snakeToCamel(f.name)}\`: ${f.fieldType}${f.resolvedType ? ` → ${f.resolvedType}` : ''}`);
             }
             if (missing.length > 8) {
               const cmdArgs = encodeURIComponent(JSON.stringify([
                 resolvedCls.name,
                 gf.children.map((c) => c.name),
-                missing.map((f) => ({ name: snakeToCamel(f.name), type: `${f.fieldType}${f.resolvedType ? ' → ' + f.resolvedType : ''}` })),
+                missing.map((f) => ({ name: f.graphqlName ?? snakeToCamel(f.name), type: `${f.fieldType}${f.resolvedType ? ' → ' + f.resolvedType : ''}` })),
               ]));
               lines.push(``, `[Show all ${missing.length} missing fields](command:djangoGraphqlExplorer.showMissingFields?${cmdArgs})`);
             }
@@ -482,13 +591,13 @@ export class GqlCodeLensProvider implements vscode.CodeLensProvider, vscode.Hove
         const others = cls.fields.filter((f) => f.name !== field.name);
         lines.push('', `**Other fields in ${cls.name}:**`);
         for (const f of others.slice(0, 8)) {
-          lines.push(`- \`${snakeToCamel(f.name)}\`: ${f.fieldType}${f.resolvedType ? ` → ${f.resolvedType}` : ''}`);
+          lines.push(`- \`${f.graphqlName ?? snakeToCamel(f.name)}\`: ${f.fieldType}${f.resolvedType ? ` → ${f.resolvedType}` : ''}`);
         }
         if (others.length > 8) {
           const cmdArgs = encodeURIComponent(JSON.stringify([
             cls.name,
             [field.name],
-            others.map((f) => ({ name: snakeToCamel(f.name), type: `${f.fieldType}${f.resolvedType ? ' → ' + f.resolvedType : ''}` })),
+            others.map((f) => ({ name: f.graphqlName ?? snakeToCamel(f.name), type: `${f.fieldType}${f.resolvedType ? ' → ' + f.resolvedType : ''}` })),
           ]));
           lines.push(``, `[Show all ${others.length} fields](command:djangoGraphqlExplorer.showMissingFields?${cmdArgs})`);
         }
@@ -530,6 +639,8 @@ export interface GqlField {
    * undefined.
    */
   fromFragment?: string;
+  /** Type condition introduced by an inline or named fragment spread. */
+  typeCondition?: string;
 }
 
 export function stripTemplateExpressions(body: string): string {
@@ -632,6 +743,7 @@ function findTemplateEnd(text: string, start: number): number {
 export interface FragmentDef {
   source: string;
   bodyStart: number;
+  onType: string;
   fields: GqlField[] | null;
   resolving: boolean;
 }
@@ -643,12 +755,13 @@ export interface FragmentDef {
  */
 function collectFragmentDefsFromSource(gqlSource: string): Map<string, FragmentDef> {
   const out = new Map<string, FragmentDef>();
-  const re = /\bfragment\s+([A-Za-z_]\w*)\s+on\s+[A-Za-z_]\w*\s*\{/g;
+  const re = /\bfragment\s+([A-Za-z_]\w*)\s+on\s+([A-Za-z_]\w*)\s*\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(gqlSource)) !== null) {
     const name = m[1];
+    const onType = m[2];
     const braceIdx = m.index + m[0].length - 1;
-    out.set(name, { source: gqlSource, bodyStart: braceIdx + 1, fields: null, resolving: false });
+    out.set(name, { source: gqlSource, bodyStart: braceIdx + 1, onType, fields: null, resolving: false });
   }
   return out;
 }
@@ -712,7 +825,13 @@ export function parseGqlFields(gql: string, externalFragments?: Map<string, Frag
   // Local fragments win over external ones (same name = same-literal wins).
   const fragments = new Map<string, FragmentDef>();
   if (externalFragments) {
-    for (const [name, def] of externalFragments) fragments.set(name, def);
+    // Parsing lazily caches `fields` and toggles `resolving`. Clone workspace
+    // definitions per literal so a local nested-fragment override in one file
+    // cannot contaminate resolution in the next file that uses the same
+    // shared FragmentDef object.
+    for (const [name, def] of externalFragments) {
+      fragments.set(name, { ...def, fields: null, resolving: false });
+    }
   }
   for (const [name, def] of local) fragments.set(name, def);
 
@@ -721,9 +840,9 @@ export function parseGqlFields(gql: string, externalFragments?: Map<string, Frag
   // so scan anywhere in the gql string instead of only the leading token.
   let bodyStart: number | undefined;
 
-  const keywordMatch = /(^|[^A-Za-z_0-9])(query|mutation|subscription)\b/.exec(gql);
-  if (keywordMatch) {
-    let i = keywordMatch.index + keywordMatch[0].length;
+  const operation = findGraphqlOperation(gql);
+  if (operation) {
+    let i = operation.keywordEnd;
     // Skip operation name
     const nameMatch = gql.substring(i).match(/^\s*(\w+)/);
     if (nameMatch) i += nameMatch[0].length;
@@ -801,7 +920,9 @@ function parseFieldsBlock(
       ) {
         i += 2;
         while (i < gql.length && /\s/.test(gql[i])) i++;
-        while (i < gql.length && /\w/.test(gql[i])) i++; // type name
+        const typeMatch = gql.substring(i).match(/^([A-Za-z_]\w*)/);
+        const typeCondition = typeMatch?.[1];
+        if (typeMatch) i += typeMatch[0].length;
         while (i < gql.length && /\s/.test(gql[i])) i++;
         while (gql[i] === '@') {
           i++;
@@ -812,7 +933,12 @@ function parseFieldsBlock(
         }
         if (gql[i] === '{') {
           i++;
-          i = parseFieldsBlock(gql, i, out, fragments);
+          const inlineFields: GqlField[] = [];
+          i = parseFieldsBlock(gql, i, inlineFields, fragments);
+          for (const field of inlineFields) {
+            if (typeCondition && !field.typeCondition) field.typeCondition = typeCondition;
+            out.push(field);
+          }
         }
         continue;
       }
@@ -858,7 +984,9 @@ function parseFieldsBlock(
             // fragment-body offsets so other spread sites can reuse it.
             const spreadLen = spreadEnd - spreadStart;
             for (const f of def.fields) {
-              out.push(rebaseFragmentField(f, spreadStart, spreadLen, fragName));
+              const rebased = rebaseFragmentField(f, spreadStart, spreadLen, fragName);
+              if (!rebased.typeCondition) rebased.typeCondition = def.onType;
+              out.push(rebased);
             }
           }
         }
@@ -956,6 +1084,7 @@ function rebaseFragmentField(f: GqlField, offset: number, length: number, fragNa
     argNames: f.argNames,
     children: f.children.map((c) => rebaseFragmentField(c, offset, length, fragName)),
     fromFragment: fragName,
+    typeCondition: f.typeCondition,
   };
 }
 
@@ -1031,6 +1160,23 @@ function skipBracket(text: string, start: number, open: string, close: string): 
   let depth = 0;
   let i = start;
   while (i < text.length) {
+    if (text[i] === '#') {
+      while (i < text.length && text[i] !== '\n') i++;
+      continue;
+    }
+    if (text[i] === '"') {
+      const triple = text.substring(i, i + 3) === '"""';
+      i += triple ? 3 : 1;
+      while (i < text.length) {
+        if (!triple && text[i] === '\\') { i += 2; continue; }
+        if (triple ? text.substring(i, i + 3) === '"""' : text[i] === '"') {
+          i += triple ? 3 : 1;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
     if (text[i] === open) depth++;
     else if (text[i] === close) { depth--; if (depth === 0) return i + 1; }
     i++;

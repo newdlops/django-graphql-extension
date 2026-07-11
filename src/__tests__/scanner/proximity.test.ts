@@ -161,6 +161,80 @@ describe('parseGrapheneSchemas — proximity resolution (scenario 11)', () => {
     expect(fooQueries, 'mixin query class must survive').toBeDefined();
   });
 
+  it('prefers a nearby composition root over a top-level Graphene test Query', async () => {
+    // Captain's application Query is a composition-only class and therefore
+    // has no direct Graphene import. A distant test module also declares a
+    // top-level Query(ObjectType). The schema package must win before the
+    // Graphene-import tie-breaker is considered.
+    __setMockFiles({
+      '/proj/app/graphql/schema.py': [
+        'import graphene',
+        'from .query import Query',
+        '',
+        'SCHEMA = graphene.Schema(query=Query)',
+      ].join('\n'),
+      '/proj/app/graphql/query/__init__.py': [
+        'from .company_query import CompanyQuery',
+        'from packages.captable.app_queries import AppCaptableQueries',
+        '',
+        'class AppQueries(CompanyQuery):',
+        '    pass',
+        '',
+        'class Query(AppQueries, AppCaptableQueries):',
+        '    pass',
+      ].join('\n'),
+      '/proj/app/graphql/query/company_query.py': [
+        'from common.typed_graphene import TypedField',
+        '',
+        'class CompanyType:',
+        '    captable_english_name = TypedField(str)',
+        '',
+        'class CompanyQuery:',
+        '    company = TypedField(CompanyType)',
+      ].join('\n'),
+      '/proj/packages/captable/app_queries.py': [
+        'from .captable_query import CaptableQuery',
+        '',
+        'class AppCaptableQueries(CaptableQuery):',
+        '    pass',
+      ].join('\n'),
+      '/proj/packages/captable/captable_query.py': [
+        'from common.typed_graphene import TypedField',
+        '',
+        'class CaptableType:',
+        '    items = TypedField(list[CaptableItemType])',
+        '',
+        'class CaptableItemType:',
+        '    ownership = TypedField(float)',
+        '',
+        'class CaptableQuery:',
+        '    captable = TypedField(CaptableType)',
+      ].join('\n'),
+      '/proj/packages/payroll/graphql/tests/test_query.py': [
+        'from graphene import Field, ObjectType, String',
+        '',
+        'class PayrollType(ObjectType):',
+        '    id = String()',
+        '',
+        'class Query(ObjectType):',
+        '    payroll = Field(PayrollType)',
+      ].join('\n'),
+    });
+
+    const schemas = await parseGrapheneSchemas('/proj');
+    const appSchema = schemas.find((s) => s.filePath === '/proj/app/graphql/schema.py');
+    expect(appSchema, 'application schema must exist').toBeDefined();
+
+    const root = appSchema!.queries.find((c) => c.name === 'Query');
+    expect(root?.filePath).toBe('/proj/app/graphql/query/__init__.py');
+    expect(root?.fields.map((field) => field.name)).toEqual(
+      expect.arrayContaining(['company', 'captable']),
+    );
+    expect(root?.fields.some((field) => field.name === 'payroll')).toBe(false);
+    expect(appSchema!.queries.find((c) => c.name === 'CompanyQuery')?.isSchemaRootContributor).toBe(true);
+    expect(appSchema!.queries.find((c) => c.name === 'CaptableQuery')?.isSchemaRootContributor).toBe(true);
+  });
+
   it('resolves both schemas independently when two Schema() calls exist in different subtrees', async () => {
     __setMockFiles({
       '/proj/core/types.py': [
@@ -204,5 +278,9 @@ describe('parseGrapheneSchemas — proximity resolution (scenario 11)', () => {
     const apiUser = allClasses([api!]).find((c) => c.name === 'UserType');
     expect(coreUser!.filePath).toBe('/proj/core/types.py');
     expect(apiUser!.filePath).toBe('/proj/api/types.py');
+    expect(core!.queries.find((c) => c.name === 'Query')!.isSchemaRoot).toBe(true);
+    expect(api!.queries.find((c) => c.name === 'Query')!.isSchemaRoot).toBe(true);
+    expect(coreUser!.isSchemaRoot).not.toBe(true);
+    expect(apiUser!.isSchemaRoot).not.toBe(true);
   });
 });

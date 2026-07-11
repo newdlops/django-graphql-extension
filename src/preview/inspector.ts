@@ -103,7 +103,7 @@ export function buildInspectorData(
 
       return {
         name: f.name,
-        displayName: snakeToCamel(f.name),
+        displayName: f.graphqlName ?? snakeToCamel(f.name),
         fieldType: f.fieldType,
         resolvedType: f.resolvedType,
         resolvedTypeExists: !!f.resolvedType && classMap.has(f.resolvedType),

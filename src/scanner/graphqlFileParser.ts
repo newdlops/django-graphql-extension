@@ -16,11 +16,33 @@ export async function parseGraphQLFiles(rootDir: string): Promise<SchemaInfo[]> 
   const subscriptionFields: FieldInfo[] = [];
   const typeClasses: ClassInfo[] = [];
 
+  const documents: Array<{ filePath: string; text: string }> = [];
+
   for (const uri of gqlFiles) {
     const doc = await vscode.workspace.openTextDocument(uri);
-    const text = doc.getText();
+    documents.push({ filePath: uri.fsPath, text: doc.getText() });
+  }
 
-    parseSDL(text, uri.fsPath, queryFields, mutationFields, subscriptionFields, typeClasses);
+  const hasExplicitSchema = documents.some((document) =>
+    /\b(?:extend\s+)?schema\s*(?:@[^{}]+)?\{/.test(document.text),
+  );
+  const operationTypes = hasExplicitSchema
+    ? { query: '', mutation: '', subscription: '' }
+    : { query: 'Query', mutation: 'Mutation', subscription: 'Subscription' };
+  for (const document of documents) {
+    Object.assign(operationTypes, extractSchemaOperationTypes(document.text));
+  }
+
+  for (const document of documents) {
+    parseSDL(
+      document.text,
+      document.filePath,
+      queryFields,
+      mutationFields,
+      subscriptionFields,
+      typeClasses,
+      operationTypes,
+    );
   }
 
   const queries: ClassInfo[] = [];
@@ -29,41 +51,45 @@ export async function parseGraphQLFiles(rootDir: string): Promise<SchemaInfo[]> 
 
   if (queryFields.length > 0) {
     queries.push({
-      name: 'Query',
+      name: operationTypes.query,
       baseClasses: [],
       framework: 'graphql-schema',
       filePath: queryFields[0].filePath,
       lineNumber: queryFields[0].lineNumber,
       fields: queryFields,
       kind: 'query',
+      isSchemaRoot: true,
     });
   }
 
   if (mutationFields.length > 0) {
     mutations.push({
-      name: 'Mutation',
+      name: operationTypes.mutation,
       baseClasses: [],
       framework: 'graphql-schema',
       filePath: mutationFields[0].filePath,
       lineNumber: mutationFields[0].lineNumber,
       fields: mutationFields,
       kind: 'mutation',
+      isSchemaRoot: true,
     });
   }
 
   if (subscriptionFields.length > 0) {
     subscriptions.push({
-      name: 'Subscription',
+      name: operationTypes.subscription,
       baseClasses: [],
       framework: 'graphql-schema',
       filePath: subscriptionFields[0].filePath,
       lineNumber: subscriptionFields[0].lineNumber,
       fields: subscriptionFields,
       kind: 'subscription',
+      isSchemaRoot: true,
     });
   }
 
   const schemaFilePath = queryFields[0]?.filePath ?? mutationFields[0]?.filePath ?? rootDir;
+  const mergedTypes = mergeTypeClasses(typeClasses);
 
   return [{
     name: 'graphql-schema',
@@ -71,8 +97,41 @@ export async function parseGraphQLFiles(rootDir: string): Promise<SchemaInfo[]> 
     queries,
     mutations,
     subscriptions,
-    types: typeClasses,
+    types: mergedTypes,
   }];
+}
+
+function extractSchemaOperationTypes(text: string): Partial<Record<'query' | 'mutation' | 'subscription', string>> {
+  const out: Partial<Record<'query' | 'mutation' | 'subscription', string>> = {};
+  const schemaRegex = /\b(?:extend\s+)?schema\s*(?:@[^{}]+)?\{([\s\S]*?)\}/g;
+  let schemaMatch: RegExpExecArray | null;
+  while ((schemaMatch = schemaRegex.exec(text)) !== null) {
+    for (const kind of ['query', 'mutation', 'subscription'] as const) {
+      const match = new RegExp(`\\b${kind}\\s*:\\s*([A-Za-z_]\\w*)`).exec(schemaMatch[1]);
+      if (match) out[kind] = match[1];
+    }
+  }
+  return out;
+}
+
+function mergeTypeClasses(classes: ClassInfo[]): ClassInfo[] {
+  const merged = new Map<string, ClassInfo>();
+  for (const cls of classes) {
+    const existing = merged.get(cls.name);
+    if (!existing) {
+      merged.set(cls.name, cls);
+      continue;
+    }
+    const seen = new Set(existing.fields.map((field) => field.graphqlName ?? field.name));
+    for (const field of cls.fields) {
+      const name = field.graphqlName ?? field.name;
+      if (!seen.has(name)) {
+        existing.fields.push(field);
+        seen.add(name);
+      }
+    }
+  }
+  return [...merged.values()];
 }
 
 function parseSDL(
@@ -82,6 +141,7 @@ function parseSDL(
   mutationFields: FieldInfo[],
   subscriptionFields: FieldInfo[],
   typeClasses: ClassInfo[],
+  operationTypes: { query: string; mutation: string; subscription: string },
 ): void {
   const lines = text.split('\n');
 
@@ -123,7 +183,7 @@ function parseSDL(
         const typeName = inlineTypeMatch[2];
         const body = inlineTypeMatch[3];
         const fields = parseFieldsFromBody(body, filePath, i);
-        addFieldsToTarget(typeName, fields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, i);
+        addFieldsToTarget(typeName, fields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, i, operationTypes);
         continue;
       }
 
@@ -153,7 +213,7 @@ function parseSDL(
 
       if (braceDepth <= 0) {
         // Type block closed
-        addFieldsToTarget(currentType, currentFields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, currentTypeStartLine);
+        addFieldsToTarget(currentType, currentFields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, currentTypeStartLine, operationTypes);
         currentType = null;
         continue;
       }
@@ -169,6 +229,7 @@ function parseSDL(
 
           currentFields.push({
             name: fieldName,
+            graphqlName: fieldName,
             fieldType: rawType,
             resolvedType,
             filePath,
@@ -181,7 +242,7 @@ function parseSDL(
 
   // Handle unclosed type (EOF)
   if (currentType !== null && currentFields.length > 0) {
-    addFieldsToTarget(currentType, currentFields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, currentTypeStartLine);
+    addFieldsToTarget(currentType, currentFields, queryFields, mutationFields, subscriptionFields, typeClasses, filePath, currentTypeStartLine, operationTypes);
   }
 }
 
@@ -195,6 +256,7 @@ function parseFieldsFromBody(body: string, filePath: string, lineNumber: number)
       const rawType = fieldMatch[2].trim();
       fields.push({
         name: fieldMatch[1],
+        graphqlName: fieldMatch[1],
         fieldType: rawType,
         resolvedType: extractResolvedType(rawType),
         filePath,
@@ -215,12 +277,13 @@ function addFieldsToTarget(
   typeClasses: ClassInfo[],
   filePath: string,
   lineNumber: number,
+  operationTypes: { query: string; mutation: string; subscription: string },
 ): void {
-  if (typeName === 'Query') {
+  if (typeName === operationTypes.query) {
     queryFields.push(...fields);
-  } else if (typeName === 'Mutation') {
+  } else if (typeName === operationTypes.mutation) {
     mutationFields.push(...fields);
-  } else if (typeName === 'Subscription') {
+  } else if (typeName === operationTypes.subscription) {
     subscriptionFields.push(...fields);
   } else {
     typeClasses.push({

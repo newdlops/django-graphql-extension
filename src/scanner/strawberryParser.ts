@@ -36,6 +36,7 @@ export async function parseStrawberrySchemas(rootDir: string): Promise<SchemaInf
 
     // Build a map of line → decorator type (only for strawberry files)
     const decoratorAtLine = new Map<number, string>();
+    const graphqlNameAtLine = new Map<number, string>();
     if (hasStrawberry) {
       // Detect strawberry.Schema() calls
       const schemaMatch = text.match(
@@ -62,6 +63,8 @@ export async function parseStrawberrySchemas(rootDir: string): Promise<SchemaInf
         }
         if (classLineIdx < lines.length && /^\s*class\s+/.test(lines[classLineIdx])) {
           decoratorAtLine.set(classLineIdx, decoratorMatch[1]);
+          const graphqlName = readStrawberryNameOverride(lines[i]);
+          if (graphqlName) graphqlNameAtLine.set(classLineIdx, graphqlName);
         }
       }
     }
@@ -99,6 +102,7 @@ export async function parseStrawberrySchemas(rootDir: string): Promise<SchemaInf
 
         decoratedClasses.push({
           name: className,
+          graphqlName: graphqlNameAtLine.get(lineNumber),
           baseClasses,
           framework: 'strawberry',
           filePath: uri.fsPath,
@@ -152,16 +156,14 @@ export async function parseStrawberrySchemas(rootDir: string): Promise<SchemaInf
 
   // --- Classification (same multi-strategy as graphene) ---
   if (!queryRootName) { queryRootName = 'Query'; }
-  if (!mutationRootName) { mutationRootName = 'Mutation'; }
-  if (!subscriptionRootName) { subscriptionRootName = 'Subscription'; }
 
   // Step A: tag by Schema() ref, decorator kind, or name heuristic
   const kindMap = new Map<string, ClassInfo['kind']>();
 
   for (const cls of allClasses) {
-    if (cls.name === queryRootName) { kindMap.set(cls.name, 'query'); continue; }
-    if (cls.name === mutationRootName) { kindMap.set(cls.name, 'mutation'); continue; }
-    if (cls.name === subscriptionRootName) { kindMap.set(cls.name, 'subscription'); continue; }
+    if (cls.name === queryRootName) { cls.isSchemaRoot = true; kindMap.set(cls.name, 'query'); continue; }
+    if (cls.name === mutationRootName) { cls.isSchemaRoot = true; kindMap.set(cls.name, 'mutation'); continue; }
+    if (cls.name === subscriptionRootName) { cls.isSchemaRoot = true; kindMap.set(cls.name, 'subscription'); continue; }
     if (cls.kind === 'mutation') { kindMap.set(cls.name, 'mutation'); continue; }
 
     const lower = cls.name.toLowerCase();
@@ -194,6 +196,25 @@ export async function parseStrawberrySchemas(rootDir: string): Promise<SchemaInf
       }
     }
   }
+
+  const markRootContributors = (rootName: string): void => {
+    const root = classMap.get(rootName);
+    if (!root) return;
+    const stack = [...root.baseClasses];
+    const seen = new Set<string>();
+    while (stack.length > 0) {
+      const name = stack.pop()!;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const base = classMap.get(name);
+      if (!base) continue;
+      base.isSchemaRootContributor = true;
+      stack.push(...base.baseClasses);
+    }
+  };
+  markRootContributors(queryRootName);
+  if (mutationRootName) markRootContributors(mutationRootName);
+  if (subscriptionRootName) markRootContributors(subscriptionRootName);
 
   // --- Build result ---
   const queries: ClassInfo[] = [];
@@ -256,6 +277,7 @@ function parseStrawberryClassBody(
 
       fields.push({
         name: fieldName,
+        graphqlName: readStrawberryNameOverride(line),
         fieldType: typeAnnotation,
         resolvedType: extractTypeFromAnnotation(typeAnnotation),
         filePath,
@@ -266,6 +288,7 @@ function parseStrawberryClassBody(
 
     // Decorated methods
     if (/^\s+@(?:strawberry(?:_django)?\.)(field|mutation)/.test(line)) {
+      const graphqlName = readStrawberryNameOverride(line);
       let defIdx = i + 1;
       while (defIdx < lines.length && /^\s+@/.test(lines[defIdx])) { defIdx++; }
       if (defIdx < lines.length) {
@@ -274,6 +297,7 @@ function parseStrawberryClassBody(
           const returnType = defMatch[2]?.trim() ?? '';
           fields.push({
             name: defMatch[1],
+            graphqlName,
             fieldType: returnType || 'Field',
             resolvedType: extractTypeFromAnnotation(returnType),
             filePath,
@@ -286,6 +310,10 @@ function parseStrawberryClassBody(
   }
 
   return fields;
+}
+
+function readStrawberryNameOverride(text: string): string | undefined {
+  return /\bname\s*=\s*(["'])([A-Za-z_]\w*)\1/.exec(text)?.[2];
 }
 
 function extractTypeFromAnnotation(annotation: string): string | undefined {

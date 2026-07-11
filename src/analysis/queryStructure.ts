@@ -1,4 +1,5 @@
 import { ClassInfo, FieldInfo } from '../types';
+import { fieldMatchesGraphqlName, findClassByGraphqlName } from '../codelens/gqlResolver';
 import { GqlField } from '../codelens/gqlCodeLensProvider';
 
 /** A single argument in the expanded query tree. */
@@ -260,21 +261,18 @@ function expandClassFields(
   if (ctx.expanding.has(cls.name)) return []; // cycle guard
   ctx.expanding.add(cls.name);
   try {
-    // Index the user's queried children by their snake_case name.
-    const userBySnake = new Map<string, GqlField>();
-    for (const gf of userChildren) userBySnake.set(camelToSnake(gf.name), gf);
     const nodes: QueryStructureNode[] = [];
     for (const field of cls.fields) {
       // Hide synthetic markers like __relay_node__.
       if (field.name.startsWith('__') && field.name.endsWith('__')) continue;
 
-      const userSubfield = userBySnake.get(field.name);
+      const userSubfield = userChildren.find((gf) => fieldMatchesGraphqlName(field, gf.name));
       const queried = !!userSubfield;
 
       const args = buildArgs(field.args, userSubfield?.argNames);
 
       const resolvedType = field.resolvedType;
-      const resolvedCls = resolvedType ? ctx.classMap.get(resolvedType) ?? null : null;
+      const resolvedCls = resolvedType ? findClassByGraphqlName(ctx.classMap, resolvedType) : null;
       const isScalarLeaf = !!resolvedType && KNOWN_GRAPHQL_SCALARS.has(resolvedType);
       const typeLabel = resolvedType
         ? `${field.fieldType === 'List' ? '[' : ''}${resolvedType}${field.fieldType === 'List' ? ']' : ''}`
@@ -301,7 +299,7 @@ function expandClassFields(
 
       nodes.push({
         name: field.name,
-        displayName: snakeToCamel(field.name),
+        displayName: field.graphqlName ?? snakeToCamel(field.name),
         typeLabel,
         resolvedType,
         // Scalars aren't in classMap but they are "known" for display purposes —

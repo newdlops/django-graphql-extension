@@ -3,14 +3,18 @@ import { ClassInfo } from '../types';
 import { parseGqlFields, GqlField, camelToSnake, collectDocumentFragments, mergeFragments, expandGqlBody, FragmentDef } from './gqlCodeLensProvider';
 import {
   FieldIndex,
+  ResolutionContext,
   RootOperationKind,
   collectAncestors,
   collectRootFieldNames,
   findEntry,
+  findClassByGraphqlName,
   hasSchemaRootForOperation,
+  isGraphqlMetaField,
   readFragmentContextFromGql,
   readRootOperationKindFromGql,
   resolveChildClass,
+  selectResolutionContext,
 } from './gqlResolver';
 
 export interface DiagnosticInfo {
@@ -28,6 +32,8 @@ interface ComputeCtx {
   fieldIndex: FieldIndex;
   workspaceFragments?: Map<string, FragmentDef>;
   workspaceConstBodies?: Map<string, string>;
+  resolutionContexts?: ResolutionContext[];
+  documentPath?: string;
 }
 
 /**
@@ -54,18 +60,25 @@ export function computeDiagnostics(text: string, ctx: ComputeCtx): DiagnosticInf
     const gqlBody = expandGqlBody(rawBody, ctx.workspaceConstBodies);
     const parsed = parseGqlFields(gqlBody, docFragments);
     const fragCtx = readFragmentContextFromGql(gqlBody);
+    const rootKind = fragCtx ? 'unknown' : readRootOperationKindFromGql(gqlBody);
+    const selected = selectResolutionContext(ctx.resolutionContexts, parsed, rootKind, {
+      fragmentType: fragCtx?.onType,
+      documentPath: ctx.documentPath,
+    })?.context;
+    const activeCtx: ComputeCtx = selected
+      ? { ...ctx, classMap: selected.classMap, fieldIndex: selected.fieldIndex }
+      : ctx;
     // For fragment-only literals, walk the selection set as children of the
     // `on Type` class. If the target type isn't in the schema index yet,
     // skip this literal instead of falling through to root-level matching —
     // otherwise we'd flag legitimate fields as "no root query field …".
     if (fragCtx) {
-      const fragCls = ctx.classMap.get(fragCtx.onType);
+      const fragCls = findClassByGraphqlName(activeCtx.classMap, fragCtx.onType);
       if (!fragCls) continue;
-      walk(parsed, fragCls, startOffset, ctx, out, 'unknown');
+      walk(parsed, fragCls, startOffset, activeCtx, out, 'unknown');
       continue;
     }
-    const rootKind = readRootOperationKindFromGql(gqlBody);
-    walk(parsed, null, startOffset, ctx, out, rootKind);
+    walk(parsed, null, startOffset, activeCtx, out, rootKind);
   }
   return out;
 }
@@ -79,33 +92,47 @@ function walk(
   rootKind: RootOperationKind,
 ): void {
   for (const gf of fields) {
+    const conditionedParent = gf.typeCondition
+      ? findClassByGraphqlName(ctx.classMap, gf.typeCondition)
+      : parentCls;
+    if (gf.typeCondition && !conditionedParent) continue;
+    if (isGraphqlMetaField(gf.name, conditionedParent, rootKind)) continue;
     const snake = camelToSnake(gf.name);
-    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, parentCls, { rootKind });
+    const entry = findEntry(ctx.fieldIndex, ctx.classMap, snake, conditionedParent, {
+      rootKind,
+      graphqlFieldName: gf.name,
+    });
 
-    if (!entry && parentCls) {
+    if (!entry && conditionedParent) {
       // Parent is known but the field doesn't exist on it — user typo or
       // schema drift. Surface it.
-      const candidates = collectCandidateFieldNames(parentCls, ctx.classMap);
+      const candidates = collectCandidateFieldNames(conditionedParent, ctx.classMap);
       const suggestions = suggest(snake, candidates, 3);
+      const displayName = candidates.some((candidate) => camelToSnake(candidate) !== candidate)
+        ? gf.name
+        : snake;
       const suggestText = suggestions.length > 0
         ? ` — did you mean ${suggestions.map((s) => `\`${s}\``).join(' or ')}?`
         : '';
       out.push({
         offset: baseOffset + gf.nameOffset,
         length: gf.nameLength,
-        message: `No field '${snake}' on ${parentCls.name} (or its ancestors)${suggestText}`,
+        message: `No field '${displayName}' on ${conditionedParent.name} (or its ancestors)${suggestText}`,
         suggestions,
       });
     } else if (!entry && hasSchemaRootForOperation(ctx.classMap, rootKind)) {
       const candidates = collectRootFieldNames(ctx.classMap, rootKind);
       const suggestions = suggest(snake, candidates, 3);
+      const displayName = candidates.some((candidate) => camelToSnake(candidate) !== candidate)
+        ? gf.name
+        : snake;
       const suggestText = suggestions.length > 0
         ? ` — did you mean ${suggestions.map((s) => `\`${s}\``).join(' or ')}?`
         : '';
       out.push({
         offset: baseOffset + gf.nameOffset,
         length: gf.nameLength,
-        message: `No root ${rootKind} field '${snake}' in the schema${suggestText}`,
+        message: `No root ${rootKind} field '${displayName}' in the schema${suggestText}`,
         suggestions,
       });
     }
@@ -119,13 +146,14 @@ function walk(
 function collectCandidateFieldNames(cls: ClassInfo, classMap: Map<string, ClassInfo>): string[] {
   const names: string[] = cls.fields
     .filter((f) => !(f.name.startsWith('__') && f.name.endsWith('__')))
-    .map((f) => f.name);
+    .map((f) => f.graphqlName ?? f.name);
   for (const anc of collectAncestors(cls, classMap)) {
     const ancCls = classMap.get(anc);
     if (!ancCls) continue;
     for (const f of ancCls.fields) {
       if (f.name.startsWith('__') && f.name.endsWith('__')) continue;
-      if (!names.includes(f.name)) names.push(f.name);
+      const name = f.graphqlName ?? f.name;
+      if (!names.includes(name)) names.push(name);
     }
   }
   return names;
@@ -135,7 +163,7 @@ function collectCandidateFieldNames(cls: ClassInfo, classMap: Map<string, ClassI
 function suggest(target: string, pool: string[], limit: number): string[] {
   if (target.length < 2) return [];
   const scored = pool
-    .map((candidate) => ({ candidate, dist: levenshtein(target, candidate) }))
+    .map((candidate) => ({ candidate, dist: levenshtein(target, camelToSnake(candidate)) }))
     // Allow up to half the target length in edits before we consider it unrelated.
     .filter((s) => s.dist <= Math.max(2, Math.floor(target.length / 2)))
     .sort((a, b) => a.dist - b.dist || a.candidate.length - b.candidate.length);
@@ -227,7 +255,7 @@ export class GqlDiagnosticsManager {
 
   refresh(document: vscode.TextDocument): void {
     const ctx = this.readState();
-    const infos = computeDiagnostics(document.getText(), ctx);
+    const infos = computeDiagnostics(document.getText(), { ...ctx, documentPath: document.fileName });
     const diags = infos.map((info) => {
       const range = new vscode.Range(
         document.positionAt(info.offset),

@@ -5,6 +5,16 @@ const names = (fields: { name: string; children: { name: string }[] }[]) =>
   fields.map((f) => ({ name: f.name, children: f.children.map((c) => c.name) }));
 
 describe('parseGqlFields fragment inlining', () => {
+  it('ignores operation keywords inside comments and string values', () => {
+    const gql = `
+      # mutation Fake { nope }
+      query Real { search(text: "subscription Hidden )") { id } }
+    `;
+    const parsed = parseGqlFields(gql);
+    expect(parsed.map((field) => field.name)).toEqual(['search']);
+    expect(parsed[0].children.map((field) => field.name)).toEqual(['id']);
+  });
+
   it('inlines named fragment spreads defined in the same gql literal', () => {
     const gql = `
       fragment StatusFields on RtccType {
@@ -48,6 +58,9 @@ describe('parseGqlFields fragment inlining', () => {
       { name: 'email', children: [] },
       { name: 'profile', children: ['bio'] },
     ]);
+    expect(parsed[0].children.find((f) => f.name === 'id')!.typeCondition).toBeUndefined();
+    expect(parsed[0].children.find((f) => f.name === 'email')!.typeCondition).toBe('UserType');
+    expect(parsed[0].children.find((f) => f.name === 'profile')!.typeCondition).toBe('UserType');
   });
 
   it('resolves fragments that reference other fragments', () => {
@@ -292,6 +305,8 @@ describe('parseGqlFields fragment origin tagging', () => {
     expect(byName.get('id')!.fromFragment).toBeUndefined();
     expect(byName.get('name')!.fromFragment).toBe('UserFields');
     expect(byName.get('email')!.fromFragment).toBe('UserFields');
+    expect(byName.get('name')!.typeCondition).toBe('UserType');
+    expect(byName.get('email')!.typeCondition).toBe('UserType');
   });
 
   it('does not tag fields introduced via inline `... on Type` spreads', () => {

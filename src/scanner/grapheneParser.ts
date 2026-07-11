@@ -119,16 +119,26 @@ function resolveClassByProximity(
   const pool = topLevel.length > 0 ? topLevel : candidates;
   if (pool.length === 1) return pool[0];
 
-  // Score: prefer graphene-import files, then longest common path prefix.
+  // Resolve in the schema's directory context first.  Composition-only root
+  // modules often do not import Graphene themselves (they merely inherit
+  // query mixins), while test modules commonly define a same-named Query and
+  // import ObjectType directly.  Treating the Graphene import as the primary
+  // signal lets that test Query replace the production root and drops the
+  // production mixin graph from the schema entirely.
+  //
+  // Keep the import signal only as a tie-breaker after path proximity.  It is
+  // still useful when two candidates live at an equally-close location, but
+  // it must not overrule the Schema() call's own package context.
   return pool.reduce((best, candidate) => {
+    const bestScore = commonPrefixLength(best.filePath, contextFilePath);
+    const candidateScore = commonPrefixLength(candidate.filePath, contextFilePath);
+    if (candidateScore > bestScore) return candidate;
+    if (candidateScore < bestScore) return best;
+
     const bestHasImports = best.imports !== EMPTY_IMPORTS;
     const candidateHasImports = candidate.imports !== EMPTY_IMPORTS;
     if (candidateHasImports && !bestHasImports) return candidate;
-    if (!candidateHasImports && bestHasImports) return best;
-
-    const bestScore = commonPrefixLength(best.filePath, contextFilePath);
-    const candidateScore = commonPrefixLength(candidate.filePath, contextFilePath);
-    return candidateScore > bestScore ? candidate : best;
+    return best;
   });
 }
 
@@ -727,10 +737,11 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     });
   }
 
-  // Fill in defaults for entries missing root names
+  // Fill in the conventional query root only. For an explicit Schema call,
+  // an omitted mutation argument means there is no mutation root; inventing
+  // `Mutation` can expose an unrelated class from tests or another module.
   for (const entry of schemaEntries) {
     if (!entry.queryRootName) entry.queryRootName = 'Query';
-    if (!entry.mutationRootName) entry.mutationRootName = 'Mutation';
   }
 
   // Deduplicate schema entries
@@ -921,6 +932,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
       }
       classMap.set(name, {
         name: raw.name,
+        graphqlName: extractGrapheneTypeName(raw),
         baseClasses: raw.baseClasses,
         framework: 'graphene',
         filePath: raw.filePath,
@@ -1002,12 +1014,37 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     }
 
     const queryRootName = schemaEntry.queryRootName!;
-    const mutationRootName = schemaEntry.mutationRootName!;
+    const mutationRootName = schemaEntry.mutationRootName;
 
     // Deduplicate by resolved root classes: if multiple schema entries
     // resolve to the same Query/Mutation root class, keep only the first
     const queryRootCls = classMap.get(queryRootName);
-    const mutationRootCls = classMap.get(mutationRootName);
+    const mutationRootCls = mutationRootName ? classMap.get(mutationRootName) : undefined;
+    if (queryRootCls) queryRootCls.isSchemaRoot = true;
+    if (mutationRootCls) mutationRootCls.isSchemaRoot = true;
+    const markRootContributors = (root: ClassInfo | undefined): void => {
+      if (!root) return;
+      const stack = [...root.baseClasses];
+      const seen = new Set<string>();
+      while (stack.length > 0) {
+        const name = stack.pop()!;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const base = classMap.get(name);
+        if (!base) continue;
+        base.isSchemaRootContributor = true;
+        stack.push(...base.baseClasses);
+      }
+      // Inherited fields already carry their declaring owner.  This also
+      // covers scanners/cache entries whose multiline base list was partial.
+      for (const field of root.fields) {
+        if (!field.definedIn) continue;
+        const owner = classMap.get(field.definedIn);
+        if (owner) owner.isSchemaRootContributor = true;
+      }
+    };
+    markRootContributors(queryRootCls);
+    markRootContributors(mutationRootCls);
     const resolvedRootKey = `${queryRootCls?.filePath ?? ''}:${queryRootCls?.lineNumber ?? ''}::${mutationRootCls?.filePath ?? ''}:${mutationRootCls?.lineNumber ?? ''}`;
     if (seenResolvedRoots.has(resolvedRootKey)) continue;
     seenResolvedRoots.add(resolvedRootKey);
@@ -1020,7 +1057,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         kindMap.set(name, 'query');
         continue;
       }
-      if (name === mutationRootName) {
+      if (mutationRootName && name === mutationRootName) {
         kindMap.set(name, 'mutation');
         continue;
       }
@@ -1076,7 +1113,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
         }
       }
     }
-    const rootMutationCls = classMap.get(mutationRootName);
+    const rootMutationCls = mutationRootName ? classMap.get(mutationRootName) : undefined;
     if (rootMutationCls) {
       for (const field of rootMutationCls.fields) {
         if (field.resolvedType && classMap.has(field.resolvedType) && !kindMap.has(field.resolvedType)) {
@@ -1110,7 +1147,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
       }
     }
     collectReachable(queryRootName);
-    collectReachable(mutationRootName);
+    if (mutationRootName) collectReachable(mutationRootName);
 
     // Build result for this schema entry
     const queries: ClassInfo[] = [];
@@ -1386,6 +1423,7 @@ export function parseClassFields(
 
         fields.push({
           name: fieldName,
+          graphqlName: extractGraphqlNameOverride(lines, i),
           fieldType: effectiveFieldType,
           resolvedType,
           args: args.length > 0 ? args : undefined,
@@ -1410,6 +1448,7 @@ export function parseClassFields(
 
       fields.push({
         name: fieldName,
+        graphqlName: extractGraphqlNameOverride(lines, i),
         fieldType: 'Field',
         resolvedType: className,
         args: args.length > 0 ? args : undefined,
@@ -1500,6 +1539,53 @@ export function parseClassFields(
   }
 
   return fields;
+}
+
+/**
+ * Read Graphene's explicit wire-name override from a field constructor:
+ * `python_name = Field(Type, name="graphqlName")` (including multiline
+ * calls).  The source name remains in `FieldInfo.name` for navigation while
+ * the resolver indexes this exact GraphQL name.
+ */
+function extractGraphqlNameOverride(lines: string[], fieldLineNumber: number): string | undefined {
+  let fullDef = '';
+  let depth = 0;
+  let sawParen = false;
+  for (let j = fieldLineNumber; j < lines.length && j < fieldLineNumber + 20; j++) {
+    const line = lines[j];
+    for (const ch of line) {
+      if (ch === '(') { depth++; sawParen = true; }
+      else if (ch === ')') depth--;
+    }
+    fullDef += line + '\n';
+    if (sawParen && depth <= 0) break;
+  }
+  const match = /\bname\s*=\s*(["'])([A-Za-z_]\w*)\1/.exec(fullDef);
+  return match?.[2];
+}
+
+/** Read `class Meta: name = "WireType"` from a Graphene class body. */
+function extractGrapheneTypeName(raw: RawClassInfo): string | undefined {
+  const classLine = raw.lines[raw.lineNumber] ?? '';
+  const classIndent = classLine.match(/^(\s*)/)?.[1].length ?? 0;
+  for (let i = raw.lineNumber + 1; i < raw.lines.length; i++) {
+    const line = raw.lines[i];
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    if (indent <= classIndent) break;
+    if (!/^\s+class\s+Meta\s*:/.test(line)) continue;
+    const metaIndent = indent;
+    for (let j = i + 1; j < raw.lines.length; j++) {
+      const metaLine = raw.lines[j];
+      if (/^\s*$/.test(metaLine) || /^\s*#/.test(metaLine)) continue;
+      const metaLineIndent = metaLine.match(/^(\s*)/)?.[1].length ?? 0;
+      if (metaLineIndent <= metaIndent) break;
+      const match = /^\s+name\s*=\s*(["'])([A-Za-z_]\w*)\1/.exec(metaLine);
+      if (match) return match[2];
+    }
+    break;
+  }
+  return undefined;
 }
 
 // GraphQL built-in + common-custom scalar names. When Pattern 3 resolves an

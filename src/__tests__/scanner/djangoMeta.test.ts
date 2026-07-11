@@ -147,6 +147,7 @@ describe('parseGrapheneSchemas — Meta.fields end-to-end (scenario 3)', () => {
         'class UserType(DjangoObjectType):',
         '    class Meta:',
         '        model = User',
+        '        name = "User"',
         '        fields = ["id", "name", "email"]',
         '',
         '    display_name = String()',
@@ -160,6 +161,7 @@ describe('parseGrapheneSchemas — Meta.fields end-to-end (scenario 3)', () => {
     const schemas = await parseGrapheneSchemas('/proj');
     const user = findClass(schemas, 'UserType');
     expect(user, 'UserType should be discovered').toBeDefined();
+    expect(user!.graphqlName).toBe('User');
     const names = user!.fields.map((f) => f.name).sort();
     expect(names).toEqual(['display_name', 'email', 'id', 'name']);
   });
