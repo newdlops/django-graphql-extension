@@ -6,6 +6,7 @@ import { buildReverseIndex } from '../scanner/reverseIndex';
 import { computeQueryCoverage, CoverageMap } from '../analysis/gqlCoverage';
 import { FrontendGqlFileUsage } from '../analysis/frontendGqlUsage';
 import { FragmentDef } from '../codelens/gqlCodeLensProvider';
+import { isExplorerToHostMessage, SurfaceStatus } from './protocol';
 
 interface TreeNode {
   label: string;
@@ -52,8 +53,14 @@ function escapeRegex(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function createWebviewNonce(): string {
+  return Array.from({ length: 24 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
+}
+
 export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'djangoGraphqlExplorer.view';
+
+  constructor(private readonly extensionUri?: vscode.Uri) {}
 
   private view?: vscode.WebviewView;
   private schemas: SchemaInfo[] = [];
@@ -67,6 +74,20 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   private unfilteredSectionsCache = new Map<SortMode, TreeSection[]>();
   private classSearchText = new WeakMap<ClassInfo, CachedSearchText>();
   private relativePathCache = new Map<string, string>();
+  private searchError: string | undefined;
+  private explorerReady = false;
+  private inspectorReady = false;
+  private pendingInspectorPayload: (ReturnType<typeof buildInspectorData> & { hasActiveCoverage?: boolean }) | undefined;
+  private explorerStatus: SurfaceStatus = { kind: 'loading', message: 'Scanning workspace…', hasStaleData: false };
+
+  hasSchemas(): boolean {
+    return this.schemas.length > 0;
+  }
+
+  setExplorerStatus(status: SurfaceStatus): void {
+    this.explorerStatus = status;
+    if (this.view && this.explorerReady) this.view.webview.postMessage({ type: 'status', status });
+  }
 
   /**
    * List of class names the inspector can jump to (fed into the quick pick).
@@ -108,8 +129,12 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = this.getHtml();
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: this.extensionUri ? [this.extensionUri] : undefined,
+    };
+    this.explorerReady = false;
+    webviewView.webview.html = this.getHtml(webviewView.webview);
 
     webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
@@ -118,16 +143,22 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage((msg) => {
-      if (msg.type === 'search') {
+      if (!isExplorerToHostMessage(msg)) return;
+      if (msg.type === 'ready' && msg.surface === 'explorer') {
+        this.explorerReady = true;
+        this.sendTree();
+      } else if (msg.type === 'search') {
         this.applyFilter(msg);
       } else if (msg.type === 'open' && msg.file) {
-        const uri = vscode.Uri.file(msg.file);
+        const uri = vscode.Uri.file(msg.file!);
         const line = msg.line ?? 0;
         vscode.window.showTextDocument(uri, {
           selection: new vscode.Range(line, 0, line, 0),
         });
+      } else if (msg.type === 'refresh') {
+        void vscode.commands.executeCommand('djangoGraphqlExplorer.refresh');
       } else if (msg.type === 'preview' && (msg.classId || msg.className)) {
-        this.showPreview(msg.classId ?? msg.className);
+        this.showPreview(msg.classId ?? msg.className ?? '');
       } else if (msg.type === 'sort') {
         if (msg.mode !== this.sortMode) {
           this.sortMode = msg.mode;
@@ -144,6 +175,9 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     this.classIdsByName.clear();
     this.classMap.clear();
     this.clearTreeCaches();
+    this.explorerStatus = schemas.length === 0
+      ? { kind: 'empty', message: 'No Django GraphQL schema was found in this workspace.' }
+      : { kind: 'ready' };
     for (const schema of schemas) {
       const schemaClassMap = new Map<string, ClassInfo>();
       const classes = [...schema.queries, ...schema.mutations, ...schema.subscriptions, ...schema.types];
@@ -167,7 +201,15 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
   }
 
   private applyFilter(msg: { query: string; caseSensitive: boolean; wholeWord: boolean; useRegex: boolean }): void {
-    const nextFilter = this.createSearchFilter(msg);
+    let nextFilter: SearchFilter | null;
+    try {
+      nextFilter = this.createSearchFilter(msg);
+      this.searchError = undefined;
+    } catch (error) {
+      this.searchError = error instanceof Error ? `Invalid regular expression: ${error.message}` : 'Invalid regular expression.';
+      this.sendTree();
+      return;
+    }
     if (this.searchFilter?.key === nextFilter?.key) {
       return;
     }
@@ -495,11 +537,7 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       const literalSource = escapeRegex(query);
       let source = msg.useRegex ? query : literalSource;
       if (msg.wholeWord) source = `\\b${source}\\b`;
-      try {
-        pattern = new RegExp(source, flags);
-      } catch {
-        pattern = new RegExp(literalSource, flags);
-      }
+      pattern = new RegExp(source, flags);
     }
 
     return {
@@ -581,14 +619,25 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
         'graphqlPreview',
         ctx.cls.name,
         { viewColumn: vscode.ViewColumn.One, preserveFocus: true },
-        { enableScripts: true, retainContextWhenHidden: true },
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true,
+          localResourceRoots: this.extensionUri ? [this.extensionUri] : undefined,
+        },
       );
-      this.previewPanel.webview.html = this.getInspectorShellHtml();
+      this.inspectorReady = false;
+      this.previewPanel.webview.html = this.getInspectorShellHtml(this.previewPanel.webview);
       this.previewPanel.webview.onDidReceiveMessage((msg) => {
-        if (msg.type === 'navigate' && (msg.classId || msg.className)) {
-          this.renderInspector(msg.classId ?? msg.className);
+        if (!isExplorerToHostMessage(msg)) return;
+        if (msg.type === 'ready' && msg.surface === 'inspector') {
+          this.inspectorReady = true;
+          if (this.pendingInspectorPayload) {
+            this.previewPanel?.webview.postMessage({ type: 'inspector', data: this.pendingInspectorPayload });
+          }
+        } else if (msg.type === 'navigate' && (msg.classId || msg.className)) {
+          this.renderInspector(msg.classId ?? msg.className ?? '');
         } else if (msg.type === 'open' && msg.file) {
-          const uri = vscode.Uri.file(msg.file);
+          const uri = vscode.Uri.file(msg.file!);
           vscode.window.showTextDocument(uri, {
             selection: new vscode.Range(msg.line ?? 0, 0, msg.line ?? 0, 0),
           });
@@ -597,6 +646,8 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
       this.previewPanel.onDidDispose(() => {
         this.previewPanel = undefined;
         this.currentInspectorClassId = undefined;
+        this.inspectorReady = false;
+        this.pendingInspectorPayload = undefined;
       });
     }
 
@@ -611,23 +662,36 @@ export class GraphqlViewProvider implements vscode.WebviewViewProvider {
     if (!classId || !ctx) return;
     const coverageForClass = this.coverage.get(ctx.cls.name) ?? new Set<string>();
     const reverseIndex = buildReverseIndex(ctx.schemaClassMap);
-    const payload = buildInspectorData(
+    const basePayload = buildInspectorData(
       ctx.cls.name,
       ctx.schemaClassMap,
       reverseIndex,
       coverageForClass,
       (candidate) => classIdFor(candidate),
     );
-    if (!payload) return;
+    if (!basePayload) return;
+    const payload = { ...basePayload, hasActiveCoverage: this.coverage.size > 0 };
     this.currentInspectorClassId = classId;
     this.previewPanel.title = ctx.cls.name;
-    this.previewPanel.webview.postMessage({ type: 'inspector', data: payload });
+    this.pendingInspectorPayload = payload;
+    if (this.inspectorReady) {
+      this.previewPanel.webview.postMessage({ type: 'inspector', data: payload });
+    }
   }
 
-  private getInspectorShellHtml(): string {
-    return /*html*/ `<!DOCTYPE html>
-<html><head><style>
+  private codiconStyleUri(webview?: vscode.Webview): string {
+    if (!webview || !this.extensionUri) return '';
+    return webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'codicons', 'codicon.css')).toString();
+  }
+
+ private getInspectorShellHtml(webview?: vscode.Webview): string {
+    const nonce = createWebviewNonce();
+    const cspSource = webview?.cspSource ?? "'none'";
+    const codiconStyleUri = this.codiconStyleUri(webview);
+   return /*html*/ `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Type Inspector</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'nonce-${nonce}'; font-src ${cspSource}; script-src 'nonce-${nonce}';">${codiconStyleUri ? `<link nonce="${nonce}" rel="stylesheet" href="${codiconStyleUri}">` : ''}<style nonce="${nonce}">
 * { box-sizing: border-box; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 body {
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size);
@@ -638,15 +702,15 @@ body {
 .header {
   padding: 12px 20px 6px; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
 }
-.header .title { font-size: 1.4em; font-weight: 600; }
+.header .title { display: inline; margin: 0; font-size: 1.4em; font-weight: 600; }
 .header .kind {
   display: inline-block; margin-left: 8px; padding: 1px 6px; border-radius: 3px;
   font-size: 0.7em; text-transform: uppercase; vertical-align: middle;
   background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
 }
 .header .path {
-  display: block; margin-top: 4px; color: var(--vscode-textLink-foreground);
-  cursor: pointer; font-family: var(--vscode-editor-font-family); font-size: 0.85em;
+  display: block; margin-top: 4px; padding: 0; border: 0; color: var(--vscode-textLink-foreground);
+  cursor: pointer; font-family: var(--vscode-editor-font-family); font-size: 0.85em; background: transparent; text-align: left;
 }
 .header .path:hover { text-decoration: underline; }
 .section { padding: 12px 20px; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.1)); }
@@ -662,10 +726,11 @@ body {
 }
 .chip.clickable { cursor: pointer; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
 .chip.clickable:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.chip.clickable:focus-visible, .path:focus-visible, .ref-item:focus-visible, .filter:focus-visible, .load-more:focus-visible, .sdl-action:focus-visible, .field-source:focus-visible, .base-more:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .chip.unknown { opacity: 0.55; font-style: italic; }
 .fields-table { width: 100%; border-collapse: collapse; font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
 .fields-table th, .fields-table td { text-align: left; padding: 4px 8px; vertical-align: top; }
-.fields-table th { color: var(--vscode-descriptionForeground); font-weight: 500; font-size: 0.85em; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); }
+.fields-table th { color: var(--vscode-descriptionForeground); font-weight: 500; font-size: 0.85em; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); position: sticky; top: 0; background: var(--vscode-editor-background); }
 .fields-table tr.inherited td .name::after { content: ' ↳'; color: var(--vscode-descriptionForeground); font-size: 0.75em; }
 .fields-table tr.queried td .name::before {
   content: '✓ '; color: var(--vscode-testing-iconPassed, #4caf50); font-weight: bold;
@@ -683,24 +748,51 @@ body {
 .coverage-pill.zero { background: var(--vscode-badge-background); opacity: 0.6; }
 .fields-table .muted { color: var(--vscode-descriptionForeground); }
 .fields-table .name { font-weight: 500; }
+.field-source { appearance: none; border: 0; padding: 0; margin: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left; }
+.field-source:hover { text-decoration: underline; }
 .fields-table .name-snake { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
 .fields-table .arg-row { font-size: 0.85em; margin-top: 2px; color: var(--vscode-descriptionForeground); }
 .fields-table .arg-row .chip { font-size: 0.85em; padding: 1px 6px; }
 .ref-item {
-  padding: 3px 0; font-family: var(--vscode-editor-font-family); font-size: 0.9em; cursor: pointer;
+  display: block; width: 100%; border: 0; text-align: left; padding: 3px 0; font-family: var(--vscode-editor-font-family); font-size: 0.9em; cursor: pointer; color: inherit; background: transparent;
 }
 .ref-item:hover { text-decoration: underline; }
 .ref-item .via { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-left: 6px; }
+.references summary { cursor: pointer; color: var(--vscode-textLink-foreground); margin-bottom: 4px; }
 .empty { color: var(--vscode-descriptionForeground); font-style: italic; font-size: 0.9em; }
 details.sdl { font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
 details.sdl summary { cursor: pointer; padding: 4px 0; color: var(--vscode-descriptionForeground); }
 details.sdl pre { margin: 6px 0 0; padding: 8px; background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.08)); border-radius: 3px; overflow-x: auto; }
+details.sdl pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
 details.sdl .kw { color: #c586c0; } details.sdl .type { color: #4ec9b0; } details.sdl .comment { color: #6a9955; }
+.field-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.field-tools input { min-width: 10rem; flex: 1 1 12rem; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); padding: 4px 6px; }
+.filter, .load-more, .sdl-action { border: 1px solid var(--vscode-button-secondaryBackground); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); padding: 3px 7px; cursor: pointer; }
+.filter[aria-pressed="true"] { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.field-count { color: var(--vscode-descriptionForeground); font-size: .9em; margin: 6px 0; }
+.base-more { border: 0; padding: 2px 6px; background: transparent; color: var(--vscode-textLink-foreground); cursor: pointer; font: inherit; }
+@media (max-width: 520px) {
+  .fields-table .origin-col { display: none; }
+  .fields-table .origin-inline { display: inline; }
+}
+@media (min-width: 521px) { .fields-table .origin-inline { display: none; } }
 </style></head><body>
-<div id="root"><div class="empty" style="padding:20px">Loading…</div></div>
-<script>
+<div id="root" aria-busy="true"><div class="empty" role="status" style="padding:20px">Loading type…</div></div>
+<script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const root = document.getElementById('root');
+const savedInspectorState = typeof vscode.getState === 'function' ? vscode.getState() : undefined;
+let fieldLimit = Number.isInteger(savedInspectorState?.fieldLimit) ? Math.max(100, Math.min(savedInspectorState.fieldLimit, 1000)) : 100;
+let lastInspectorData = null;
+let fieldQuery = typeof savedInspectorState?.fieldQuery === 'string' ? savedInspectorState.fieldQuery.slice(0, 256) : '';
+let fieldFilter = ['all', 'own', 'inherited', 'queried', 'unqueried'].includes(savedInspectorState?.fieldFilter) ? savedInspectorState.fieldFilter : 'all';
+let baseClassesExpanded = !!savedInspectorState?.baseClassesExpanded;
+let wrapSdl = !!savedInspectorState?.wrapSdl;
+
+function persistInspectorState() {
+  if (typeof vscode.setState !== 'function') return;
+  vscode.setState({ fieldLimit, fieldQuery, fieldFilter, baseClassesExpanded, wrapSdl });
+}
 
 function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -715,9 +807,8 @@ function renderSdl(sdl) {
 
 function typeChip(typeName, targetId) {
   if (!typeName) return '';
-  const cls = targetId ? 'chip clickable' : 'chip unknown';
-  const attrs = targetId ? ' data-nav="' + escapeHtml(targetId) + '"' : '';
-  return '<span class="' + cls + '"' + attrs + '">' + escapeHtml(typeName) + '</span>';
+  if (targetId) return '<button type="button" class="chip clickable" data-nav="' + escapeHtml(targetId) + '" aria-label="Inspect type ' + escapeHtml(typeName) + '">' + escapeHtml(typeName) + '</button>';
+  return '<span class="chip unknown">' + escapeHtml(typeName) + '</span>';
 }
 
 function argsFragment(args) {
@@ -731,59 +822,82 @@ function argsFragment(args) {
 }
 
 function render(data) {
+  lastInspectorData = data;
+  if (!data.hasActiveCoverage && (fieldFilter === 'queried' || fieldFilter === 'unqueried')) fieldFilter = 'all';
+  root.setAttribute('aria-busy', 'false');
   const kindBadge = '<span class="kind">' + escapeHtml(data.kind) + '</span>';
   const path = escapeHtml(data.filePath) + ':' + (data.lineNumber + 1);
 
+  const visibleBaseClasses = baseClassesExpanded ? data.baseClasses : data.baseClasses.slice(0, 8);
   const baseChips = data.baseClasses.length === 0
     ? '<span class="empty">—</span>'
-    : '<div class="chips">' + data.baseClasses.map(b =>
+    : '<div class="chips">' + visibleBaseClasses.map(b =>
         typeChip(b, data.baseClassTargets[b])
-      ).join('') + '</div>';
+      ).join('') + (data.baseClasses.length > 8 ? '<button type="button" class="base-more" data-toggle-base aria-expanded="' + String(baseClassesExpanded) + '">' + (baseClassesExpanded ? 'Show fewer' : 'Show ' + (data.baseClasses.length - 8) + ' more') + '</button>' : '') + '</div>';
 
   const coveragePill = data.totalCount === 0
     ? ''
     : '<span class="coverage-pill' + (data.queriedCount === 0 ? ' zero' : '') + '">' +
       '✓ ' + data.queriedCount + ' / ' + data.totalCount + ' queried</span>';
 
-  const fieldRows = data.fields.length === 0
-    ? '<div class="empty">No fields</div>'
-    : '<table class="fields-table"><thead><tr><th>Field</th><th>Type</th></tr></thead><tbody>' +
-      data.fields.map(r => {
+  const normalizedQuery = fieldQuery.trim().toLowerCase();
+  const matchingFields = data.fields.filter((field) => {
+    const matchesQuery = !normalizedQuery || [field.name, field.displayName, field.fieldType, field.resolvedType || ''].join(' ').toLowerCase().includes(normalizedQuery);
+    const matchesFilter = fieldFilter === 'all' || (fieldFilter === 'own' && field.origin === 'own') || (fieldFilter === 'inherited' && field.origin === 'inherited') || (fieldFilter === 'queried' && field.queried) || (fieldFilter === 'unqueried' && !field.queried);
+    return matchesQuery && matchesFilter;
+  });
+  const visibleFields = matchingFields.slice(0, fieldLimit);
+  const availableFilters = data.hasActiveCoverage ? ['all', 'own', 'inherited', 'queried', 'unqueried'] : ['all', 'own', 'inherited'];
+  const fieldTools = '<div class="field-tools"><label class="sr-only" for="field-search">Search fields</label><input id="field-search" name="field-search" autocomplete="off" type="search" value="' + escapeHtml(fieldQuery) + '" placeholder="Search fields" />' +
+    availableFilters.map((filter) => '<button type="button" class="filter" data-filter="' + filter + '" aria-pressed="' + String(fieldFilter === filter) + '">' + ({ all: 'All', own: 'Own', inherited: 'Inherited', queried: 'Queried', unqueried: 'Not queried' })[filter] + '</button>').join('') + '</div>' +
+    (data.hasActiveCoverage ? '' : '<div class="field-count">No active operation context</div>');
+  const fieldRows = matchingFields.length === 0
+    ? '<div class="empty">No fields match the current filters. <button type="button" class="base-more" data-clear-field-filters>Clear field filters</button></div>'
+    : '<table class="fields-table"><caption class="sr-only">Fields for ' + escapeHtml(data.className) + '</caption><thead><tr><th scope="col">Field</th><th scope="col">Type</th><th class="origin-col" scope="col">Origin</th></tr></thead><tbody>' +
+      visibleFields.map(r => {
         const rowClasses = ['field-row'];
         if (r.origin === 'inherited') rowClasses.push('inherited');
         if (r.queried) rowClasses.push('queried');
         const resolved = r.resolvedType ? ' → ' + typeChip(r.resolvedType, r.resolvedTypeId) : '';
-        return '<tr class="' + rowClasses.join(' ') + '" data-file="' + escapeHtml(r.filePath) + '" data-line="' + r.lineNumber + '">' +
-          '<td><span class="name">' + escapeHtml(r.displayName) + '</span>' +
+        return '<tr class="' + rowClasses.join(' ') + '">' +
+          '<td><button type="button" class="field-source name" data-file="' + escapeHtml(r.filePath) + '" data-line="' + r.lineNumber + '" aria-label="Open source for ' + escapeHtml(r.displayName) + '">' + escapeHtml(r.displayName) + '</button>' +
           (r.name !== r.displayName ? ' <span class="name-snake">(' + escapeHtml(r.name) + ')</span>' : '') +
+          '<span class="origin-inline muted"> · ' + escapeHtml(r.origin === 'inherited' ? 'Inherited' : 'Own') + '</span>' +
           '</td><td>' +
           '<span class="muted">' + escapeHtml(r.fieldType) + '</span>' + resolved +
           argsFragment(r.args) +
-          '</td></tr>';
-      }).join('') + '</tbody></table>';
+          '</td><td class="origin-col">' + escapeHtml(r.origin === 'inherited' ? 'Inherited' : 'Own') + '</td></tr>';
+      }).join('') + '</tbody></table>' +
+      '<div class="field-count">Showing ' + visibleFields.length + ' of ' + matchingFields.length + ' fields</div>' +
+      (visibleFields.length < matchingFields.length ? '<button type="button" class="load-more" id="load-more">Show 100 more fields</button>' : '');
 
   const refItems = (refs, via) => refs.length === 0
     ? '<div class="empty">—</div>'
-    : refs.map(r =>
-        '<div class="ref-item"' + (r.fromClassId ? ' data-nav="' + escapeHtml(r.fromClassId) + '"' : '') + '>' +
+    : (() => {
+      const items = refs.map(r =>
+        (r.fromClassId ? '<button type="button" class="ref-item" data-nav="' + escapeHtml(r.fromClassId) + '" aria-label="Inspect type ' + escapeHtml(r.fromClass) + '">' : '<div class="ref-item">') +
         escapeHtml(r.fromClass) + '.<span class="muted">' + escapeHtml(r.fromField) + '</span>' +
         '<span class="via">(' + via + (r.label !== r.fromField ? ': ' + escapeHtml(r.label) : '') + ')</span>' +
-        '</div>'
+        (r.fromClassId ? '</button>' : '</div>')
       ).join('');
+      return refs.length > 20
+        ? '<details class="references"><summary>Show all ' + refs.length + ' references</summary>' + items + '</details>'
+        : items;
+    })();
 
   root.innerHTML =
-    '<div class="header"><div><span class="title">' + escapeHtml(data.className) + '</span>' + kindBadge + '</div>' +
-    '<a class="path" data-file="' + escapeHtml(data.filePath) + '" data-line="' + data.lineNumber + '">' + path + '</a></div>' +
+    '<div class="header"><div><h1 class="title">' + escapeHtml(data.className) + '</h1>' + kindBadge + '</div>' +
+    '<button type="button" class="path" data-file="' + escapeHtml(data.filePath) + '" data-line="' + data.lineNumber + '" aria-label="Open source ' + path + '">' + path + '</button></div>' +
 
     '<div class="section"><h3>Base classes</h3>' + baseChips + '</div>' +
 
-    '<div class="section"><h3>Fields (' + data.fields.length + ')' + coveragePill + '</h3>' + fieldRows + '</div>' +
+    '<div class="section"><h3>Fields (' + data.fields.length + ')' + coveragePill + '</h3>' + fieldTools + fieldRows + '</div>' +
 
     '<div class="section"><h3>Used as field type (' + data.usedAsFieldType.length + ')</h3>' + refItems(data.usedAsFieldType, 'field') + '</div>' +
 
     '<div class="section"><h3>Used as argument type (' + data.usedAsArgType.length + ')</h3>' + refItems(data.usedAsArgType, 'arg') + '</div>' +
 
-    '<div class="section"><details class="sdl"><summary>GraphQL SDL preview</summary><pre>' + renderSdl(data.sdl) + '</pre></details></div>';
+    '<div class="section"><details class="sdl"><summary>GraphQL SDL preview</summary><div class="field-tools"><button type="button" class="sdl-action" data-copy-sdl>Copy SDL</button><button type="button" class="sdl-action" data-wrap-sdl aria-pressed="' + String(wrapSdl) + '">Wrap code</button><span class="field-count" data-sdl-feedback role="status"></span></div><pre class="' + (wrapSdl ? 'wrap' : '') + '"><code>' + renderSdl(data.sdl) + '</code></pre></details></div>';
 
   root.querySelectorAll('[data-nav]').forEach(el => {
     el.addEventListener('click', (e) => {
@@ -801,33 +915,100 @@ function render(data) {
       });
     });
   });
+  const loadMore = root.querySelector('#load-more');
+  if (loadMore) loadMore.addEventListener('click', () => {
+    fieldLimit += 100;
+    persistInspectorState();
+    render(lastInspectorData);
+    root.querySelector('#load-more')?.focus();
+  });
+  const fieldSearch = root.querySelector('#field-search');
+  if (fieldSearch) fieldSearch.addEventListener('input', () => {
+    fieldQuery = fieldSearch.value;
+    fieldLimit = 100;
+    persistInspectorState();
+    render(lastInspectorData);
+  });
+  root.querySelectorAll('[data-filter]').forEach((button) => button.addEventListener('click', () => {
+    fieldFilter = button.getAttribute('data-filter') || 'all';
+    fieldLimit = 100;
+    persistInspectorState();
+    render(lastInspectorData);
+  }));
+  const baseMore = root.querySelector('[data-toggle-base]');
+  if (baseMore) baseMore.addEventListener('click', () => {
+    baseClassesExpanded = !baseClassesExpanded;
+    persistInspectorState();
+    render(lastInspectorData);
+  });
+  const clearFieldFilters = root.querySelector('[data-clear-field-filters]');
+  if (clearFieldFilters) clearFieldFilters.addEventListener('click', () => {
+    fieldQuery = '';
+    fieldFilter = 'all';
+    fieldLimit = 100;
+    persistInspectorState();
+    render(lastInspectorData);
+    root.querySelector('#field-search')?.focus();
+  });
+  const copySdl = root.querySelector('[data-copy-sdl]');
+  const sdlFeedback = root.querySelector('[data-sdl-feedback]');
+  if (copySdl) copySdl.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(lastInspectorData.sdl);
+      sdlFeedback.textContent = 'Copied';
+    } catch {
+      sdlFeedback.textContent = 'Could not copy SDL';
+    }
+  });
+  const wrapButton = root.querySelector('[data-wrap-sdl]');
+  if (wrapButton) wrapButton.addEventListener('click', () => {
+    wrapSdl = !wrapSdl;
+    persistInspectorState();
+    render(lastInspectorData);
+  });
 }
 
 window.addEventListener('message', (e) => {
   const msg = e.data;
-  if (msg.type === 'inspector') render(msg.data);
+  if (msg.type === 'inspector') {
+    render(msg.data);
+  }
 });
+vscode.postMessage({ type: 'ready', surface: 'inspector' });
 </script>
 </body></html>`;
   }
 
   private sendTree(): void {
-    if (!this.view) return;
+    if (!this.view || !this.explorerReady) return;
     const sections = this.buildSections();
-    this.view.webview.postMessage({ type: 'tree', sections, hasFilter: !!this.searchFilter, sortMode: this.sortMode });
+    this.view.webview.postMessage({ type: 'status', status: this.explorerStatus });
+    this.view.webview.postMessage({
+      type: 'tree',
+      sections,
+      hasFilter: !!this.searchFilter,
+      sortMode: this.sortMode,
+      filterError: this.searchError,
+    });
   }
 
-  private getHtml(): string {
+  private getHtml(webview?: vscode.Webview): string {
+    const nonce = createWebviewNonce();
+    const cspSource = webview?.cspSource ?? "'none'";
+    const codiconStyleUri = this.codiconStyleUri(webview);
     return /*html*/ `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<style>
+<meta charset="UTF-8"><title>Schema Explorer</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'nonce-${nonce}'; font-src ${cspSource}; script-src 'nonce-${nonce}';">${codiconStyleUri ? `<link nonce="${nonce}" rel="stylesheet" href="${codiconStyleUri}">` : ''}<style nonce="${nonce}">
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size);
   color: var(--vscode-foreground);
   overflow: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
 }
 
 /* ── Search bar ── */
@@ -842,7 +1023,8 @@ body {
 .search-row {
   display: flex;
   align-items: center;
-  gap: 1px;
+  flex-wrap: wrap;
+  gap: 4px;
   background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, transparent));
   border-radius: 2px;
@@ -852,15 +1034,19 @@ body {
   border-color: var(--vscode-focusBorder);
 }
 .search-row input {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 156px;
+  min-width: 156px;
   border: none;
-  outline: none;
   padding: 3px 4px;
   font-family: inherit;
   font-size: inherit;
   color: var(--vscode-input-foreground);
   background: transparent;
+}
+.search-row select { flex: 0 0 106px; min-width: 106px; max-width: 100%; background: var(--vscode-dropdown-background, var(--vscode-input-background)); color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground)); border: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, transparent)); }
+@media (max-width: 480px) {
+  .search-row input { flex: 1 0 100%; }
+  .search-row select { flex: 1 1 100px; min-width: 100px; }
 }
 .search-row input::placeholder {
   color: var(--vscode-input-placeholderForeground);
@@ -882,6 +1068,11 @@ body {
   flex-shrink: 0;
 }
 .toggle:hover { opacity: 0.85; background: var(--vscode-toolbar-hoverBackground); }
+.toggle:focus-visible, .node:focus-visible, .accordion summary:focus-visible, select:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .sep { width: 1px; height: 14px; background: var(--vscode-widget-border, rgba(128,128,128,0.3)); margin: 0 2px; flex-shrink: 0; }
 .toggle.active {
   opacity: 1;
@@ -893,14 +1084,15 @@ body {
 /* ── Sections / accordion ── */
 .sections { padding: 6px 0 12px; }
 .accordion {
-  margin: 8px;
-  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
-  border-radius: 6px;
-  overflow: hidden;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-widget-border, rgba(128,128,128,0.2)));
+  border-radius: 0;
+  overflow: visible;
   background: var(--vscode-sideBar-background);
 }
 .accordion[open] {
-  background: var(--vscode-editor-background);
+  background: var(--vscode-sideBar-background);
 }
 .accordion summary {
   list-style: none;
@@ -908,7 +1100,7 @@ body {
   align-items: center;
   justify-content: space-between;
   cursor: pointer;
-  padding: 8px 10px;
+  padding: 7px 10px;
   background: var(--vscode-sideBarSectionHeader-background, rgba(128,128,128,0.06));
 }
 .accordion summary::-webkit-details-marker { display: none; }
@@ -937,11 +1129,9 @@ body {
   color: var(--vscode-descriptionForeground);
   font-size: 0.9em;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
-.section-body {
-  padding: 4px 0 8px;
-  overflow-x: auto;
-}
+.section-body { padding: 4px 0 8px; overflow-x: hidden; }
 .section-empty {
   padding: 10px 14px;
   color: var(--vscode-descriptionForeground);
@@ -949,12 +1139,7 @@ body {
 }
 
 /* ── Tree ── */
-.tree {
-  display: inline-block;
-  min-width: 100%;
-  width: max-content;
-  padding: 2px 0;
-}
+.tree { display: block; min-width: 0; padding: 2px 0; }
 .tree-empty {
   padding: 12px 20px;
   color: var(--vscode-descriptionForeground);
@@ -964,12 +1149,16 @@ body {
   display: flex;
   align-items: center;
   height: 22px;
-  min-width: 100%;
+  min-width: 0;
   padding-right: 8px;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
-  width: max-content;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
 }
 .node:hover { background: var(--vscode-list-hoverBackground); }
 .node .indent { flex-shrink: 0; }
@@ -994,72 +1183,126 @@ body {
   flex-shrink: 0;
   margin-right: 4px;
 }
-.node .label { flex-shrink: 0; }
+.node .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .node .desc {
-  flex-shrink: 0;
+  min-width: 0;
+  flex: 0 1 auto;
   margin-left: 6px;
   color: var(--vscode-descriptionForeground);
-  overflow: visible;
-  text-overflow: clip;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.search-match {
+mark.search-match {
   border-radius: 2px;
   background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.35));
+  color: inherit;
   color: var(--vscode-editor-findMatchForeground, inherit);
 }
 .children { display: none; }
 .children.open { display: block; }
+.search-results { display: grid; gap: 1px; padding: 2px 0; }
+.search-result { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 6px; width: 100%; border: 0; background: transparent; color: inherit; text-align: left; padding: 5px 10px; cursor: pointer; }
+.search-result:hover, .search-result:focus-visible { background: var(--vscode-list-hoverBackground); }
+.search-result:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.search-result .result-main { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-result .result-context { grid-column: 2; color: var(--vscode-descriptionForeground); font-size: .85em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-more { margin: 6px 10px; width: calc(100% - 20px); }
 
-/* codicon-like icons via SVG or characters */
-.icon-symbol-package::before { content: '📦'; font-size: 12px; }
-.icon-symbol-namespace::before { content: '{}'; font-size: 10px; font-weight: bold; color: var(--vscode-symbolIcon-namespaceForeground, #9cdcfe); }
-.icon-symbol-class::before { content: 'C'; font-size: 11px; font-weight: bold; color: var(--vscode-symbolIcon-classForeground, #ee9d28); }
-.icon-symbol-field::before { content: 'F'; font-size: 11px; font-weight: bold; color: var(--vscode-symbolIcon-fieldForeground, #75beff); }
-.icon-folder::before { content: 'D'; font-size: 11px; font-weight: 700; color: var(--vscode-symbolIcon-folderForeground, #dcb67a); }
-.icon-file-code::before { content: 'JS'; font-size: 8px; font-weight: 700; color: var(--vscode-symbolIcon-fileForeground, #cccccc); }
-.icon-symbol-event::before { content: 'G'; font-size: 11px; font-weight: 700; color: var(--vscode-symbolIcon-eventForeground, #4ec9b0); }
+.icon.codicon { font-size: 15px; color: var(--vscode-symbolIcon-classForeground, var(--vscode-foreground)); }
 </style>
 </head>
 <body>
 <div class="search-bar">
   <div class="search-row">
-    <input id="q" type="text" placeholder="Search..." spellcheck="false" />
-    <button class="toggle" id="case" title="Match Case (Alt+C)">Aa</button>
-    <button class="toggle" id="word" title="Match Whole Word (Alt+W)"><b>ab</b>|</button>
-    <button class="toggle" id="regex" title="Use Regular Expression (Alt+R)">.*</button>
+    <label class="sr-only" for="q">Search schema and operations</label>
+    <input id="q" name="schema-search" autocomplete="off" type="text" aria-describedby="search-error" placeholder="Search schema and operations…" spellcheck="false" />
+    <button class="toggle" id="clear-search" type="button" aria-label="Clear search" title="Clear search" hidden>×</button>
+    <button class="toggle" id="case" type="button" aria-label="Match case" aria-pressed="false" title="Match case">Aa</button>
+    <button class="toggle" id="word" type="button" aria-label="Match whole word" aria-pressed="false" title="Match whole word"><b>ab</b>|</button>
+    <button class="toggle" id="regex" type="button" aria-label="Use regular expression" aria-pressed="false" title="Use regular expression">.*</button>
     <span class="sep"></span>
-    <button class="toggle" id="expand" title="Tree: Expand all (Alt+E)">▾▾</button>
-    <button class="toggle" id="sort" title="Sort: click to cycle (none → A-Z → Z-A)">↕</button>
+    <button class="toggle" id="expand" type="button" aria-label="Expand one level" title="Expand one level">▾</button>
+    <button class="toggle" id="collapse" type="button" aria-label="Collapse all" title="Collapse all">▸</button>
+    <select id="sort" aria-label="Sort results" title="Sort results"><option value="none">Source order</option><option value="asc">Name: A–Z</option><option value="desc">Name: Z–A</option></select>
   </div>
 </div>
-<div id="sections" class="sections"></div>
+<div id="search-error" class="sr-only" role="status"></div>
+<div id="status" class="tree-empty" role="status" aria-live="polite">Scanning workspace…</div>
+<div id="sections" class="sections" aria-busy="true"></div>
 
-<script>
+<script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const input = document.getElementById('q');
+const clearSearchBtn = document.getElementById('clear-search');
 const caseBtn = document.getElementById('case');
 const wordBtn = document.getElementById('word');
 const regexBtn = document.getElementById('regex');
 const expandBtn = document.getElementById('expand');
+const collapseBtn = document.getElementById('collapse');
 const sortBtn = document.getElementById('sort');
 const sectionsEl = document.getElementById('sections');
+const statusEl = document.getElementById('status');
+const searchErrorEl = document.getElementById('search-error');
+const dataControls = [input, clearSearchBtn, caseBtn, wordBtn, regexBtn, expandBtn, collapseBtn, sortBtn];
+const codiconByKind = {
+  'symbol-package': 'package',
+  'symbol-namespace': 'symbol-namespace',
+  'symbol-class': 'symbol-class',
+  'symbol-field': 'symbol-field',
+  folder: 'folder',
+  'file-code': 'file-code',
+  'symbol-event': 'symbol-event',
+};
 
-let searchState = { caseSensitive: false, wholeWord: false, useRegex: false };
-const sortCycle = ['none', 'asc', 'desc'];
-const sortLabels = { none: '↕', asc: 'A↓', desc: 'Z↓' };
-let sortIdx = 0;
-const sectionState = { backend: true, frontend: true };
-let expandMode = 'default';
+const savedUiState = typeof vscode.getState === 'function' ? vscode.getState() : undefined;
+let searchState = { caseSensitive: !!savedUiState?.caseSensitive, wholeWord: !!savedUiState?.wholeWord, useRegex: !!savedUiState?.useRegex };
+const sectionState = { backend: savedUiState?.backendOpen !== false, frontend: savedUiState?.frontendOpen !== false };
+const visibleSearchLimitBySection = { backend: 100, frontend: 100 };
+const visibleTreeLimitBySection = {
+  backend: Number.isInteger(savedUiState?.visibleTreeLimitBySection?.backend) ? Math.max(100, Math.min(savedUiState.visibleTreeLimitBySection.backend, 2000)) : 299,
+  frontend: Number.isInteger(savedUiState?.visibleTreeLimitBySection?.frontend) ? Math.max(100, Math.min(savedUiState.visibleTreeLimitBySection.frontend, 2000)) : 299,
+};
+let expandDepth = Number.isInteger(savedUiState?.expandDepth) ? Math.max(0, Math.min(savedUiState.expandDepth, 8)) : 1;
+let selectedNodeId = typeof savedUiState?.selectedNodeId === 'string' ? savedUiState.selectedNodeId.slice(0, 512) : '';
+let savedScrollTop = Number.isFinite(savedUiState?.scrollTop) ? Math.max(0, Math.min(savedUiState.scrollTop, 10000000)) : 0;
 let lastSections = [];
 let lastHasFilter = false;
 let searchTimer = 0;
+let scrollPersistTimer = 0;
 const SEARCH_DEBOUNCE_MS = 180;
+input.value = typeof savedUiState?.query === 'string' ? savedUiState.query : '';
+sortBtn.value = ['none', 'asc', 'desc'].includes(savedUiState?.sortMode) ? savedUiState.sortMode : 'none';
+
+function persistUiState() {
+  if (typeof vscode.setState !== 'function') return;
+  vscode.setState({
+    query: input.value,
+    caseSensitive: searchState.caseSensitive,
+    wholeWord: searchState.wholeWord,
+    useRegex: searchState.useRegex,
+    sortMode: sortBtn.value,
+    backendOpen: sectionState.backend,
+    frontendOpen: sectionState.frontend,
+    visibleTreeLimitBySection,
+    expandDepth,
+    selectedNodeId,
+    scrollTop: Math.round(window.scrollY),
+  });
+}
+
+function setDataControlsDisabled(disabled) {
+  dataControls.forEach((control) => { control.disabled = disabled; });
+}
 
 function emitSearchNow() {
   if (searchTimer) {
     clearTimeout(searchTimer);
     searchTimer = 0;
   }
+  visibleSearchLimitBySection.backend = 100;
+  visibleSearchLimitBySection.frontend = 100;
+  clearSearchBtn.hidden = input.value.length === 0;
+  persistUiState();
   vscode.postMessage({ type: 'search', query: input.value, ...searchState });
 }
 
@@ -1072,23 +1315,29 @@ function scheduleSearch() {
   searchTimer = setTimeout(emitSearchNow, SEARCH_DEBOUNCE_MS);
 }
 
+function clearSearch() {
+  if (!input.value) return;
+  input.value = '';
+  input.removeAttribute('aria-invalid');
+  searchErrorEl.textContent = '';
+  emitSearchNow();
+}
+
 function toggleBtn(btn, key) {
   searchState[key] = !searchState[key];
   btn.classList.toggle('active', searchState[key]);
+  btn.setAttribute('aria-pressed', String(searchState[key]));
   emitSearchNow();
 }
 
 function syncExpandButton() {
-  const expandAll = expandMode === 'expand-all';
-  expandBtn.textContent = expandAll ? '▸▸' : '▾▾';
-  expandBtn.title = expandAll ? 'Tree: Collapse all (Alt+E)' : 'Tree: Expand all (Alt+E)';
-  expandBtn.classList.toggle('active', expandAll);
+  expandBtn.textContent = '▾';
+  expandBtn.title = 'Expand one level';
+  expandBtn.setAttribute('aria-label', 'Expand one level');
 }
 
 function shouldStartOpen(depth, autoExpand) {
-  if (expandMode === 'expand-all') return true;
-  if (expandMode === 'collapse-all') return false;
-  return autoExpand || depth < 1;
+  return !autoExpand && depth < expandDepth;
 }
 
 function rerenderTree() {
@@ -1096,32 +1345,42 @@ function rerenderTree() {
 }
 
 input.addEventListener('input', scheduleSearch);
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && input.value) {
+    clearSearch();
+    e.preventDefault();
+  }
+});
+clearSearchBtn.addEventListener('click', clearSearch);
 caseBtn.addEventListener('click', () => toggleBtn(caseBtn, 'caseSensitive'));
 wordBtn.addEventListener('click', () => toggleBtn(wordBtn, 'wholeWord'));
 regexBtn.addEventListener('click', () => toggleBtn(regexBtn, 'useRegex'));
 expandBtn.addEventListener('click', () => {
-  expandMode = expandMode === 'expand-all' ? 'collapse-all' : 'expand-all';
+  expandDepth = Math.min(expandDepth + 1, 8);
+  persistUiState();
   syncExpandButton();
   rerenderTree();
 });
-
-sortBtn.addEventListener('click', () => {
-  sortIdx = (sortIdx + 1) % sortCycle.length;
-  const mode = sortCycle[sortIdx];
-  sortBtn.textContent = sortLabels[mode];
-  sortBtn.classList.toggle('active', mode !== 'none');
-  sortBtn.title = 'Sort: ' + (mode === 'none' ? 'none' : mode === 'asc' ? 'A → Z' : 'Z → A');
-  vscode.postMessage({ type: 'sort', mode: mode });
+collapseBtn.addEventListener('click', () => {
+  expandDepth = 0;
+  persistUiState();
+  rerenderTree();
 });
 
-document.addEventListener('keydown', (e) => {
-  if (e.altKey && e.key === 'c') { toggleBtn(caseBtn, 'caseSensitive'); e.preventDefault(); }
-  if (e.altKey && e.key === 'w') { toggleBtn(wordBtn, 'wholeWord'); e.preventDefault(); }
-  if (e.altKey && e.key === 'r') { toggleBtn(regexBtn, 'useRegex'); e.preventDefault(); }
-  if (e.altKey && e.key === 'e') { expandBtn.click(); e.preventDefault(); }
-  if (e.altKey && e.key === 's') { sortBtn.click(); e.preventDefault(); }
+sortBtn.addEventListener('change', () => {
+  persistUiState();
+  vscode.postMessage({ type: 'sort', mode: sortBtn.value });
+});
+[
+  [caseBtn, 'caseSensitive'],
+  [wordBtn, 'wholeWord'],
+  [regexBtn, 'useRegex'],
+].forEach(([button, key]) => {
+  button.classList.toggle('active', searchState[key]);
+  button.setAttribute('aria-pressed', String(searchState[key]));
 });
 syncExpandButton();
+clearSearchBtn.hidden = input.value.length === 0;
 
 // ── Section + tree rendering ──
 function escapeHtml(s) {
@@ -1166,7 +1425,7 @@ function highlightedHtml(value, pattern) {
     }
 
     out += escapeHtml(text.slice(lastIndex, start)) +
-      '<span class="search-match">' + escapeHtml(text.slice(start, end)) + '</span>';
+      '<mark class="search-match">' + escapeHtml(text.slice(start, end)) + '</mark>';
     lastIndex = end;
     matched = true;
   }
@@ -1175,9 +1434,14 @@ function highlightedHtml(value, pattern) {
 }
 
 function renderSections(sections, hasFilter) {
+  sectionsEl.setAttribute('aria-busy', 'false');
   sectionsEl.innerHTML = '';
   if (!sections || sections.length === 0) {
-    sectionsEl.innerHTML = '<div class="tree-empty">No items found</div>';
+    sectionsEl.innerHTML = '<div class="tree-empty"><strong>No matching schema items</strong><div>Try clearing search options or use Clear search.</div><button type="button" class="load-more" data-clear-search>Clear search</button></div>';
+    sectionsEl.querySelector('[data-clear-search]')?.addEventListener('click', () => {
+      clearSearch();
+      input.focus();
+    });
     return;
   }
   const highlightPattern = hasFilter ? buildHighlightPattern() : null;
@@ -1186,6 +1450,85 @@ function renderSections(sections, hasFilter) {
     frag.appendChild(buildSection(section, hasFilter, highlightPattern));
   }
   sectionsEl.appendChild(frag);
+  const firstItem = sectionsEl.querySelector('[role="treeitem"]');
+  const restoredSelection = selectedNodeId
+    ? Array.from(sectionsEl.querySelectorAll('[role="treeitem"]')).find((item) => item.dataset.nodeId === selectedNodeId)
+    : undefined;
+  if (restoredSelection) restoredSelection.tabIndex = 0;
+  else if (firstItem) firstItem.tabIndex = 0;
+  if (savedScrollTop > 0) {
+    window.scrollTo(0, savedScrollTop);
+    savedScrollTop = 0;
+  }
+}
+
+function countNodes(nodes, predicate) {
+  let count = 0;
+  for (const node of nodes || []) {
+    if (predicate(node)) count += 1;
+    count += countNodes(node.children, predicate);
+  }
+  return count;
+}
+
+function collectSearchResults(nodes, ancestors, results) {
+  for (const node of nodes || []) {
+    const nextAncestors = [...ancestors, node.label];
+    const hasChildren = node.children && node.children.length > 0;
+    if (!hasChildren || node.classId || node.kind === 'file' || node.kind === 'operation' || node.kind === 'field') {
+      results.push({ node, context: ancestors.join(' › ') });
+    }
+    if (hasChildren) collectSearchResults(node.children, nextAncestors, results);
+  }
+}
+
+function activateSearchResult(node, sectionId) {
+  if (sectionId === 'frontend' && node.file) {
+    vscode.postMessage({ type: 'open', file: node.file, line: node.line });
+  } else if (node.classId) {
+    vscode.postMessage({ type: 'preview', classId: node.classId });
+  } else if (node.file) {
+    vscode.postMessage({ type: 'open', file: node.file, line: node.line });
+  }
+}
+
+function buildSearchResults(section, highlightPattern) {
+  const all = [];
+  collectSearchResults(section.children, [], all);
+  const limit = visibleSearchLimitBySection[section.id] || 100;
+  const list = document.createElement('div');
+  list.className = 'search-results';
+  list.setAttribute('role', 'list');
+  list.setAttribute('aria-label', section.label + ' search results');
+  for (const result of all.slice(0, limit)) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'search-result';
+    row.innerHTML =
+      '<span class="icon codicon codicon-' + (codiconByKind[result.node.icon] || 'circle-large-outline') + '" aria-hidden="true"></span>' +
+      '<span class="result-main">' + highlightedHtml(result.node.label, highlightPattern) + '</span>' +
+      (result.context ? '<span class="result-context">' + escapeHtml(result.context) + '</span>' : '');
+    row.addEventListener('click', () => activateSearchResult(result.node, section.id));
+    list.appendChild(row);
+  }
+  if (all.length > limit) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'load-more result-more';
+    more.textContent = 'Show 100 more (' + (all.length - limit) + ' remaining)';
+    more.addEventListener('click', () => {
+      visibleSearchLimitBySection[section.id] = limit + 100;
+      renderSections(lastSections, true);
+      sectionsEl.querySelector('.result-more')?.focus();
+    });
+    list.appendChild(more);
+  }
+  if (all.length === 0) list.innerHTML = '<div class="section-empty"><strong>No matching schema items</strong><div>Try clearing search options or use Clear search.</div><button type="button" class="load-more" data-clear-search>Clear search</button></div>';
+  list.querySelector('[data-clear-search]')?.addEventListener('click', () => {
+    clearSearch();
+    input.focus();
+  });
+  return list;
 }
 
 function buildSection(section, hasFilter, highlightPattern) {
@@ -1194,7 +1537,7 @@ function buildSection(section, hasFilter, highlightPattern) {
   const remembered = Object.prototype.hasOwnProperty.call(sectionState, section.id)
     ? sectionState[section.id]
     : !!section.openByDefault;
-  details.open = hasFilter ? true : remembered;
+  details.open = remembered;
   details.dataset.sectionId = section.id;
 
   const summary = document.createElement('summary');
@@ -1210,18 +1553,37 @@ function buildSection(section, hasFilter, highlightPattern) {
   body.className = 'section-body';
   if (!section.children || section.children.length === 0) {
     body.innerHTML = '<div class="section-empty">' + escapeHtml(section.emptyMessage || 'No items found') + '</div>';
+  } else if (hasFilter) {
+    body.appendChild(buildSearchResults(section, highlightPattern));
   } else {
     const tree = document.createElement('div');
     tree.className = 'tree';
-    for (const node of section.children) {
+    tree.setAttribute('role', 'tree');
+    tree.setAttribute('aria-label', section.label + ' schema items');
+    const treeLimit = visibleTreeLimitBySection[section.id] || 299;
+    for (const node of section.children.slice(0, treeLimit)) {
       tree.appendChild(buildNode(node, 0, hasFilter, section.id, highlightPattern));
     }
     body.appendChild(tree);
+    if (section.children.length > treeLimit) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'load-more result-more';
+      more.textContent = 'Show 100 more (' + (section.children.length - treeLimit) + ' remaining)';
+      more.addEventListener('click', () => {
+        visibleTreeLimitBySection[section.id] = treeLimit + 100;
+        persistUiState();
+        renderSections(lastSections, false);
+        sectionsEl.querySelector('.result-more')?.focus();
+      });
+      body.appendChild(more);
+    }
   }
   details.appendChild(body);
 
   details.addEventListener('toggle', () => {
     sectionState[section.id] = details.open;
+    persistUiState();
   });
 
   return details;
@@ -1234,6 +1596,10 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
   // Row
   const row = document.createElement('div');
   row.className = 'node';
+  row.setAttribute('role', 'treeitem');
+  row.setAttribute('aria-level', String(depth + 1));
+  row.tabIndex = -1;
+  row.dataset.nodeId = node.classId || (node.file ? node.file + ':' + (node.line || 0) : sectionId + ':' + node.kind + ':' + node.label + ':' + depth);
 
   const indent = document.createElement('span');
   indent.className = 'indent';
@@ -1246,7 +1612,8 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
   row.appendChild(twistie);
 
   const icon = document.createElement('span');
-  icon.className = 'icon icon-' + node.icon;
+  icon.className = 'icon codicon codicon-' + (codiconByKind[node.icon] || 'circle-large-outline');
+  icon.setAttribute('aria-hidden', 'true');
   row.appendChild(icon);
 
   const label = document.createElement('span');
@@ -1278,12 +1645,15 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
     }
 
     wrapper.appendChild(childrenEl);
+    childrenEl.setAttribute('role', 'group');
+    row.setAttribute('aria-expanded', childrenEl.classList.contains('open') ? 'true' : 'false');
   }
 
   function toggleChildren() {
     if (!hasChildren || !childrenEl) return;
     const isOpen = childrenEl.classList.toggle('open');
     twistie.textContent = isOpen ? '▾' : '▸';
+    row.setAttribute('aria-expanded', String(isOpen));
     if (isOpen && childrenEl.children.length === 0) {
       for (const child of node.children) {
         childrenEl.appendChild(buildNode(child, depth + 1, false, sectionId, highlightPattern));
@@ -1291,14 +1661,7 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
     }
   }
 
-  if (hasChildren) {
-    twistie.addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleChildren();
-    });
-  }
-
-  row.addEventListener('click', () => {
+  function activate() {
     if (sectionId === 'frontend' && node.file && (node.kind === 'file' || node.kind === 'operation')) {
       vscode.postMessage({ type: 'open', file: node.file, line: node.line });
       return;
@@ -1309,6 +1672,32 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
     if (hasChildren && (sectionId !== 'frontend' || node.kind === 'folder')) {
       toggleChildren();
     }
+  }
+
+  row.addEventListener('click', activate);
+  row.addEventListener('focus', () => {
+    const tree = row.closest('[role="tree"]');
+    if (!tree) return;
+    tree.querySelectorAll('[role="treeitem"]').forEach((item) => { item.tabIndex = -1; item.classList.remove('selected'); });
+    row.tabIndex = 0;
+    row.classList.add('selected');
+    selectedNodeId = row.dataset.nodeId || '';
+    persistUiState();
+  });
+  row.addEventListener('keydown', (e) => {
+    const tree = row.closest('[role="tree"]');
+    const visible = tree ? Array.from(tree.querySelectorAll('[role="treeitem"]')).filter((item) => item.offsetParent !== null) : [];
+    const index = visible.indexOf(row);
+    const move = (next) => { if (next) next.focus(); };
+    if (e.key === 'ArrowDown') { move(visible[index + 1]); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { move(visible[index - 1]); e.preventDefault(); }
+    else if (e.key === 'Home') { move(visible[0]); e.preventDefault(); }
+    else if (e.key === 'End') { move(visible[visible.length - 1]); e.preventDefault(); }
+    else if (e.key === 'ArrowRight' && hasChildren) { if (!childrenEl.classList.contains('open')) toggleChildren(); else move(childrenEl.querySelector('[role="treeitem"]')); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft' && hasChildren && childrenEl.classList.contains('open')) { toggleChildren(); e.preventDefault(); }
+    else if (e.key === ' ' && hasChildren) { toggleChildren(); e.preventDefault(); }
+    else if (e.key === 'Enter') { activate(); e.preventDefault(); }
+    else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && node.file) { vscode.postMessage({ type: 'open', file: node.file, line: node.line }); e.preventDefault(); }
   });
   row.addEventListener('dblclick', (e) => {
     e.stopPropagation();
@@ -1323,12 +1712,60 @@ function buildNode(node, depth, autoExpand, sectionId, highlightPattern) {
 // ── Messages from extension ──
 window.addEventListener('message', (e) => {
   const msg = e.data;
+  if (msg.type === 'status' && msg.status) {
+    const nextStatus = msg.status;
+    statusEl.hidden = false;
+    statusEl.textContent = nextStatus.message || '';
+    const busy = nextStatus.kind === 'loading';
+    sectionsEl.setAttribute('aria-busy', String(busy));
+    setDataControlsDisabled(busy && !nextStatus.hasStaleData);
+    if (nextStatus.kind === 'error') statusEl.setAttribute('role', 'alert');
+    else statusEl.setAttribute('role', 'status');
+    if (nextStatus.kind === 'error' && nextStatus.retryable) {
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'load-more';
+      retry.textContent = 'Try Again';
+      retry.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
+      statusEl.appendChild(document.createTextNode(' '));
+      statusEl.appendChild(retry);
+    }
+    return;
+  }
   if (msg.type === 'tree') {
     lastSections = msg.sections;
     lastHasFilter = msg.hasFilter;
+    if (msg.filterError) {
+      input.setAttribute('aria-invalid', 'true');
+      searchErrorEl.textContent = msg.filterError;
+      statusEl.hidden = false;
+      statusEl.textContent = msg.filterError;
+      sectionsEl.setAttribute('aria-busy', 'false');
+      return;
+    }
+    input.removeAttribute('aria-invalid');
+    searchErrorEl.textContent = '';
     renderSections(msg.sections, msg.hasFilter);
+    setDataControlsDisabled(false);
+    const backend = msg.sections.find((section) => section.id === 'backend');
+    const frontend = msg.sections.find((section) => section.id === 'frontend');
+    const typeCount = countNodes(backend?.children, (node) => !!node.classId);
+    const fileCount = countNodes(frontend?.children, (node) => node.kind === 'file');
+    if (!statusEl.textContent || statusEl.textContent === 'Scanning workspace…') {
+      statusEl.hidden = false;
+      statusEl.textContent = Number(typeCount).toLocaleString() + ' types · ' + Number(fileCount).toLocaleString() + ' GraphQL files';
+    }
   }
 });
+window.addEventListener('scroll', () => {
+  if (scrollPersistTimer) return;
+  scrollPersistTimer = setTimeout(() => {
+    scrollPersistTimer = 0;
+    persistUiState();
+  }, 150);
+}, { passive: true });
+setDataControlsDisabled(true);
+vscode.postMessage({ type: 'ready', surface: 'explorer' });
 </script>
 </body>
 </html>`;

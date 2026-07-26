@@ -16,6 +16,7 @@ import { scanFrontendGqlUsages, scanWorkspaceFragments } from './analysis/fronte
 import { renderQueryStructureHtml, renderSubtreeNodesHtml } from './preview/queryStructureWebview';
 import { hydrateGqlField, GqlFieldLite } from './codelens/gqlCodeLensProvider';
 import { LiveQueryInspector } from './preview/liveQueryInspector';
+import { isLazyExpandMessage } from './webview/protocol';
 
 const GQL_LANGUAGES = new Set([
   'typescript', 'typescriptreact', 'javascript', 'javascriptreact',
@@ -26,7 +27,7 @@ export function activate(context: vscode.ExtensionContext) {
   const parseCache = new ParseCache(context.globalState);
   parseCache.load();
 
-  const viewProvider = new GraphqlViewProvider();
+  const viewProvider = new GraphqlViewProvider(context.extensionUri);
   const codeLensProvider = new GqlCodeLensProvider();
   const inlayHintsProvider = new GqlInlayHintsProvider(() => codeLensProvider.getSharedState());
   const diagnosticsManager = new GqlDiagnosticsManager(() => codeLensProvider.getSharedState());
@@ -84,7 +85,7 @@ export function activate(context: vscode.ExtensionContext) {
       const structure = buildQueryStructure(gf, cls, classMap, undefined, rootFieldInfo);
       const panel = vscode.window.createWebviewPanel(
         'queryStructure',
-        `${gf.name} — ${typeName}`,
+        `Query Coverage — ${gf.name} — ${typeName}`,
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
         { enableScripts: true, retainContextWhenHidden: true },
       );
@@ -98,13 +99,14 @@ export function activate(context: vscode.ExtensionContext) {
       // (depth cap or cycle guard). We resolve against the CURRENT classMap
       // so the panel reflects any refreshes since it was opened.
       panel.webview.onDidReceiveMessage((msg) => {
-        if (!msg || msg.type !== 'expandType') return;
+        if (!isLazyExpandMessage(msg)) return;
         const { classMap: currentClassMap } = codeLensProvider.getSharedState();
         const target = currentClassMap.get(msg.typeName);
         if (!target) {
           panel.webview.postMessage({
             type: 'subtree',
             nodeId: msg.nodeId,
+            requestId: msg.requestId,
             error: `Class '${msg.typeName}' is not in the current schema index.`,
           });
           return;
@@ -112,7 +114,7 @@ export function activate(context: vscode.ExtensionContext) {
         const ancestry: string[] = Array.isArray(msg.ancestry) ? msg.ancestry : [];
         const nodes = buildLazySubtree(target, currentClassMap, ancestry, 2);
         const html = renderSubtreeNodesHtml(nodes, [...ancestry, msg.typeName]);
-        panel.webview.postMessage({ type: 'subtree', nodeId: msg.nodeId, html });
+        panel.webview.postMessage({ type: 'subtree', nodeId: msg.nodeId, requestId: msg.requestId, html });
       });
     },
   );
@@ -126,8 +128,17 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     refreshing = true;
+    viewProvider.setExplorerStatus({
+      kind: 'loading',
+      message: viewProvider.hasSchemas() ? 'Refreshing schema…' : 'Scanning workspace…',
+      hasStaleData: viewProvider.hasSchemas(),
+    });
     try {
       await doRefresh();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      log(`[refresh] failed: ${detail}`);
+      viewProvider.setExplorerStatus({ kind: 'error', message: 'Could not refresh the schema. Try again from the Explorer title bar.', retryable: true });
     } finally {
       refreshing = false;
       if (pendingRefresh) {
@@ -265,7 +276,7 @@ export function activate(context: vscode.ExtensionContext) {
           classId: c.classId,
           className: c.name,
         })),
-        { title: 'Inspect GraphQL type', matchOnDescription: true, matchOnDetail: true, placeHolder: 'Type a class name…' },
+        { title: 'Inspect GraphQL type', matchOnDescription: true, matchOnDetail: true, placeHolder: 'Inspect GraphQL type' },
       );
       if (picked) viewProvider.showInspectorForClass(picked.classId ?? picked.className);
     },
