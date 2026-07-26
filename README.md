@@ -77,7 +77,7 @@ Open a **side-by-side** panel that auto-follows the cursor inside any `gql`/`gra
 - A JSON-tree view of the entire selection with missing-field markers and frontend-only markers
 - Lazy **▸ expand** markers on any subtree truncated by the depth cap or cycle guard — click to load another two levels on demand, same as a debugger inspecting a variable
 
-Open via **Django GraphQL: Open Live Query Structure** (Command Palette) or the icon in the Schema Explorer title bar.
+Open via **Django GraphQL: Open Live Query Inspector** (Command Palette) or the icon in the Schema Explorer title bar.
 
 ### Typed Graphene Patterns
 
@@ -122,6 +122,14 @@ class ItemListQuery:
 - Incremental: only changed files re-parsed
 - Cache persists across VS Code sessions
 
+## Explorer controls and keyboard navigation
+
+The Schema Explorer search supports case-sensitive, whole-word, and regular-expression matching, plus source-order or name sorting. Invalid regular expressions keep the last valid result set visible and explain the error inline. Use **Clear search** or `Escape` while the search field has text to reset it.
+
+In hierarchy mode, the tree supports `Up`/`Down`, `Home`/`End`, `Left`/`Right`, `Space`, and `Enter`. Use `Ctrl+Enter` (or `Cmd+Enter`) to open a selected item’s source. Search results are mounted in groups of 100; use **Show 100 more** when needed.
+
+Type Inspector field lists also mount in 100-row increments. Its SDL section includes **Copy SDL** and a persisted **Wrap code** option.
+
 ## Requirements
 
 - VS Code 1.75.0+
@@ -132,7 +140,7 @@ class ItemListQuery:
 | Command | Description |
 |---------|-------------|
 | **Django GraphQL: Refresh Schema** | Re-scans all project files. |
-| **Django GraphQL: Open Live Query Structure** | Opens the side-by-side live inspector that follows the cursor. |
+| **Django GraphQL: Open Live Query Inspector** | Opens the side-by-side live inspector that follows the cursor. |
 | **Django GraphQL: Inspect Type…** | Quick-pick any class to view its SDL preview. |
 | **Django GraphQL: Clear Parse Cache** | Drops the persisted parse cache and re-scans from scratch. Useful after an extension upgrade or when a stale result looks suspicious. |
 
@@ -140,7 +148,7 @@ class ItemListQuery:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `djangoGraphqlExplorer.inlayHints` | `false` | Show inline `→ TypeName` chips after every gql field. Disabled by default in favor of the Live Query Graph (Beside panel). |
+| `djangoGraphqlExplorer.inlayHints` | `false` | Show inline `→ TypeName` chips after every gql field. Disabled by default in favor of the Live Query Inspector (Beside panel). |
 
 No further configuration required. The extension auto-detects projects on activation.
 

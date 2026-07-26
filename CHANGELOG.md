@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Interface
+- Refined the Schema Explorer into a more keyboard-accessible, responsive instrument panel: labeled search controls, explicit clear/collapse actions, invalid-regex feedback, flat paged search results, Codicons, and semantic tree navigation.
+- Improved Type Inspector navigation and scale handling with source buttons, field filters, progressive 100-row mounting, base-class disclosure, and SDL copy/wrap controls.
+- Renamed and aligned query-facing UI around **Query Coverage** and **Live Query Inspector**; lazy query expansion now reports failures and supports retry without replacing the whole view.
+- Hardened Webview loading/ready handshakes, CSPs, packaged icon assets, stale-result behavior, and asynchronous lazy-response ordering.
+
 ## 0.0.2 — 2026-04-18
 
 ### Highlights
