@@ -138,16 +138,34 @@ describe('GraphqlViewProvider tree sections', () => {
     expect(userField.children).toBeUndefined();
   });
 
-  it('renders expand-all control and horizontal scrolling in the webview shell', () => {
+  it('renders accessible search controls, bounded expansion, and a semantic tree shell', () => {
     const provider = new GraphqlViewProvider();
     const html = (provider as any).getHtml();
 
     expect(html).toContain('id="expand"');
-    expect(html).toContain('overflow-x: auto;');
+    expect(html).toContain('Expand one level');
+    expect(html).toContain('<label class="sr-only" for="q">Search schema and operations</label>');
+    expect(html).toContain('role="tree"');
+    expect(html).toContain('aria-pressed');
+    expect(html).toContain('id="sort"');
     expect(html).toContain('SEARCH_DEBOUNCE_MS');
     expect(html).toContain('search-match');
     expect(html).toContain('highlightedHtml(node.label');
     expect(html).toContain("node.kind === 'file' || node.kind === 'operation'");
+    expect(html).not.toContain('Tree: Expand all');
+    expect(html).not.toContain("document.addEventListener('keydown'");
+  });
+
+  it('keeps the last valid filter when a regular expression is invalid', () => {
+    const provider = new GraphqlViewProvider();
+    provider.updateSchemas([schema({ types: [cls('UserType', [f('id')])] })]);
+    (provider as any).applyFilter({ query: 'User', caseSensitive: false, wholeWord: false, useRegex: false });
+    const previous = (provider as any).searchFilter;
+
+    (provider as any).applyFilter({ query: '(', caseSensitive: false, wholeWord: false, useRegex: true });
+
+    expect((provider as any).searchFilter).toBe(previous);
+    expect((provider as any).searchError).toContain('Invalid regular expression');
   });
 
   it('keeps resolved backend path expansions schema-local when duplicate type names exist', () => {

@@ -33,6 +33,7 @@ function showInspector(provider: GraphqlViewProvider, className: string): void {
   // showPreview is private; call through the resolveWebviewView message handler
   // by invoking the prototype method with `any`.
   (provider as unknown as { showPreview: (n: string) => void }).showPreview(className);
+  (__getLastPanel() as FakeWebviewPanel).simulateMessage({ type: 'ready', surface: 'inspector' });
 }
 
 beforeEach(() => __clearPanels());
@@ -122,6 +123,7 @@ describe('GraphqlViewProvider inspector panel (phase p)', () => {
 
     provider.showInspectorForClass(schemaAUser!.classId);
     const panel = __getLastPanel() as FakeWebviewPanel;
+    panel.simulateMessage({ type: 'ready', surface: 'inspector' });
     const msgs = panel.webview.postedMessages as Array<{ type: string; data: any }>;
     expect(msgs[0].data.filePath).toBe('/proj/a/types.py');
     expect(msgs[0].data.fields.map((row: any) => row.name)).toEqual(['id']);

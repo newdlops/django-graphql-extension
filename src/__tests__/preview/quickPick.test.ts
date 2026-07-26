@@ -54,6 +54,7 @@ describe('showInspectorForClass (phase s)', () => {
 
     provider.showInspectorForClass('UserType');
     const panel = __getLastPanel() as FakeWebviewPanel;
+    panel.simulateMessage({ type: 'ready', surface: 'inspector' });
     expect(panel).toBeDefined();
     expect(panel.title).toBe('UserType');
 
@@ -81,6 +82,7 @@ describe('showInspectorForClass (phase s)', () => {
 
     provider.showInspectorForClass('UserType');
     const firstPanel = __getLastPanel() as FakeWebviewPanel;
+    firstPanel.simulateMessage({ type: 'ready', surface: 'inspector' });
     provider.showInspectorForClass('CompanyType');
     const secondPanel = __getLastPanel() as FakeWebviewPanel;
 
