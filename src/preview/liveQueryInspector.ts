@@ -5,6 +5,7 @@ import { resolveTemplateAtCursor, TemplateContext } from '../codelens/gqlCursorR
 import { buildQueryStructure, buildPartialStructureFromGql, buildLazySubtree, QueryStructure } from '../analysis/queryStructure';
 import { renderTemplateStructuresHtml, renderJsonSubtreeHtml, QUERY_STRUCTURE_JSON_STYLES } from './queryStructureJson';
 import { FragmentDef } from '../codelens/gqlCodeLensProvider';
+import { isLazyExpandMessage } from '../webview/protocol';
 
 interface StateSource {
   (): {
@@ -27,6 +28,9 @@ export class LiveQueryInspector {
   private timer: NodeJS.Timeout | undefined;
   private lastContextKey: string | undefined;
   private lastResolutionContextId: string | undefined;
+  private panelReady = false;
+  private pendingMessage: unknown | undefined;
+  private hasRenderedResult = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -38,22 +42,32 @@ export class LiveQueryInspector {
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
         'djangoGraphqlLiveInspector',
-        'GraphQL Query Graph',
+        'Live Query Inspector',
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
         { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [this.extensionUri] },
       );
+      this.panelReady = false;
       this.panel.webview.html = this.shellHtml();
       this.panel.onDidDispose(() => {
         this.panel = undefined;
+        this.panelReady = false;
+        this.pendingMessage = undefined;
         this.lastContextKey = undefined;
         this.lastResolutionContextId = undefined;
+        this.hasRenderedResult = false;
       });
       // Lazy expansion: the webview asks for a class's fields when the user
       // clicks the ▸ marker on a truncated subtree. We resolve against the
       // LIVE classMap so the response reflects any refreshes that happened
       // since the panel was opened.
       this.panel.webview.onDidReceiveMessage((msg) => {
-        if (!msg || msg.type !== 'expandType') return;
+        if (!msg || typeof msg !== 'object' || typeof (msg as { type?: unknown }).type !== 'string') return;
+        if (msg.type === 'ready' && msg.surface === 'live-query-inspector') {
+          this.panelReady = true;
+          if (this.pendingMessage) this.panel?.webview.postMessage(this.pendingMessage);
+          return;
+        }
+        if (!isLazyExpandMessage(msg)) return;
         const state = this.readState();
         const classMap = state.resolutionContexts?.find(
           (ctx) => ctx.id === this.lastResolutionContextId,
@@ -63,6 +77,7 @@ export class LiveQueryInspector {
           this.postMessage({
             type: 'jsonSubtree',
             nodeId: msg.nodeId,
+            requestId: msg.requestId,
             error: `Class '${msg.typeName}' is not in the current schema index.`,
           });
           return;
@@ -75,7 +90,7 @@ export class LiveQueryInspector {
         const parentDepth = typeof msg.depth === 'number' ? msg.depth : 0;
         const nodes = buildLazySubtree(target, classMap, ancestry, 2);
         const html = renderJsonSubtreeHtml(nodes, [...ancestry, msg.typeName], parentDepth + 1);
-        this.postMessage({ type: 'jsonSubtree', nodeId: msg.nodeId, html });
+        this.postMessage({ type: 'jsonSubtree', nodeId: msg.nodeId, requestId: msg.requestId, html });
       });
     } else {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
@@ -113,7 +128,9 @@ export class LiveQueryInspector {
       documentPath: doc.fileName,
     });
     if (!tpl) {
-      this.postMessage({ type: 'empty', reason: 'Cursor is not inside a gql template.' });
+      this.postMessage(this.hasRenderedResult
+        ? { type: 'stale', reason: 'Cursor is outside a GraphQL operation.' }
+        : { type: 'empty', reason: 'Place the cursor inside a GraphQL operation to inspect its query structure.' });
       this.lastContextKey = undefined;
       this.lastResolutionContextId = undefined;
       return;
@@ -174,9 +191,11 @@ export class LiveQueryInspector {
 
     const titleBits: string[] = [tpl.operationKind];
     if (tpl.operationName) titleBits.push(tpl.operationName);
-    this.panel.title = `Query Structure — ${titleBits.join(' ')}`;
+    this.panel.title = `Live Query Inspector — ${titleBits.join(' ')}`;
+    this.hasRenderedResult = true;
     this.postMessage({
       type: 'render',
+      contextKey: key,
       body,
       summary: {
         operationKind: tpl.operationKind,
@@ -188,29 +207,46 @@ export class LiveQueryInspector {
     });
   }
 
-  private postMessage(msg: unknown): void {
-    this.panel?.webview.postMessage(msg);
-  }
+ private postMessage(msg: unknown): void {
+    this.pendingMessage = msg;
+    if (this.panelReady) this.panel?.webview.postMessage(msg);
+ }
 
   private shellHtml(): string {
+    const nonce = Array.from({ length: 24 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
     // No external libraries — just a postMessage-driven DOM update. The body
     // HTML comes from renderQueryStructureJsonHtml on every cursor move.
     return /*html*/ `<!DOCTYPE html>
-<html><head>
-<style>${QUERY_STRUCTURE_JSON_STYLES}</style>
+<html lang="en"><head><meta charset="UTF-8"><title>Live Query Inspector</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+<style nonce="${nonce}">${QUERY_STRUCTURE_JSON_STYLES}</style>
 </head><body>
 <div id="header" class="header">
-  <div class="title">Live Query Structure</div>
-  <div class="subtitle">Move the cursor into a gql template to inspect the field under it.</div>
+  <div class="title">Live Query Inspector</div>
+  <div class="subtitle">Place the cursor inside a GraphQL operation to inspect its query structure.</div>
 </div>
+<div id="status" class="sr-only" role="status" aria-live="polite"></div>
+<div class="live-tools"><button id="wrap-code" type="button" aria-pressed="false">Wrap code</button></div>
 <div id="content">
-  <div class="empty">No gql field under cursor yet.</div>
+  <div class="empty" role="status">No GraphQL operation under cursor yet.</div>
 </div>
-<div class="legend">Green ✓ = queried · Red ✗ = available on the backend but missing from your gql · Unresolved gql fields are highlighted in the source editor · Gray italic = type not in the indexed schema · Click <code>▾</code>/<code>▸</code> to collapse or expand · Blue <code>▸</code> loads deeper fields on first open.</div>
-<script>
+<details class="legend"><summary>Status key</summary><p>✓ Queried · ✗ Missing from this query · + Frontend-only · ◇ Fragment-sourced. Gray italic means the type is not in the indexed schema. Open a lazy disclosure to load deeper fields.</p></details>
+<script nonce="${nonce}">
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
   const header = document.getElementById('header');
   const content = document.getElementById('content');
+  const status = document.getElementById('status');
+  const wrapCodeButton = document.getElementById('wrap-code');
+  const savedState = typeof vscode.getState === 'function' ? vscode.getState() : undefined;
+  let wrapCode = !!savedState?.wrapCode;
+  let currentContextKey = '';
+
+  function syncWrapCode() {
+    content.classList.toggle('wrap-code', wrapCode);
+    wrapCodeButton.setAttribute('aria-pressed', String(wrapCode));
+    if (typeof vscode.setState === 'function') vscode.setState({ wrapCode });
+  }
+  wrapCodeButton.addEventListener('click', () => { wrapCode = !wrapCode; syncWrapCode(); });
+  syncWrapCode();
 
   function escapeHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -226,10 +262,14 @@ export class LiveQueryInspector {
     if (!el.classList.contains('block-lazy') || !el.open) return;
     if (el.dataset.loaded === '1' || el.dataset.loading === '1') return;
     el.dataset.loading = '1';
+    el.setAttribute('aria-busy', 'true');
+    const requestId = 'live-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    el.dataset.requestId = requestId;
     const slot = el.querySelector(':scope > .lazy-content');
     if (slot) slot.innerHTML = '<span class="line muted">  loading…</span>';
     vscode.postMessage({
       type: 'expandType',
+      requestId,
       nodeId: el.dataset.nodeId,
       typeName: el.dataset.lazyType,
       ancestry: (el.dataset.ancestry || '').split(',').filter(Boolean),
@@ -237,13 +277,33 @@ export class LiveQueryInspector {
     });
   }, true);
 
+  content.addEventListener('click', (e) => {
+    const retry = e.target instanceof Element ? e.target.closest('[data-retry-lazy]') : null;
+    if (!retry) return;
+    const block = retry.closest('.block-lazy');
+    if (!block) return;
+    block.dataset.loaded = '0';
+    block.dataset.loading = '0';
+    block.open = false;
+    block.open = true;
+  });
+
   window.addEventListener('message', (ev) => {
     const msg = ev.data;
     if (msg.type === 'empty') {
       header.innerHTML =
-        '<div class="title">Live Query Structure</div>' +
+        '<div class="title">Live Query Inspector</div>' +
         '<div class="subtitle">' + escapeHtml(msg.reason || 'Nothing to show.') + '</div>';
       content.innerHTML = '<div class="empty">' + escapeHtml(msg.reason || '') + '</div>';
+      status.textContent = msg.reason || 'Nothing to show.';
+      currentContextKey = '';
+      return;
+    }
+    if (msg.type === 'stale') {
+      header.innerHTML =
+        '<div class="title">Live Query Inspector</div>' +
+        '<div class="subtitle" role="status">' + escapeHtml(msg.reason || 'Showing the last query structure.') + '</div>';
+      status.textContent = msg.reason || 'Showing the last query structure.';
       return;
     }
     if (msg.type === 'jsonSubtree') {
@@ -251,16 +311,26 @@ export class LiveQueryInspector {
       if (!el) return;
       const slot = el.querySelector(':scope > .lazy-content');
       if (!slot) return;
+      if (msg.requestId && el.dataset.requestId !== msg.requestId) return;
       if (msg.error) {
-        slot.innerHTML = '<span class="line lazy-error">  ' + escapeHtml(msg.error) + '</span>';
+        slot.innerHTML = '<span class="line lazy-error">  ' + escapeHtml(msg.error) + ' <button type="button" data-retry-lazy>Retry</button></span>';
+        el.dataset.loading = '0';
+        el.dataset.loaded = '0';
+        delete el.dataset.requestId;
       } else {
         slot.innerHTML = msg.html || '';
+        delete el.dataset.requestId;
       }
+      el.removeAttribute('aria-busy');
       el.dataset.loaded = '1';
       el.dataset.loading = '0';
       return;
     }
     if (msg.type !== 'render') return;
+    const openStates = msg.contextKey === currentContextKey
+      ? Array.from(content.querySelectorAll('details')).map((detail) => detail.open)
+      : [];
+    content.setAttribute('aria-busy', 'true');
     const s = msg.summary;
     const opLabel = s.operationKind + (s.operationName ? ' ' + s.operationName : '');
     const resolvedLabel = s.resolvedCount + ' / ' + s.rootCount + ' root field' + (s.rootCount === 1 ? '' : 's') + ' resolved';
@@ -268,7 +338,16 @@ export class LiveQueryInspector {
       '<div class="title">' + escapeHtml(opLabel) + '</div>' +
       '<div class="subtitle">' + escapeHtml(resolvedLabel) + (s.unresolvedCount > 0 ? ' · ' + s.unresolvedCount + ' unresolved' : '') + '</div>';
     content.innerHTML = msg.body;
+    if (openStates.length > 0) {
+      content.querySelectorAll('details').forEach((detail, index) => {
+        if (index < openStates.length) detail.open = openStates[index];
+      });
+    }
+    currentContextKey = msg.contextKey || '';
+    content.setAttribute('aria-busy', 'false');
+    status.textContent = 'Updated ' + opLabel + '.';
   });
+  vscode.postMessage({ type: 'ready', surface: 'live-query-inspector' });
 </script>
 </body></html>`;
   }

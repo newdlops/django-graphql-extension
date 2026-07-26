@@ -328,31 +328,46 @@ function escape(s: string): string {
  * shell HTML can embed them directly without any build-step magic.
  */
 export const QUERY_STRUCTURE_JSON_STYLES = `
+:root {
+  --query-queried: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #4caf50));
+  --query-missing: var(--vscode-testing-iconFailed, var(--vscode-errorForeground, #f44747));
+  --query-frontend: var(--vscode-textLink-foreground, #3794ff);
+  --query-fragment: var(--vscode-charts-purple, var(--vscode-textLink-foreground, #c678dd));
+  --query-queried-bg: var(--vscode-editorWidget-background, rgba(76, 175, 80, 0.18));
+  --query-missing-bg: var(--vscode-editorWidget-background, rgba(244, 67, 54, 0.18));
+  --query-frontend-bg: var(--vscode-editorWidget-background, rgba(55, 148, 255, 0.18));
+  --query-fragment-bg: var(--vscode-editorWidget-background, rgba(198, 120, 221, 0.18));
+}
 body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menlo, monospace); font-size: var(--vscode-editor-font-size, 13px); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .header { padding: 10px 14px; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 5; }
 .header .title { font-weight: 600; font-size: 1.05em; }
 .header .subtitle { margin-top: 3px; color: var(--vscode-descriptionForeground); font-size: 0.85em; }
-.summary { padding: 8px 14px 4px; border-bottom: 1px dashed rgba(128,128,128,0.15); }
-.pill { display: inline-block; padding: 1px 8px; margin-right: 6px; border-radius: 10px; font-size: 0.85em; }
-.pill-q { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
-.pill-m { background: rgba(244, 67, 54, 0.18); color: #f44747; }
-.pill-f { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
-.pill-frag { background: rgba(198, 120, 221, 0.18); color: #c678dd; }
+.live-tools { padding: 6px 14px; border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); }
+.live-tools button { border: 1px solid var(--vscode-button-secondaryBackground); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); padding: 3px 7px; cursor: pointer; }
+.live-tools button[aria-pressed="true"] { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.live-tools button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.summary { padding: 8px 14px 4px; border-bottom: 1px dashed rgba(128,128,128,0.15); overflow-wrap: anywhere; }
+.pill { display: inline-block; padding: 1px 8px; margin-right: 6px; border-radius: 10px; font-size: 0.85em; white-space: normal; }
+.pill-q { background: var(--query-queried-bg); color: var(--query-queried); }
+.pill-m { background: var(--query-missing-bg); color: var(--query-missing); }
+.pill-f { background: var(--query-frontend-bg); color: var(--query-frontend); }
+.pill-frag { background: var(--query-fragment-bg); color: var(--query-fragment); }
 .muted { color: var(--vscode-descriptionForeground); }
 
 /* Fragment-sourced rows get their own hue + a small "which fragment?"
    badge so the user can tell at a glance what came via a spread versus
    what they wrote directly in the gql body. Matches the webview panel. */
-.mark-frag { color: #c678dd; }
-.key-fragment { color: #c678dd; }
+.mark-frag { color: var(--query-fragment); }
+.key-fragment { color: var(--query-fragment); }
 .line-frag { }
 .frag-badge {
   display: inline-block;
   margin-left: 6px;
   padding: 0 6px;
   border-radius: 8px;
-  background: rgba(198, 120, 221, 0.18);
-  color: #c678dd;
+  background: var(--query-fragment-bg);
+  color: var(--query-fragment);
   font-size: 0.75em;
   font-weight: 500;
   vertical-align: middle;
@@ -360,6 +375,7 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 }
 
 .json-tree { margin: 0; padding: 12px 18px 22px; white-space: pre; line-height: 1.55; overflow: auto; }
+.wrap-code .json-tree, .wrap-code .op-variables-body { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
 .line { display: block; white-space: pre; }
 .line-q { }
 .line-m { opacity: 0.95; }
@@ -371,25 +387,25 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
   font-weight: bold; font-size: 1.15em; line-height: 1;
   vertical-align: middle;
 }
-.mark-q { color: #4caf50; }
-.mark-m { color: #f44747; }
-.mark-f { color: #3794ff; }
+.mark-q { color: var(--query-queried); }
+.mark-m { color: var(--query-missing); }
+.mark-f { color: var(--query-frontend); }
 
 .key { font-weight: 500; }
 .key-root { color: var(--vscode-symbolIcon-classForeground, #ee9d28); }
 .key-queried { color: var(--vscode-symbolIcon-propertyForeground, #75beff); }
-.key-missing { color: #f44747; text-decoration: underline dotted rgba(244, 67, 54, 0.5); }
-.key-frontend-only { color: #3794ff; text-decoration: underline dotted rgba(55, 148, 255, 0.55); }
+.key-missing { color: var(--query-missing); text-decoration: underline dotted currentColor; }
+.key-frontend-only { color: var(--query-frontend); text-decoration: underline dotted currentColor; }
 
 .type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .type-unknown { color: var(--vscode-descriptionForeground); font-style: italic; text-decoration: underline dotted; }
-.type-frontend-only { color: #3794ff; }
+.type-frontend-only { color: var(--query-frontend); }
 
 .args { color: var(--vscode-descriptionForeground); font-size: 0.9em; margin: 0 2px; }
 .arg-req { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
-.arg-f { color: #3794ff; }
+.arg-f { color: var(--query-frontend); }
 .arg-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
-.arg-type-f { color: #3794ff; }
+.arg-type-f { color: var(--query-frontend); }
 
 .brace { color: var(--vscode-descriptionForeground); font-weight: 600; }
 
@@ -399,7 +415,7 @@ body { margin: 0; padding: 0; font-family: var(--vscode-editor-font-family, Menl
 details.block-lazy > summary:before { color: var(--vscode-textLink-foreground, #3794ff); }
 details.block-lazy > summary:hover:before { color: var(--vscode-editor-foreground); }
 .lazy-content { display: block; }
-.lazy-error { color: #f44747; font-size: 0.82em; margin-left: 6px; }
+.lazy-error { color: var(--query-missing); font-size: 0.82em; margin-left: 6px; }
 
 details.block { padding: 0; margin: 0; }
 details.block > summary { cursor: pointer; list-style: none; display: block; }
@@ -419,18 +435,20 @@ details.block-f > summary .key-frontend-only { /* keep existing colors */ }
 
 .empty { padding: 24px; color: var(--vscode-descriptionForeground); font-style: italic; text-align: center; }
 .legend { padding: 8px 14px; border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); color: var(--vscode-descriptionForeground); font-size: 0.78em; }
+.legend summary { cursor: pointer; color: var(--vscode-foreground); font-weight: 600; }
+.legend p { margin: 6px 0 0; }
 
 .op-label { display: inline-block; padding: 1px 8px; margin-right: 8px; border-radius: 3px; font-size: 0.85em; font-weight: 600; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
 .op-variables { margin: 8px 14px 0; padding: 6px 10px; border: 1px dashed rgba(128,128,128,0.3); border-radius: 4px; background: var(--vscode-editorWidget-background, rgba(128,128,128,0.05)); }
 .op-variables-title { font-size: 0.78em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); margin-bottom: 2px; }
-.op-variables-body { margin: 0; font-family: var(--vscode-editor-font-family, Menlo, monospace); font-size: 0.9em; white-space: pre; color: var(--vscode-editor-foreground); }
+.op-variables-body { margin: 0; font-family: var(--vscode-editor-font-family, Menlo, monospace); font-size: 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--vscode-editor-foreground); }
 .opvar { display: inline; }
 .opvar-name { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
 .opvar-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .opvar-default { color: var(--vscode-descriptionForeground); font-style: italic; }
 .root-note { padding: 4px 14px 0; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
-.unresolved-section { margin: 14px 14px 0; padding: 8px 12px; border: 1px dashed rgba(55, 148, 255, 0.45); border-radius: 4px; background: rgba(55, 148, 255, 0.06); }
-.unresolved-title { font-size: 0.8em; font-weight: 600; color: #3794ff; margin-bottom: 4px; }
+.unresolved-section { margin: 14px 14px 0; padding: 8px 12px; border: 1px dashed var(--query-frontend); border-radius: 4px; background: var(--query-frontend-bg); }
+.unresolved-title { font-size: 0.8em; font-weight: 600; color: var(--query-frontend); margin-bottom: 4px; }
 .unresolved-row { font-size: 0.85em; }
-.unresolved-row code { color: #3794ff; }
+.unresolved-row code { color: var(--query-frontend); }
 `;

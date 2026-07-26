@@ -19,6 +19,7 @@ interface RenderState {
  * twistie that fetches the deeper subtree from the extension on demand.
  */
 export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: string): string {
+  const nonce = Array.from({ length: 24 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
   const rootArgsHtml = renderHeaderArgs(structure.rootField.args);
   const frontendOnlyPill = structure.frontendOnlyCount > 0
     ? `<span class="pill pill-frontend-only">+ ${structure.frontendOnlyCount} frontend-only</span>`
@@ -59,8 +60,18 @@ export function renderQueryStructureHtml(structure: QueryStructure, subtitle?: s
   const state: RenderState = { nextId: 0, ancestry: [structure.rootTypeName] };
   const body = renderNode(structure.rootField, 0, true, state);
 
-  return /*html*/ `<!DOCTYPE html><html><head><style>
+  return /*html*/ `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Query Coverage</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';"><style nonce="${nonce}">
 * { box-sizing: border-box; }
+:root {
+  --query-queried: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #4caf50));
+  --query-missing: var(--vscode-testing-iconFailed, var(--vscode-errorForeground, #f44747));
+  --query-frontend: var(--vscode-textLink-foreground, #3794ff);
+  --query-fragment: var(--vscode-charts-purple, var(--vscode-textLink-foreground, #c678dd));
+  --query-queried-bg: var(--vscode-editorWidget-background, rgba(76, 175, 80, 0.18));
+  --query-missing-bg: var(--vscode-editorWidget-background, rgba(244, 67, 54, 0.18));
+  --query-frontend-bg: var(--vscode-editorWidget-background, rgba(55, 148, 255, 0.18));
+  --query-fragment-bg: var(--vscode-editorWidget-background, rgba(198, 120, 221, 0.18));
+}
 body {
   font-family: var(--vscode-editor-font-family, Menlo, monospace);
   font-size: var(--vscode-editor-font-size, 13px);
@@ -92,7 +103,7 @@ body {
   white-space: normal;
 }
 .header .subtitle { margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 0.85em; }
-.header .summary { margin-top: 8px; display: flex; gap: 6px; align-items: center; font-size: 0.85em; }
+.header .summary { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 0.85em; overflow-wrap: anywhere; }
 .type-chip {
   display: inline-block; margin-left: 8px;
   padding: 1px 7px; border-radius: 3px; font-size: 0.7em;
@@ -102,10 +113,10 @@ body {
 .pill {
   display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.85em;
 }
-.pill-queried { background: rgba(76, 175, 80, 0.18); color: #4caf50; }
-.pill-missing { background: rgba(244, 67, 54, 0.18); color: #f44747; }
-.pill-frontend-only { background: rgba(55, 148, 255, 0.18); color: #3794ff; }
-.pill-fragment { background: rgba(198, 120, 221, 0.18); color: #c678dd; }
+.pill-queried { background: var(--query-queried-bg); color: var(--query-queried); }
+.pill-missing { background: var(--query-missing-bg); color: var(--query-missing); }
+.pill-frontend-only { background: var(--query-frontend-bg); color: var(--query-frontend); }
+.pill-fragment { background: var(--query-fragment-bg); color: var(--query-fragment); }
 .muted { color: var(--vscode-descriptionForeground); }
 
 .tree { padding: 8px 12px 24px; }
@@ -116,10 +127,10 @@ body {
   margin-left: 2px;
   line-height: 1.55;
 }
-.row.queried { border-left-color: #4caf50; background: rgba(76, 175, 80, 0.06); }
-.row.missing { border-left-color: #f44747; background: rgba(244, 67, 54, 0.07); }
-.row.frontend-only { border-left-color: #3794ff; background: rgba(55, 148, 255, 0.08); }
-.row.fragment { border-left-color: #c678dd; background: rgba(198, 120, 221, 0.08); }
+.row.queried { border-left-color: var(--query-queried); background: var(--query-queried-bg); }
+.row.missing { border-left-color: var(--query-missing); background: var(--query-missing-bg); }
+.row.frontend-only { border-left-color: var(--query-frontend); background: var(--query-frontend-bg); }
+.row.fragment { border-left-color: var(--query-fragment); background: var(--query-fragment-bg); }
 .row.unknown-type { opacity: 0.7; font-style: italic; }
 .row.frontend-only.unknown-type { opacity: 1; font-style: normal; }
 .row:hover { background: var(--vscode-list-hoverBackground); }
@@ -129,23 +140,23 @@ body {
   font-weight: bold; font-size: 1.15em; line-height: 1;
   vertical-align: middle;
 }
-.marker.queried { color: #4caf50; }
-.marker.missing { color: #f44747; }
-.marker.frontend-only { color: #3794ff; }
-.marker.fragment { color: #c678dd; }
+.marker.queried { color: var(--query-queried); }
+.marker.missing { color: var(--query-missing); }
+.marker.frontend-only { color: var(--query-frontend); }
+.marker.fragment { color: var(--query-fragment); }
 .marker.unknown { color: var(--vscode-descriptionForeground); }
 
 .field-name { font-weight: 500; }
-.field-name.missing { color: #f44747; }
-.field-name.frontend-only { color: #3794ff; }
-.field-name.fragment { color: #c678dd; }
+.field-name.missing { color: var(--query-missing); }
+.field-name.frontend-only { color: var(--query-frontend); }
+.field-name.fragment { color: var(--query-fragment); }
 .fragment-badge {
   display: inline-block;
   margin-left: 6px;
   padding: 0 6px;
   border-radius: 8px;
-  background: rgba(198, 120, 221, 0.18);
-  color: #c678dd;
+  background: var(--query-fragment-bg);
+  color: var(--query-fragment);
   font-size: 0.72em;
   font-weight: 500;
   vertical-align: middle;
@@ -154,7 +165,7 @@ body {
 .snake { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
 .type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
 .type.clickable { cursor: pointer; text-decoration: underline dashed; }
-.type.frontend-only { color: #3794ff; }
+.type.frontend-only { color: var(--query-frontend); }
 
 .args {
   display: inline-block; margin-left: 6px; padding: 0 4px;
@@ -162,9 +173,9 @@ body {
 }
 .arg { white-space: nowrap; }
 .arg.required { color: var(--vscode-symbolIcon-variableForeground, #e06c75); font-weight: 500; }
-.arg.frontend-only { color: #3794ff; }
+.arg.frontend-only { color: var(--query-frontend); }
 .arg-type { color: var(--vscode-symbolIcon-typeParameterForeground, #4ec9b0); }
-.arg-type.frontend-only { color: #3794ff; }
+.arg-type.frontend-only { color: var(--query-frontend); }
 
 .children { margin-left: 22px; border-left: 1px dashed rgba(128,128,128,0.25); padding-left: 6px; }
 .hidden { display: none; }
@@ -174,21 +185,24 @@ body {
   cursor: pointer; user-select: none;
   color: var(--vscode-descriptionForeground);
   font-size: 1.1em; line-height: 1;
-  vertical-align: middle;
+  vertical-align: middle; border: 0; background: transparent; padding: 0;
 }
 .twistie:hover { color: var(--vscode-editor-foreground); }
+.twistie:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .twistie.empty { visibility: hidden; }
 .twistie.lazy { color: var(--vscode-textLink-foreground, #3794ff); font-weight: 600; }
 .twistie.loading { opacity: 0.5; }
 .lazy-hint { color: var(--vscode-descriptionForeground); font-size: 0.82em; font-style: italic; margin-left: 4px; }
-.lazy-error { color: #f44747; font-size: 0.82em; margin-left: 4px; }
+.lazy-error { color: var(--query-missing); font-size: 0.82em; margin-left: 4px; }
 
 .legend { padding: 8px 20px; border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2)); color: var(--vscode-descriptionForeground); font-size: 0.8em; }
+.legend summary { cursor: pointer; color: var(--vscode-foreground); font-weight: 600; }
+.legend p { margin: 6px 0 0; }
 </style></head><body>
 ${header}
 <div class="tree">${body}</div>
-<div class="legend">Green = queried directly · <span style="color:#c678dd">Purple</span> = queried via a named fragment · Red = available on the backend but missing from your gql · Gray italic = type not in the indexed schema · <span class="lazy-hint">▸</span> = click to load deeper fields lazily</div>
-<script>
+<details class="legend"><summary>Status key</summary><p>✓ Queried · ✗ Missing from this query · + Frontend-only · ◇ Fragment-sourced · Gray italic means the type is not in the indexed schema. Lazy rows can be opened to load deeper fields.</p></details>
+<script nonce="${nonce}">
 (function () {
   const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
 
@@ -206,6 +220,7 @@ ${header}
         if (target && target.classList.contains('children')) {
           const hidden = target.classList.toggle('hidden');
           el.textContent = hidden ? '▸' : '▾';
+          el.setAttribute('aria-expanded', String(!hidden));
         }
       });
     });
@@ -218,9 +233,15 @@ ${header}
     const typeName = row.dataset.lazyType;
     const ancestry = row.dataset.ancestry || '';
     if (!typeName) return;
+    const previousError = row.querySelector('.lazy-error');
+    if (previousError) previousError.remove();
     twistie.classList.add('loading');
+    row.setAttribute('aria-busy', 'true');
+    const requestId = 'coverage-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    twistie.dataset.requestId = requestId;
     vscode.postMessage({
       type: 'expandType',
+      requestId,
       nodeId,
       typeName,
       ancestry: ancestry.split(',').filter(Boolean),
@@ -233,16 +254,29 @@ ${header}
     const row = document.querySelector('[data-node-id="' + msg.nodeId + '"]');
     if (!row) return;
     const twistie = row.querySelector('.twistie');
-    if (twistie) {
+    if (twistie && msg.requestId && twistie.dataset.requestId !== msg.requestId) return;
+    if (twistie && !msg.error) {
       twistie.classList.remove('loading');
       twistie.classList.remove('lazy');
       twistie.dataset.loaded = '1';
+      delete twistie.dataset.requestId;
       twistie.textContent = '▾';
+      twistie.setAttribute('aria-expanded', 'true');
     }
+    row.removeAttribute('aria-busy');
     // Remove the "click to load" hint once we have real content.
     const hint = row.querySelector('.lazy-hint');
     if (hint) hint.remove();
     if (msg.error) {
+      if (twistie) {
+        twistie.classList.remove('loading');
+        twistie.classList.add('lazy');
+        twistie.dataset.loaded = '0';
+        delete twistie.dataset.requestId;
+        twistie.textContent = '↻';
+        twistie.setAttribute('aria-label', 'Retry loading deeper fields');
+        twistie.setAttribute('title', 'Retry loading deeper fields');
+      }
       const err = document.createElement('span');
       err.className = 'lazy-error';
       err.textContent = msg.error;
@@ -291,9 +325,9 @@ function renderNode(node: QueryStructureNode, depth: number, isRoot: boolean, st
         : '<span class="marker missing">✗</span>';
   let twistie: string;
   if (hasChildren) {
-    twistie = '<span class="twistie">▾</span>';
+    twistie = '<button type="button" class="twistie" aria-label="Collapse fields" aria-expanded="true">▾</button>';
   } else if (isLazy) {
-    twistie = '<span class="twistie lazy" title="Expand to inspect deeper fields">▸</span>';
+    twistie = '<button type="button" class="twistie lazy" aria-label="Load deeper fields" aria-expanded="false" title="Load deeper fields">▸</button>';
   } else {
     twistie = '<span class="twistie empty">·</span>';
   }
