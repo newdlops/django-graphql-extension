@@ -23,9 +23,9 @@ const GQL_LANGUAGES = new Set([
   'vue', 'svelte', 'astro',
 ]);
 
-export function activate(context: vscode.ExtensionContext) {
-  const parseCache = new ParseCache(context.globalState);
-  parseCache.load();
+export async function activate(context: vscode.ExtensionContext) {
+  const parseCache = new ParseCache(context.globalState, context.storageUri);
+  await parseCache.load();
 
   const viewProvider = new GraphqlViewProvider(context.extensionUri);
   const codeLensProvider = new GqlCodeLensProvider();
@@ -229,7 +229,7 @@ export function activate(context: vscode.ExtensionContext) {
     },
   );
 
-  // Drops every cached file entry from globalState and re-runs a full scan.
+  // Drops every workspace-local cached file entry and re-runs a full scan.
   // Exposed both as a command and via the view title bar so users can force
   // a fresh parse after upgrading the extension, editing outside VS Code,
   // or when a stale result looks suspicious. Reports how many entries were

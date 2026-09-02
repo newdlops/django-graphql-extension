@@ -8,6 +8,14 @@
 - Renamed and aligned query-facing UI around **Query Coverage** and **Live Query Inspector**; lazy query expansion now reports failures and supports retry without replacing the whole view.
 - Hardened Webview loading/ready handshakes, CSPs, packaged icon assets, stale-result behavior, and asynchronous lazy-response ordering.
 
+## 0.1.1002 — 2026-09-03
+
+### Performance and storage safety
+- Moved Graphene parse persistence out of VS Code's shared `globalState` database into one workspace-local cache file, preventing large state-row rewrites and cache replacement between open windows.
+- Added an 8 MiB / 20,000-entry persistence ceiling, atomic file replacement, corrupt/oversized-file rejection, obsolete file cleanup, and unchanged-content write suppression.
+- Removed every legacy `grapheneParseCache.v*` Memento key on activation and made project pruning retain sibling Django roots in multi-project workspaces.
+- Awaited cache persistence so refresh timing and failures no longer escape as detached asynchronous writes.
+
 ## 0.0.2 — 2026-04-18
 
 ### Highlights

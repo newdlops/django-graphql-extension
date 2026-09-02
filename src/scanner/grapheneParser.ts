@@ -335,7 +335,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     __nativeParseMs = __nativeResult.stats.parseMs;
     __pyFileCount = __nativeResult.stats.fileCount;
 
-    if (cache) cache.pruneExcept(new Set(__nativeResult.files.map((f) => f.path)));
+    if (cache) cache.pruneExcept(new Set(__nativeResult.files.map((f) => f.path)), rootDir);
 
     for (const fr of __nativeResult.files) {
       const filePath = fr.path;
@@ -400,7 +400,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
     __tFindFiles = performance.now() - __tFindFilesStart;
     __pyFileCount = pyFiles.length;
 
-    if (cache) cache.pruneExcept(new Set(pyFiles.map((u) => u.fsPath)));
+    if (cache) cache.pruneExcept(new Set(pyFiles.map((u) => u.fsPath)), rootDir);
 
     for (const uri of pyFiles) {
       const filePath = uri.fsPath;
@@ -564,7 +564,7 @@ export async function parseGrapheneSchemas(rootDir: string, cache?: ParseCache):
 
   // Save cache after all parsing is done
   const __tCacheSaveStart = performance.now();
-  cache?.save();
+  await cache?.save();
   const __tCacheSave = performance.now() - __tCacheSaveStart;
 
   // -------------------------------------------------------
